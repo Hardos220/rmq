@@ -1,0 +1,6 @@
+#!/bin/sh
+# rmq for Git Bash / MSYS shells
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PY="$DIR/.venv/Scripts/python.exe"
+[ -x "$PY" ] || PY=python
+exec "$PY" "$DIR/rmq_cli.py" "$@"

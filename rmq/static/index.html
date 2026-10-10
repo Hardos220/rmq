@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Менеджер ресурсов</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='17' width='6' height='12' rx='2' fill='%232a78d6'/%3E%3Crect x='13' y='9' width='6' height='20' rx='2' fill='%23eb6834'/%3E%3Crect x='23' y='3' width='6' height='26' rx='2' fill='%23898781'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div id="login" class="login card" hidden>
+  <h1>Менеджер ресурсов</h1>
+  <p class="ink2">Откройте дашборд ярлыком «Менеджер ресурсов» на рабочем столе — он входит сам.
+    Или вставьте токен из файла <code>data\admin_token.txt</code> в папке менеджера.</p>
+  <form id="login-form" class="form-actions">
+    <input id="login-token" type="password" autocomplete="off" placeholder="adm_…" style="flex:1; padding:6px 8px; border:1px solid var(--border); border-radius:7px; background:var(--page)">
+    <button class="primary btn" type="submit">Войти</button>
+  </form>
+  <div id="login-msg" class="msg err"></div>
+</div>
+
+<div id="app" hidden>
+  <header class="top">
+    <div class="brand">Менеджер ресурсов</div>
+    <div id="status-chip" class="chip"><span class="dot"></span><span class="txt">…</span></div>
+    <div id="heat-chip" class="chip" hidden><span class="dot"></span><span class="txt"></span></div>
+    <div id="net-chip" class="chip" hidden><span class="dot"></span><span class="txt"></span></div>
+    <div id="awake-chip" class="chip awake" hidden title="Пока выполняются задачи, Windows не уйдёт в сон по таймеру. Экран гаснет как обычно; закрытие крышки и «Пуск → Сон» работают как всегда.">
+      <span class="dot"></span><span class="txt">ПК не уснёт: идут расчёты</span></div>
+    <div class="spacer"></div>
+    <div class="seg" id="mode-seg" role="group" aria-label="Режим работы">
+      <button type="button" data-mode="auto" title="Задачи используют свободные ресурсы; игра определяется автоматически">Авто</button>
+      <button type="button" data-mode="game" title="Включить игровой режим вручную">Игровой</button>
+      <button type="button" data-mode="paused" title="Заморозить все задачи агентов">Пауза всех</button>
+    </div>
+    <button type="button" id="theme-btn" class="ghost" title="Тема: авто / светлая / тёмная">Тема: авто</button>
+    <button type="button" id="shutdown-btn" class="ghost danger" title="Выключить менеджер ресурсов">Выключить</button>
+  </header>
+  <nav class="tabs" role="tablist" aria-label="Разделы">
+    <button role="tab" data-tab="overview" aria-selected="true">Обзор</button>
+    <button role="tab" data-tab="tasks" aria-selected="false">Задачи</button>
+    <button role="tab" data-tab="network" aria-selected="false">Сеть</button>
+    <button role="tab" data-tab="thermal" aria-selected="false">Температура</button>
+    <button role="tab" data-tab="stats" aria-selected="false">Статистика</button>
+    <button role="tab" data-tab="chronicle" aria-selected="false">Хроника</button>
+    <button role="tab" data-tab="agents" aria-selected="false">Агенты</button>
+    <button role="tab" data-tab="rules" aria-selected="false">Правила и настройки</button>
+    <button role="tab" data-tab="log" aria-selected="false">Журнал</button>
+  </nav>
+
+  <main>
+    <div id="banners"></div>
+
+    <section id="tab-overview">
+      <div class="filters">
+        <span class="label">Период графиков</span>
+        <div class="seg range-seg" id="range-seg" role="group" aria-label="Период графиков">
+          <button type="button" data-range="300">5 мин</button>
+          <button type="button" data-range="900" aria-pressed="true">15 мин</button>
+          <button type="button" data-range="3600">1 ч</button>
+          <button type="button" data-range="21600">6 ч</button>
+          <button type="button" data-range="86400">24 ч</button>
+        </div>
+        <label class="chk smooth" title="Каждая точка — среднее за последние 5 секунд: меньше шума от коротких всплесков. На периодах 6 ч и 24 ч точки и так усреднены по 15 с.">
+          <input type="checkbox" class="smooth-toggle"> Скользящее среднее за 5 с</label>
+      </div>
+      <div class="tiles" id="tiles"></div>
+      <div class="disks" id="disks" hidden></div>
+      <div class="charts" id="charts"></div>
+
+      <h2>Выполняются и на паузе</h2>
+      <div class="tbl-wrap"><table id="t-active">
+        <thead><tr>
+          <th>#</th><th>Задача</th><th>Агент</th><th>Состояние</th>
+          <th class="num">CPU, яд.</th><th class="num">ОЗУ, ГБ</th><th class="num">VRAM, ГБ</th>
+          <th class="num">Время</th><th>Выполнено</th><th></th>
+        </tr></thead><tbody></tbody>
+      </table></div>
+
+      <h2>Очередь</h2>
+      <div class="tbl-wrap"><table id="t-queue">
+        <thead><tr>
+          <th class="num">Поз.</th><th>#</th><th>Задача</th><th>Агент</th>
+          <th class="num">Заявка</th><th class="num">Ждёт</th><th class="num">Очки</th><th>Почему ждёт</th><th></th>
+        </tr></thead><tbody></tbody>
+      </table></div>
+    </section>
+
+    <section id="tab-tasks" hidden>
+      <h2>Поставить задачу от своего имени</h2>
+      <form id="submit-form" class="card">
+        <div class="form-grid">
+          <label class="f wide">Команда (выполняется через cmd.exe)
+            <input name="command" required placeholder="python C:\work\train.py --epochs 10"></label>
+          <label class="f wide">Рабочая папка
+            <input name="cwd" placeholder="C:\work"></label>
+          <label class="f">Название <input name="name" placeholder="необязательно"></label>
+          <label class="f">CPU, ядер <input name="cpu" type="number" min="0.1" step="0.5" value="2"></label>
+          <label class="f">ОЗУ, ГБ <input name="ram" type="number" min="0" step="0.5" value="4"></label>
+          <label class="f">VRAM, ГБ <input name="vram" type="number" min="0" step="0.5" value="0"></label>
+          <label class="f">Ожидаемое время <input name="time" value="1h"><span class="hint">30m, 2h, 1d</span></label>
+          <label class="f">Приоритет
+            <select name="priority"><option value="low">низкий</option><option value="normal">обычный</option><option value="high" selected>высокий</option></select></label>
+          <label class="f">Если ресурсы нужны вам
+            <select name="preempt"><option value="suspend">заморозить</option><option value="requeue">перезапустить позже</option></select></label>
+        </div>
+        <div class="form-actions">
+          <button class="primary btn" type="submit">Поставить в очередь</button>
+          <span id="submit-msg" class="msg"></span>
+        </div>
+      </form>
+
+      <h2>Активные</h2>
+      <div class="tbl-wrap"><table id="t-all-active">
+        <thead><tr><th>#</th><th>Задача</th><th>Агент</th><th>Состояние</th><th class="num">Заявка</th><th class="num">Время</th><th>Подробности</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+
+      <h2>Недавно завершённые</h2>
+      <div class="tbl-wrap"><table id="t-recent">
+        <thead><tr><th>#</th><th>Задача</th><th>Агент</th><th>Итог</th><th class="num">Код</th><th class="num">Работала</th><th class="num">Пик ОЗУ</th><th class="num">Завершена</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </section>
+
+    <section id="tab-network" hidden>
+      <div class="card net-head" id="net-head"></div>
+      <div class="net-actions" id="net-actions"></div>
+      <h2>Компьютеры сети</h2>
+      <div class="tbl-wrap"><table id="t-nodes">
+        <thead><tr>
+          <th>Компьютер</th><th>Связь</th><th>Режим</th><th>Процессор</th><th class="num">ОЗУ</th><th>Видеокарта</th>
+          <th class="num">Свободно сейчас</th><th class="num">Задачи</th><th class="num">Версия</th>
+        </tr></thead><tbody></tbody>
+      </table></div>
+      <h2>Задачи через сеть</h2>
+      <div class="tbl-wrap"><table id="t-net-tasks">
+        <thead><tr><th>#</th><th>Задача</th><th>Агент</th><th>Где</th><th>Состояние</th><th class="num">Время</th><th>Выполнено</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <p class="small muted">ПК связываются через Tailscale — бесплатную зашифрованную частную сеть; менеджер слушает
+        только адрес Tailscale, наружу ничего не открыто, каждый запрос подписан ключом сети. Задачи с других ПК встают
+        в общую очередь с низким приоритетом: ваши программы и ваши агенты всегда первые. Они работают с пониженным
+        уровнем доступа Windows: читать файлы этого ПК могут, менять и удалять — нет.</p>
+      <h2>Обновления</h2>
+      <div class="card" id="update-card"></div>
+    </section>
+
+    <section id="tab-thermal" hidden>
+      <div class="filters">
+        <span class="label">Период графиков</span>
+        <div class="seg range-seg" role="group" aria-label="Период графиков">
+          <button type="button" data-range="300">5 мин</button>
+          <button type="button" data-range="900" aria-pressed="true">15 мин</button>
+          <button type="button" data-range="3600">1 ч</button>
+          <button type="button" data-range="21600">6 ч</button>
+          <button type="button" data-range="86400">24 ч</button>
+        </div>
+        <label class="chk smooth" title="Каждая точка — среднее за последние 5 секунд: меньше шума от коротких всплесков. На периодах 6 ч и 24 ч точки и так усреднены по 15 с.">
+          <input type="checkbox" class="smooth-toggle"> Скользящее среднее за 5 с</label>
+      </div>
+      <div class="card thermal-status" id="thermal-status" role="status"></div>
+      <div class="tiles" id="thermal-tiles"></div>
+      <div class="charts" id="thermal-charts"></div>
+      <p class="small muted">Регулятор держит каждый компонент не выше его цели: пока компонент выше цели и не остывает,
+        доля процессора для задач плавно снижается, а когда он остыл на 2° ниже цели — так же плавно возвращается.
+        Перегрев замораживает все расчёты до остывания. Откуда температуры (всё локально, без интернета): процессор —
+        LibreHardwareMonitor через драйвер PawnIO (папка <code>tools</code> проекта); плата — термозона ACPI прошивки
+        ноутбука; видеокарта — драйвер NVIDIA (опрашивается, только пока она работает, чтобы не будить её); SSD — сам
+        диск. Цели и пороги меняются в «Правилах и настройках».</p>
+    </section>
+
+    <section id="tab-stats" hidden>
+      <div class="filters">
+        <span class="label">Период</span>
+        <div class="seg" id="stats-seg" role="group" aria-label="Период статистики">
+          <button type="button" data-period="24h">24 часа</button>
+          <button type="button" data-period="7d" aria-pressed="true">7 дней</button>
+          <button type="button" data-period="30d">30 дней</button>
+          <button type="button" data-period="all">Всё время</button>
+        </div>
+        <span class="small muted" id="stats-note"></span>
+      </div>
+      <div class="tiles" id="stats-tiles"></div>
+      <div class="charts" id="stats-charts"></div>
+      <h2 id="stats-table-title">По дням</h2>
+      <div class="tbl-wrap"><table id="t-stats"><thead></thead><tbody></tbody></table></div>
+      <h2>По агентам</h2>
+      <div class="tbl-wrap"><table id="t-stats-agents">
+        <thead><tr>
+          <th>Агент</th><th class="num">Работа задач</th><th class="num">Процессор, ядро-ч</th><th class="num">Видеокарта, ч</th>
+          <th class="num">Память, ГБ·ч</th><th class="num">Записано, ГБ</th><th class="num">Запущено</th>
+          <th class="num">Готово / ошибок</th><th class="num">Отменено / перезапущено</th>
+        </tr></thead><tbody></tbody>
+      </table></div>
+      <h2>Файлы статистики</h2>
+      <div class="card" id="stats-files"></div>
+    </section>
+
+    <section id="tab-chronicle" hidden>
+      <div class="filters">
+        <span class="label">Период</span>
+        <div class="seg" id="chron-seg" role="group" aria-label="Период хроники">
+          <button type="button" data-days="1">24 часа</button>
+          <button type="button" data-days="7" aria-pressed="true">7 дней</button>
+          <button type="button" data-days="30">30 дней</button>
+        </div>
+        <span class="small muted" id="chron-note"></span>
+      </div>
+      <div class="tiles" id="chron-facts"></div>
+      <div class="charts" id="chron-charts"></div>
+    </section>
+
+    <section id="tab-agents" hidden>
+      <h2>Агенты</h2>
+      <p class="ink2 small">Агенты регистрируются сами при первой задаче — ключи не нужны. Имя складывается из
+        инструмента и проекта, например <code>claude-code@my-project</code>. Здесь можно задать агенту вес, лимиты
+        или отключить его.</p>
+      <div class="tbl-wrap"><table id="t-agents">
+        <thead><tr>
+          <th>Агент</th><th>Откуда</th><th class="num">Вес</th><th>Макс. приоритет</th><th class="num">Макс. задач</th>
+          <th class="num">Нагрузка, маш.-ч</th><th class="num">Честная доля</th><th class="num">Сейчас</th><th></th>
+        </tr></thead><tbody></tbody>
+      </table></div>
+      <p class="small muted">«Нагрузка» — сколько ресурсов ПК агент занимал в последнее время (1 = весь ПК в течение часа,
+        затухает вдвое за период полураспада). Чем она больше относительно веса, тем ниже «честная доля»
+        (1 — не пользовался, ниже — пользовался много) и тем позже его задачи в очереди.</p>
+
+      <h2>Как агенты узнают о системе</h2>
+      <div class="card">
+        <div id="rules-installed" class="small"></div>
+        <p class="small ink2">Ниже — короткие правила, которые получает каждый агент. Подробное руководство агент
+          читает командой <code>rmq guide</code>. Для Cursor скопируйте текст в Cursor Settings → Rules → User Rules.</p>
+        <div class="form-actions"><button class="btn" type="button" id="copy-rules">Скопировать правила для Cursor</button>
+          <span id="copy-msg" class="msg ok"></span></div>
+        <pre class="snippet" id="agent-rules"></pre>
+      </div>
+    </section>
+
+    <section id="tab-rules" hidden>
+      <h2>Правила очереди (с текущими значениями)</h2>
+      <div class="card rules" id="rules"></div>
+      <h2>Настройки</h2>
+      <form id="settings-form" class="card">
+        <div id="settings-fields"></div>
+        <div class="form-actions">
+          <button class="primary btn" type="submit">Сохранить</button>
+          <button class="btn" type="button" id="settings-reset">Сбросить к умолчаниям</button>
+          <span id="settings-msg" class="msg"></span>
+        </div>
+      </form>
+    </section>
+
+    <section id="tab-log" hidden>
+      <h2>Журнал событий</h2>
+      <div class="card"><ul class="events" id="events"></ul></div>
+    </section>
+  </main>
+</div>
+
+<div id="overlay" class="overlay" hidden></div>
+<aside id="drawer" class="drawer" hidden aria-modal="true" role="dialog" aria-labelledby="drawer-title">
+  <header>
+    <div class="title" id="drawer-title"></div>
+    <div class="spacer"></div>
+    <span id="drawer-actions"></span>
+    <button type="button" class="ghost" id="drawer-close" aria-label="Закрыть">✕</button>
+  </header>
+  <div class="body">
+    <dl class="kv" id="drawer-kv"></dl>
+    <h3>Лог <span class="small muted" id="log-note"></span></h3>
+    <div class="logbox" id="logbox" tabindex="0"></div>
+    <h3>События</h3>
+    <ul class="events" id="drawer-events"></ul>
+  </div>
+</aside>
+
+<div id="modal-overlay" class="overlay" hidden></div>
+<div id="shutdown-modal" class="modal card" role="dialog" aria-modal="true" aria-labelledby="shutdown-title" hidden>
+  <h2 id="shutdown-title">Выключить менеджер ресурсов?</h2>
+  <p class="ink2">Что сделать с задачами агентов, которые сейчас выполняются?</p>
+  <div class="choices">
+    <button type="button" class="btn primary" data-tasks="freeze">Заморозить задачи и выключить
+      <span>Задачи встанут на паузу и продолжат с того же места при следующем запуске. Рекомендуется.</span></button>
+    <button type="button" class="btn" data-tasks="keep">Выключить, задачи пусть работают
+      <span>Задачи продолжат с низким приоритетом и текущими лимитами, но без защиты при нехватке памяти и в играх.</span></button>
+    <button type="button" class="btn danger" data-tasks="cancel">Выключить и отменить все задачи
+      <span>Все выполняющиеся и ждущие задачи будут остановлены.</span></button>
+  </div>
+  <div class="form-actions"><button type="button" class="btn" id="shutdown-cancel">Не выключать</button></div>
+</div>
+<div id="stopped" class="login card" hidden>
+  <h1>Менеджер выключен</h1>
+  <p class="ink2" id="stopped-note"></p>
+  <p class="ink2">Запустить снова — ярлык «Менеджер ресурсов» на рабочем столе.</p>
+</div>
+
+<div id="tooltip" class="tooltip" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

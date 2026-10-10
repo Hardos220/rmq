@@ -1,0 +1,12 @@
+# the state of an installation: settings, database, task logs, statistics, the dashboard token, the network key
+data/
+snapshots/
+dist/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+# third-party binaries ship in the release archive, not in git (see THIRD_PARTY.md)
+tools/*.exe
+tools/*.zip
