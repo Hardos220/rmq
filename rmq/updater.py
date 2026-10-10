@@ -76,6 +76,9 @@ class Updater:
         self._report_finished_update()
 
     def _report_finished_update(self) -> None:
+        for stage in self.dir.glob("*"):  # unpacked releases left from an earlier update
+            if stage.is_dir():
+                shutil.rmtree(stage, ignore_errors=True)
         mark = self.dir / "last.json"
         try:
             info = json.loads(mark.read_text(encoding="utf-8"))
