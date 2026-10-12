@@ -483,7 +483,7 @@
   // ================================================================ level charts: temperatures and the regulator's share
   // Small multiples, each on its own fixed scale, with reference lines for the limits and quiet bands for
   // the periods when the regulator held tasks back or everything was frozen.
-  const HEAT_NAMES = ['норма', 'регулятор урезает процессор задачам', 'перегрев — расчёты заморожены'];
+  const HEAT_NAMES = ['норма', 'регулятор урезает процессор задачам', 'перегрев — задачи агентов заморожены'];
   class LevelChart {
     // o: { title, series, color, min, max, step, values(), fmt(v), tick(v), refs() -> [{ v, color, dash, cls, label, text }],
     //      sub(), hidden(), empty(), wide }
@@ -731,8 +731,8 @@
       body = `Включается в «Правилах и настройках». Сейчас: ${temps || 'нет данных'}.`;
     } else if (th.state === 'hot') {
       icon = '✕';
-      head = 'Перегрев — все расчёты заморожены';
-      body = `${th.trigger}. Расчёты продолжатся, когда все компоненты остынут до нормы (${norms}) и пробудут там ${dur(th.cool_confirm_s)}; сначала на половине процессора, остальное вернётся постепенно. `
+      head = 'Перегрев — задачи агентов заморожены';
+      body = `${th.trigger}. Ваши программы работают как обычно: менеджер их не ограничивает. Задачи продолжатся, когда все компоненты остынут до нормы (${norms}) и пробудут там ${dur(th.cool_confirm_s)}; сначала на половине процессора, остальное вернётся постепенно. `
         + (th.cool_left != null ? `Уже остыли — продолжим через ${dur(th.cool_left)}.` : `Сейчас: ${temps}.`);
     } else if (th.state === 'warm') {
       icon = '▲';
@@ -744,7 +744,7 @@
       h('div', null, h('div', { class: 'head' }, head), h('div', { class: 'ink2' }, body)));
     $('#thermal-tiles').replaceChildren(...th.readings.map((r) => {
       const st = r.temp == null ? 'asleep' : (r.temp >= r.hot || r.throttling) ? 'hot' : r.temp > r.target ? 'warm' : 'normal';
-      const label = { asleep: r.note || 'нет данных', hot: r.throttling ? 'прошивка тормозит процессор от нагрева' : 'перегрев', warm: 'выше цели', normal: 'не выше цели' }[st];
+      const label = { asleep: r.note || 'нет данных', hot: r.throttling ? 'BIOS тормозит процессор от нагрева' : 'перегрев', warm: 'выше цели', normal: 'не выше цели' }[st];
       return h('div', { class: 'tile' }, h('div', { class: 'label' }, r.label),
         h('div', { class: 'value' }, r.temp == null ? '–' : String(Math.round(r.temp)), h('span', { class: 'unit' }, '°C')),
         h('div', { class: 'rows' }, h('div', null, h('span', { class: `temp-state ${st}` }, h('i'), label)),
@@ -853,15 +853,53 @@
     if (heat !== 'normal') {
       hc.className = `chip ${heat}`;
       const lim = s.thermal.limiting;
-      setText($('.txt', hc), heat === 'hot' ? 'Перегрев: расчёты заморожены'
+      setText($('.txt', hc), heat === 'hot' ? 'Перегрев: задачи агентов заморожены'
         : `Регулятор: задачам ${Math.round(s.thermal.factor * 100)}% процессора`);
       hc.title = heat === 'hot' ? (s.thermal.trigger || '')
         : (lim && lim.temp != null ? `${lim.label}: ${Math.round(lim.temp)}°C при цели ${lim.target}°C` : '');
     }
     $('#mode-seg').hidden = !s.me.admin;
     $('#shutdown-btn').hidden = !s.me.admin;
+    renderUpdateBtn(s);
     $$('.tabs button').forEach((b) => { if (['agents', 'rules', 'network'].includes(b.dataset.tab)) b.hidden = !s.me.admin; });
   }
+
+  // ---------------------------------------------------------------- "Проверить обновления" in the header
+  let updClick = 0;  // when the owner pressed the button (seconds)
+  let pageVersion = null;
+  function renderUpdateBtn(s) {
+    const b = $('#update-btn');
+    const u = s.update || {};
+    b.hidden = !s.me.admin;
+    if (pageVersion === null) pageVersion = u.version;
+    else if (u.version && u.version !== pageVersion) { location.reload(); return; }  // updated: load the new page
+    const now = Date.now() / 1000;
+    const answered = updClick && u.checked_at && u.checked_at >= updClick - 1;
+    let text = 'Проверить обновления';
+    let busy = false;
+    let title = `Установлена версия ${u.version || '?'}. Обновления приходят из github.com/${u.repo || '?'}; менеджер и сам проверяет их раз в несколько часов.`;
+    if (['available', 'downloading', 'installing'].includes(u.state)) {
+      text = `Обновляется до ${u.latest || 'новой версии'}…`;
+      busy = true;
+      title = 'Менеджер скачивает и ставит обновление, потом перезапустится; задачи продолжат с того же места.';
+    } else if (updClick && !answered && now - updClick < 60) {
+      text = 'Проверяем…';
+      busy = true;
+    } else if (answered && now - updClick < 10) {
+      if (u.error) { text = 'Не удалось проверить'; title = u.error; }
+      else if (u.state === 'dev') { text = u.latest ? `На GitHub версия ${u.latest}` : 'Релизов на GitHub пока нет'; title = 'Это рабочая копия разработчика: она не обновляется сама, обновления выпускаются из неё.'; }
+      else text = `Версия ${u.version} — последняя`;
+    }
+    if (b.textContent !== text) b.textContent = text;
+    b.disabled = busy;
+    b.title = title;
+  }
+  $('#update-btn').addEventListener('click', async () => {
+    updClick = Date.now() / 1000;
+    if (STATE) renderUpdateBtn(STATE);
+    try { await api('POST', '/api/update/check', {}); } catch (e) { updClick = 0; alert(e.message); }
+    setTimeout(() => poll(true), 1500);
+  });
 
   function renderBanners(s) {
     const out = [];
@@ -880,7 +918,7 @@
     }
     if (s && s.thermal && s.thermal.enabled && s.thermal.state === 'hot') {
       const th = s.thermal;
-      out.push(banner('warn', '🌡', `Перегрев — ${th.trigger}. Все расчёты заморожены до остывания`
+      out.push(banner('warn', '🌡', `Перегрев — ${th.trigger}. Задачи агентов заморожены до остывания, ваши программы работают как обычно`
         + (th.cool_left != null ? ` (продолжим через ${dur(th.cool_left)}). ` : '. '),
         h('button', { class: 'btn', type: 'button', onclick: () => tab('thermal') }, 'Подробнее')));
     }
@@ -1309,7 +1347,7 @@
       li('Большие задачи не голодают.', `Если первая в очереди задача ждёт дольше ${sc.reservation_after_min} мин, вперёд неё пускаются только задачи, которые по заявке успеют закончиться раньше, чем для неё освободится место. Если задача ждёт дольше ${sc.starvation_after_min} мин, она может вытеснять «захватчиков», даже если её агент при этом займёт больше своей доли.`),
       li('Время', `считается только тогда, когда задача реально работает (пауза не в счёт). Задача, работающая дольше заявленного (+${sc.overtime_grace_pct}%), — «сверхурочная»: у неё меньше очков, её проще вытеснить, а занятые ресурсы считаются агенту ×${sc.overtime_usage_mult}. Жёсткий --time-limit убивает задачу. Замороженные задачи возобновляются в порядке очков; прогресс и время работы сохраняются.`),
       li('Температура.', S.thermal.enabled
-        ? `Менеджер следит за процессором, платой (ACPI), видеокартой и SSD. ${S.thermal.regulate ? `Регулятор держит каждый компонент не выше цели (процессор ${S.thermal.cpu_target_c}°, плата ${S.thermal.board_target_c}°, видеокарта ${S.thermal.gpu_target_c}°, SSD ${S.thermal.ssd_target_c}°): пока компонент выше цели и не остывает, доля процессора для задач плавно снижается — не ниже ${Math.round(S.thermal.min_cpu_factor * 100)}%, а из-за видеокарты и SSD (их греет в основном своя работа) не ниже половины; когда он на 2° ниже цели, процессор так же плавно возвращается. ` : 'Плавный регулятор выключен. '}Перегрев (процессор ≥ ${S.thermal.cpu_hot_c}°, плата ≥ ${S.thermal.board_hot_c}°, видеокарта ≥ ${S.thermal.gpu_hot_c}°, SSD ≥ ${S.thermal.ssd_hot_c}°${S.thermal.freeze_on_throttling ? ' или прошивка тормозит процессор из-за нагрева' : ''} дольше ${S.thermal.hot_confirm_s} с) — все расчёты замораживаются, пока всё не остынет до нормы (процессор ≤ ${S.thermal.cpu_normal_c}°, плата ≤ ${S.thermal.board_normal_c}°, видеокарта ≤ ${S.thermal.gpu_normal_c}°, SSD ≤ ${S.thermal.ssd_normal_c}°) и не пробудет там ${S.thermal.cool_confirm_s} с; потом задачи продолжают на половине процессора и получают остальное постепенно. Температуру процессора читает LibreHardwareMonitor через драйвер PawnIO, локально и без интернета.`
+        ? `Менеджер следит за процессором, платой (ACPI), видеокартой и SSD. ${S.thermal.regulate ? `Регулятор держит каждый компонент не выше цели (процессор ${S.thermal.cpu_target_c}°, плата ${S.thermal.board_target_c}°, видеокарта ${S.thermal.gpu_target_c}°, SSD ${S.thermal.ssd_target_c}°): пока компонент выше цели и не остывает, доля процессора для задач плавно снижается — не ниже ${Math.round(S.thermal.min_cpu_factor * 100)}%, а из-за видеокарты и SSD (их греет в основном своя работа) не ниже половины; когда он на 2° ниже цели, процессор так же плавно возвращается. ` : 'Плавный регулятор выключен. '}Перегрев (процессор ≥ ${S.thermal.cpu_hot_c}°, плата ≥ ${S.thermal.board_hot_c}°, видеокарта ≥ ${S.thermal.gpu_hot_c}°, SSD ≥ ${S.thermal.ssd_hot_c}°${S.thermal.freeze_on_throttling ? ' или BIOS сам тормозит процессор из-за нагрева' : ''} дольше ${S.thermal.hot_confirm_s} с) — задачи агентов замораживаются (ваши программы менеджер не ограничивает никогда), пока всё не остынет до нормы (процессор ≤ ${S.thermal.cpu_normal_c}°, плата ≤ ${S.thermal.board_normal_c}°, видеокарта ≤ ${S.thermal.gpu_normal_c}°, SSD ≤ ${S.thermal.ssd_normal_c}°) и не пробудет там ${S.thermal.cool_confirm_s} с; потом задачи продолжают на половине процессора и получают остальное постепенно. Температуру процессора читает LibreHardwareMonitor через драйвер PawnIO, локально и без интернета.`
         : 'Защита от перегрева выключена.'),
       li('Место на диске.', S.disk.enabled
         ? `Если на системном диске свободно меньше ${S.disk.min_free_gb} ГБ, все задачи замораживаются — Windows тоже нужно место. Если мало места на другом диске, замораживаются задачи, которые работают в папке на нём. Задачи продолжат сами, когда свободного станет на 2 ГБ больше.`

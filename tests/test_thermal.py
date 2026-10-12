@@ -205,3 +205,17 @@ def test_cpu_comes_back_gradually_after_a_freeze_and_when_sensors_sleep():
 def test_regulation_can_be_switched_off():
     reg = HeatRegulator()
     assert drive(reg, 0, 300, lambda t: [die(99)], cfg=dict(CFG, regulate=False)) == 1.0
+
+
+def test_a_dummy_acpi_zone_neither_shows_nor_freezes_anything():
+    from rmq.thermal import zone_reading
+    k = 273.15
+    # a desktop's dummy zone: 17 °C and a passive-cooling flag that never clears
+    assert zone_reading({"TZ00": k + 17}, {"TZ00": 0.0}, {"TZ00": 1.0}) == (None, False)
+    # a real laptop zone, warm and throttled by the firmware
+    assert zone_reading({"TZ0": k + 78.4}, {"TZ0": 60.0}, {"TZ0": 0.0}) == (78.4, True)
+    # a real zone that is cool: a stuck flag there is not believed
+    assert zone_reading({"TZ0": k + 41}, {"TZ0": 0.0}, {}) == (41.0, False)
+    # the dummy is skipped, the real zone next to it counts
+    assert zone_reading({"A": k + 17, "B": k + 57}, {"A": 0.0, "B": 100.0}, {}) == (57.0, False)
+    assert zone_reading({"Z": 0.0}, {}, {}) == (None, False)          # an unpopulated zone

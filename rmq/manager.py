@@ -645,7 +645,8 @@ class Manager:
         temps = ", ".join(f"{r.label} {r.temp:.0f}°C" for r in readings if r.temp is not None)
         share = self.regulator.factor
         if state == "hot":
-            msg = f"Перегрев — {self.guard.trigger}. Все расчёты заморожены до остывания ({temps})"
+            msg = (f"Перегрев — {self.guard.trigger}. Задачи агентов заморожены до остывания, программы владельца "
+                   f"работают как обычно ({temps})")
             self.stats.count("heat_freezes")
         elif prev == "hot":
             msg = f"ПК остыл ({temps}) — расчёты продолжаются" + (

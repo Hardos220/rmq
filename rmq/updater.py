@@ -129,20 +129,30 @@ class Updater:
             threading.Thread(target=self.check_and_install, name="rmq-update", daemon=True).start()
 
     def check(self) -> dict:
-        self.status.update(state="checking", error="")
+        dev = self.status["state"] == "dev"  # a developer copy learns the latest version but keeps its state
+        self.status.update(error="")
+        if not dev:
+            self.status["state"] = "checking"
         try:
             rel = latest_release()
         except urllib.error.HTTPError as e:
             if e.code == 404:  # the repository has no published release yet
-                self.status.update(state="idle", latest=None, checked_at=time.time(), error="")
+                self.status.update(latest=None, checked_at=time.time(), error="")
+                if not dev:
+                    self.status["state"] = "idle"
                 return self.status
-            self.status.update(state="error", error=f"GitHub ответил ошибкой {e.code}", checked_at=time.time())
+            self.status.update(error=f"GitHub ответил ошибкой {e.code}", checked_at=time.time())
+            if not dev:
+                self.status["state"] = "error"
             return self.status
         except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
-            self.status.update(state="error", error=f"нет связи с GitHub: {getattr(e, 'reason', e)}",
-                               checked_at=time.time())
+            self.status.update(error=f"нет связи с GitHub: {getattr(e, 'reason', e)}", checked_at=time.time())
+            if not dev:
+                self.status["state"] = "error"
             return self.status
         self.status.update(latest=rel["version"], checked_at=time.time(), url=rel.get("url"))
+        if dev:
+            return self.status
         if is_newer(rel["version"], __version__) and rel["zip_url"] and rel["sums_url"]:
             self.status.update(state="available", release=rel)
         else:
@@ -153,9 +163,9 @@ class Updater:
         if not self._busy.acquire(blocking=False):
             return self.status
         try:
+            st = self.check()
             if self.status["state"] == "dev" and not force_install:
                 return self.status
-            st = self.check()
             if st["state"] == "available":
                 self.install(st["release"])
             return self.status

@@ -24,3 +24,45 @@ def test_an_update_replaces_the_program_but_never_the_data(tmp_path):
     assert read("rmq/__init__.py") == "new" and read("rmq/net.py") == "new module" and read("README.md") == "new readme"
     assert read("data/rmq.db") == "my data" and read(".venv/x.txt") == "env"
     assert not (install / "rmq" / "gone.py").exists()
+
+
+class FakeDB:
+    def kv_get(self, key):
+        return None
+
+    def event(self, kind, text):
+        pass
+
+
+class FakeManager:
+    def __init__(self, home):
+        self.home, self.db, self.open_dashboard_once = home, FakeDB(), False
+
+
+def release(version):
+    return {"version": version, "zip_url": "z", "sums_url": "s", "notes": "", "url": "u"}
+
+
+def test_the_button_on_a_developer_copy_only_learns_the_latest_version(tmp_path, monkeypatch):
+    from rmq import updater
+    monkeypatch.setattr(updater, "is_dev_checkout", lambda: True)
+    monkeypatch.setattr(updater, "latest_release", lambda: release("9.9.9"))
+    monkeypatch.setattr(updater.Updater, "install", lambda self, rel: (_ for _ in ()).throw(AssertionError("installed")))
+    up = updater.Updater(FakeManager(tmp_path))
+    st = up.check_and_install()
+    assert st["state"] == "dev" and st["latest"] == "9.9.9" and st["checked_at"]
+
+
+def test_the_button_on_an_installation_installs_a_newer_release(tmp_path, monkeypatch):
+    from rmq import install, updater
+    monkeypatch.setattr(updater, "is_dev_checkout", lambda: False)
+    monkeypatch.setattr(install, "ensure_shortcut", lambda home: None)  # never the real desktop in tests
+    monkeypatch.setattr(updater, "latest_release", lambda: release("9.9.9"))
+    got = []
+    monkeypatch.setattr(updater.Updater, "install", lambda self, rel: got.append(rel["version"]))
+    up = updater.Updater(FakeManager(tmp_path))
+    up.check_and_install()
+    assert got == ["9.9.9"]
+    monkeypatch.setattr(updater, "latest_release", lambda: release(updater.__version__))
+    got.clear()
+    assert up.check_and_install()["state"] == "idle" and not got

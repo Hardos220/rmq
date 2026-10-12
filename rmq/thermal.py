@@ -89,7 +89,7 @@ class ThermalGuard:
                 return self.state
             r = hot[0]
             self.trigger = (f"{r.label}: {r.temp:.0f}°C (порог {r.hot:.0f}°C)" if r.temp is not None
-                            and r.temp >= r.hot else "прошивка тормозит процессор из-за нагрева")
+                            and r.temp >= r.hot else "BIOS этого ПК сам тормозит процессор из-за нагрева")
             self.state, self._normal_since = "hot", None
 
         if normal:
@@ -174,6 +174,24 @@ class HeatRegulator:
 
 
 # ---------------------------------------------------------------- sensors (Windows)
+ZONE_PLAUSIBLE_C = (20.0, 125.0)   # a powered PC's own sensor is never colder than a room, nor this hot
+ZONE_THROTTLE_MIN_C = 50.0         # firmware does not slow a CPU down for heat while its zone is cooler than this
+
+
+def zone_reading(kelvin: dict[str, float], passive: dict[str, float],
+                 reasons: dict[str, float]) -> tuple[float | None, bool]:
+    """(the hottest real zone in °C, whether the firmware throttles for heat) from the per-zone counters.
+
+    Many desktops expose dummy ACPI zones: a fixed, impossible temperature (17 °C was seen) and a passive-cooling
+    flag that never clears. Such zones are ignored, and the throttle flag counts only for a zone that is really
+    warm, so a dummy can never freeze the tasks for good."""
+    lo, hi = ZONE_PLAUSIBLE_C
+    real = {name: k - 273.15 for name, k in kelvin.items() if lo <= k - 273.15 <= hi}
+    throttling = any(t >= ZONE_THROTTLE_MIN_C and (passive.get(name, 100.0) < 99.5 or reasons.get(name, 0.0) > 0)
+                     for name, t in real.items())
+    return (round(max(real.values()), 1) if real else None), throttling
+
+
 class CpuZones:
     """ACPI thermal zones (Kelvin) and the firmware's passive-cooling throttle flag."""
 
@@ -189,10 +207,8 @@ class CpuZones:
         if not self.ok:
             return None, False
         self._q.collect()
-        temps = [k - 273.15 for k in self._q.values("t").values() if k > 200]  # skip bogus zero zones
-        throttling = (self._passive and any(v < 99.5 for v in self._q.values("p").values())) or \
-                     (self._reasons and any(v > 0 for v in self._q.values("r").values()))
-        return (round(max(temps), 1) if temps else None), bool(throttling)
+        return zone_reading(self._q.values("t"), self._q.values("p") if self._passive else {},
+                            self._q.values("r") if self._reasons else {})
 
 
 def _number(text: str) -> float | None:
