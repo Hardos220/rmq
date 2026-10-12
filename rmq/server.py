@@ -203,7 +203,10 @@ class Handler(BaseHTTPRequestHandler):
             rng, since = float(q.get("range", 900)), float(q.get("since", 0))
         except ValueError:
             raise ApiError(400, "range/since: числа") from None
-        return self.manager.metrics.series(max(10.0, min(86400.0, rng)), since)
+        res = self.manager.metrics.series(max(10.0, min(86400.0, rng)), since)
+        ids = {int(k) for row in res.get("tasks", []) for k in (row or {})}
+        res["task_names"] = self.manager.db.task_labels(ids)  # for the chart of resources by task
+        return res
 
     @route("GET", "/api/tasks")
     def tasks(self, ident, body, q):
@@ -249,7 +252,12 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", "/api/settings")
     def settings_get(self, ident, body, q):
-        return self.manager.settings.snapshot()
+        return self.manager.settings_view()
+
+    @route("POST", "/api/settings/preset")
+    def settings_preset(self, ident, body, q):
+        self._admin(ident)
+        return self.manager.apply_preset(str(body.get("preset") or ""))
 
     @route("PATCH", "/api/settings")
     def settings_patch(self, ident, body, q):

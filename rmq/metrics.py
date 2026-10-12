@@ -1,4 +1,7 @@
-"""In-memory history for the charts: 1 s points for the last hour, 15 s averages for a day."""
+"""In-memory history for the charts: 1 s points for the last hour, 15 s averages for a day.
+
+Besides the fixed columns every point carries what each running task used then:
+{task id: [CPU % of the whole processor, RAM GB, VRAM GB, GPU %]}."""
 from __future__ import annotations
 
 import threading
@@ -25,6 +28,21 @@ def _avg(vals):
     return round(sum(vals) / len(vals), 3) if vals else None
 
 
+TASK_FIELDS = 4
+
+
+def _tasks(per: dict | None) -> dict:
+    return {str(k): [round(float(x), 2) for x in v[:TASK_FIELDS]] for k, v in (per or {}).items()}
+
+
+def _avg_tasks(rows: list[dict]) -> dict:
+    """A task missing from a point used nothing then."""
+    keys = {k for r in rows for k in r}
+    n = max(1, len(rows))
+    return {k: [round(sum((r.get(k) or [0.0] * TASK_FIELDS)[i] for r in rows) / n, 2) for i in range(TASK_FIELDS)]
+            for k in keys}
+
+
 class Metrics:
     def __init__(self, fine_s: int = 3600, coarse_step: int = 15, coarse_s: int = 86400):
         self._lock = threading.Lock()
@@ -35,7 +53,7 @@ class Metrics:
         self._last_t = 0.0
 
     def add(self, t: float, values: dict) -> None:
-        row = (round(t, 2),) + tuple(_num(values.get(c, 0.0)) for c in COLUMNS)
+        row = (round(t, 2),) + tuple(_num(values.get(c, 0.0)) for c in COLUMNS) + (_tasks(values.get("tasks")),)
         with self._lock:
             if t - self._last_t < 0.95:
                 return
@@ -43,7 +61,8 @@ class Metrics:
             self._fine.append(row)
             self._acc.append(row)
             if t - self._acc[0][0] >= self.coarse_step:
-                avg = tuple(_avg(r[i] for r in self._acc) for i in range(len(row)))
+                avg = tuple(_avg(r[i] for r in self._acc) for i in range(len(row) - 1)) + (
+                    _avg_tasks([r[-1] for r in self._acc]),)
                 self._coarse.append(avg)
                 self._acc = []
 
@@ -57,4 +76,5 @@ class Metrics:
         out = {"step": step, "t": [r[0] for r in rows]}
         for i, c in enumerate(COLUMNS, 1):
             out[c] = [r[i] for r in rows]
+        out["tasks"] = [r[-1] for r in rows]
         return out

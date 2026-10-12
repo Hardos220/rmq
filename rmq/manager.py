@@ -114,6 +114,16 @@ def clean_agent_name(name: str) -> str:
     return _NAME_BAD.sub("_", name.strip())[:64].strip()
 
 
+
+def _request_text(row: dict) -> str:
+    """A task's request in words: "CPU 4 · ОЗУ 8 ГБ · VRAM 6 ГБ · ~2 ч"."""
+    parts = [f"CPU {row['cpu']:g}", f"ОЗУ {row['ram_gb']:g} ГБ"]
+    if row.get("vram_gb"):
+        parts.append(f"VRAM {row['vram_gb']:g} ГБ")
+    if row.get("time_s"):
+        parts.append(f"~{texts.fmt_minutes(row['time_s'])}")
+    return " · ".join(parts)
+
 class Manager:
     def __init__(self, home: Path):
         self.home = home
@@ -558,6 +568,8 @@ class Manager:
                 "temp_ssd": next((r.temp for r in readings if r.key == "ssd"), None),
                 "heat": {"normal": 0.0, "warm": 1.0, "hot": 2.0}[heat],
                 "cpu_factor": factor * 100,
+                "tasks": {tid: (u.cpu / N * 100, u.ws / GB, task_vram.get(tid, 0.0), task_gpu.get(tid, 0.0))
+                          for tid, u in usage.items()},
             }
             self.metrics.add(now, mvals)
             lim = self.regulator.limiting
@@ -821,7 +833,7 @@ class Manager:
                 "run_s": self.run_time(r, now), "cpu_s": r["cpu_s"], "submitted_at": r["submitted_at"],
                 "finished_at": r["finished_at"], "segments": segs, "marks": [m for m in marks if m[0] >= start],
                 "totals": chronicle.totals(segs)})
-        tasks.sort(key=lambda t: (t["segments"][0][0], t["id"]))
+        tasks.sort(key=lambda t: (-t["segments"][0][0], -t["id"]))  # the newest on top
         agents = [{"id": a["id"], "name": a["name"], "builtin": bool(a["builtin"])} for a in self.db.agents()]
         return {"from": start, "to": now, "days": days, "tasks": tasks, "agents": agents}
 
@@ -1329,7 +1341,9 @@ class Manager:
         elif a.kind == "resume" and rt:
             rt.resume()
             self.db.task_update(tid, state="running", state_reason="", last_start_at=now, suspended_pids="[]")
-            self.db.event("resume", "Возобновлена", task_id=tid, agent_id=row["agent_id"])
+            stood = now - row["queued_since"] if row["queued_since"] else 0
+            self.db.event("resume", f"Возобновлена после паузы {texts.fmt_minutes(stood)}" if stood >= 60
+                          else "Возобновлена", task_id=tid, agent_id=row["agent_id"])
         elif a.kind == "suspend" and rt:
             rt.suspend(trim=a.reason in ("ram", "commit") or a.reason.startswith("fair:"))
             resume_ram = max(u.ws / GB if u else 0.0, row["resume_ram_gb"] if row["state"] == "suspended" else 0.0)
@@ -1441,7 +1455,10 @@ class Manager:
         self.live[tid] = {"peak_ram_gb": row["peak_ram_gb"], "peak_vram_gb": row["peak_vram_gb"],
                           "uses_gpu": row["uses_gpu"]}
         restarted = f" (перезапуск №{row['restarts']})" if row["restarts"] else ""
-        self.db.event("start", f"Запущена{restarted}", task_id=tid, agent_id=row["agent_id"])
+        waited = now - row["queued_since"] if row["queued_since"] else 0
+        self.db.event("start", f"Запущена{restarted}: {_request_text(row)}"
+                      + (f"; ждала в очереди {texts.fmt_minutes(waited)}" if waited >= 60 else ""),
+                      task_id=tid, agent_id=row["agent_id"])
         self.stats.count("tasks_started", self._agent_name(row["agent_id"]))
 
     def _request_stop(self, row: dict, reason: str, now: float, S: dict) -> None:
@@ -1537,6 +1554,9 @@ class Manager:
                "lost": "Потеряна"}.get(state, state)
         if note and state not in ("done",):
             msg += f": {note}"
+        if fields["run_s"]:
+            peak = fields.get("peak_ram_gb", row["peak_ram_gb"]) or 0.0
+            msg += f" · работала {texts.fmt_minutes(fields['run_s'])}" + (f", пик ОЗУ {peak:.1f} ГБ" if peak else "")
         self.db.event(state, msg, task_id=tid, agent_id=row["agent_id"])
         (self.task_dir(tid) / "stop").unlink(missing_ok=True)
         kind = {"done": "tasks_done", "cancelled": "tasks_cancelled"}.get(state, "tasks_failed")
@@ -1708,7 +1728,8 @@ class Manager:
                 cwd=cwd, env=json.dumps(env) if env is not None else None, cpu=cpu, ram_gb=ram, vram_gb=vram,
                 time_s=time_s, time_limit_s=time_limit_s, priority=prio, preempt=preempt, state="queued",
                 submitted_at=now, queued_since=now)
-            self.db.event("submit", f"Поставлена в очередь: {name}", task_id=tid, agent_id=agent["id"])
+            self.db.event("submit", f"Поставлена в очередь: {_request_text(dict(cpu=cpu, ram_gb=ram, vram_gb=vram, time_s=time_s))}",
+                          task_id=tid, agent_id=agent["id"])
         self.wake.set()
         return {"id": tid, "state": "queued", "warnings": warnings}
 
@@ -1746,7 +1767,8 @@ class Manager:
                 self.db.task_update(tid, state_reason="user")
             else:
                 raise ApiError(409, "приостановить можно только выполняющуюся задачу")
-            self.db.event("suspend", "Приостановлена вручную", task_id=tid, agent_id=row["agent_id"])
+            who = "владельцем ПК" if ident.admin else f"агентом {ident.agent['name']}"
+            self.db.event("suspend", f"Приостановлена вручную ({who})", task_id=tid, agent_id=row["agent_id"])
         self.wake.set()
         return {"id": tid, "state": "suspended"}
 
@@ -1829,15 +1851,34 @@ class Manager:
             data = self.settings.update(patch)
         except SettingsError as e:
             raise ApiError(400, str(e)) from e
-        self.db.event("settings", "Настройки изменены")
+        self.db.event("settings", "Настройки изменены: " + ", ".join(
+            f"{sec}.{key}" for sec, vals in patch.items() if isinstance(vals, dict) for key in vals)[:300])
         self.wake.set()
-        return data
+        return self.settings_view(data)
 
     def reset_settings(self) -> dict:
         data = self.settings.reset()
         self.db.event("settings", "Настройки сброшены к значениям по умолчанию")
         self.wake.set()
+        return self.settings_view(data)
+
+    def settings_view(self, data: dict | None = None) -> dict:
+        """The settings plus the presets and which of them they match (None: the owner's own values)."""
+        from .settings import PRESETS, active_preset
+        data = data if data is not None else self.settings.snapshot()
+        data["_presets"] = {"list": [{"id": k, "title": t, "text": d} for k, (t, d, _o) in PRESETS.items()],
+                            "active": active_preset(data)}
         return data
+
+    def apply_preset(self, name: str) -> dict:
+        from .settings import PRESETS
+        try:
+            data = self.settings.apply_preset(name)
+        except SettingsError as e:
+            raise ApiError(400, str(e)) from e
+        self.db.event("settings", f"Режим настроек: {PRESETS[name][0]}")
+        self.wake.set()
+        return self.settings_view(data)
 
     # ---------------------------------------------------------------- agents
     def agent_json(self, a: dict, counts: dict | None = None) -> dict:
@@ -1902,6 +1943,7 @@ class Manager:
             "overtime": row["state"] in ("running", "suspended") and run_s > row["time_s"] * (
                 1 + self.settings.section("scheduler")["overtime_grace_pct"] / 100),
             "score": plan.scores.get(tid) if plan else None,
+            "standing": plan.standing.get(tid) if plan and row["state"] == "running" else None,
             "position": wait.position if wait and wait.position else None,
             "wait": wait.reason if wait else None,
             "wait_text": texts.describe(wait.reason, wait.detail) if wait else "",

@@ -248,11 +248,24 @@ class DB:
         self._exec("INSERT INTO events(ts, task_id, agent_id, kind, message) VALUES(?,?,?,?,?)",
                    (time.time(), task_id, agent_id, kind, message))
 
+    _EVENTS = ("SELECT e.*, t.name AS task_name, a.name AS agent_name FROM events e "
+               "LEFT JOIN tasks t ON t.id = e.task_id LEFT JOIN agents a ON a.id = COALESCE(e.agent_id, t.agent_id) ")
+
     def events(self, after_id: int = 0, limit: int = 200, task_id: int | None = None) -> list[dict]:
+        """Newest first, each with the name of its task and of the agent (for the journal)."""
         if task_id is not None:
-            return self._all("SELECT * FROM events WHERE task_id=? AND id>? ORDER BY id DESC LIMIT ?",
+            return self._all(self._EVENTS + "WHERE e.task_id=? AND e.id>? ORDER BY e.id DESC LIMIT ?",
                              (task_id, after_id, limit))
-        return self._all("SELECT * FROM events WHERE id>? ORDER BY id DESC LIMIT ?", (after_id, limit))
+        return self._all(self._EVENTS + "WHERE e.id>? ORDER BY e.id DESC LIMIT ?", (after_id, limit))
+
+    def task_labels(self, ids) -> dict[str, dict]:
+        """{task id: {"name", "agent"}} for the chart of resources by task."""
+        ids = sorted(ids)[:500]
+        if not ids:
+            return {}
+        rows = self._all("SELECT t.id, t.name, a.name AS agent FROM tasks t LEFT JOIN agents a ON a.id = t.agent_id "
+                         f"WHERE t.id IN ({','.join('?' * len(ids))})", tuple(ids))
+        return {str(r["id"]): {"name": r["name"], "agent": r["agent"]} for r in rows}
 
     def events_for_tasks(self, ids: list[int]) -> list[dict]:
         out: list[dict] = []

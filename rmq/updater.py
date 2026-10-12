@@ -142,11 +142,13 @@ class Updater:
                     self.status["state"] = "idle"
                 return self.status
             self.status.update(error=f"GitHub ответил ошибкой {e.code}", checked_at=time.time())
+            log.warning("update check: %s", self.status["error"])
             if not dev:
                 self.status["state"] = "error"
             return self.status
         except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
             self.status.update(error=f"нет связи с GitHub: {getattr(e, 'reason', e)}", checked_at=time.time())
+            log.warning("update check: %s (next try in 30 minutes)", self.status["error"])
             if not dev:
                 self.status["state"] = "error"
             return self.status

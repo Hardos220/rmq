@@ -276,6 +276,8 @@ class Plan:
     scores: dict[int, float] = field(default_factory=dict)
     fairshare: dict[int, float] = field(default_factory=dict)
     waiting: dict[int, WaitInfo] = field(default_factory=dict)
+    # running tasks: can a waiting task take their place? {"kind": protected|overtime|owner|over|fair|stopping, ...}
+    standing: dict[int, dict] = field(default_factory=dict)
     shed: bool = False              # something was taken away this tick (starts the settle period)
 
 
@@ -668,6 +670,23 @@ def plan(inp: PlanInput) -> Plan:
     alloc = allocate_cpu(pools.cpu, run, weights)
     for t in run:
         P.cpu_caps[t.id] = max(inp.capacity.cpu * 0.01, min(inp.capacity.cpu, alloc[t.id]))
+
+    # where each running task stands against the waiting ones (the same rules as pick_victims)
+    for t in running.values():
+        held = now - (t.last_start_at if t.last_start_at is not None else now)
+        share, fair = agent_share(t.agent_id), fair_frac(t.agent_id)
+        if t.stopping:
+            st = {"kind": "stopping"}
+        elif held < pol.min_slice_s:
+            st = {"kind": "protected", "left_s": round(pol.min_slice_s - held)}
+        elif is_overtime(t, pol):
+            st = {"kind": "overtime"}
+        elif t.priority >= 2:
+            st = {"kind": "owner"}
+        else:
+            st = {"kind": "over" if share - fair > pol.share_tolerance else "fair"}
+        st.update(share=round(share, 3), fair=round(fair, 3))
+        P.standing[t.id] = st
 
     # queue annotations, in score order
     order = sorted((t for t in list(queued.values()) + list(suspended.values())),

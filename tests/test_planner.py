@@ -425,3 +425,18 @@ def test_hung_task_is_frozen_until_someone_resumes_it():
     assert acts(p) == [] and p.waiting[1].reason == "hung" and p.waiting[1].position == 0
     resumed = task(1, state="suspended", suspend_reason="resume", started_before=True)
     assert acts(run([resumed])) == [("resume", 1, "")]
+
+
+def test_each_running_task_knows_whether_a_waiting_one_may_take_its_place():
+    fresh = task(1, agent=1, state="running", cpu=16, ram=16, last_start_at=NOW - 5 * MIN)
+    hog = task(2, agent=1, state="running", cpu=2, ram=4, last_start_at=NOW - 3 * 3600)
+    late = task(3, agent=2, state="running", cpu=1, ram=1, time_s=600, run_s=1800, last_start_at=NOW - 40 * MIN)
+    waiting = task(4, agent=3, cpu=2, ram=2)
+    p = run([fresh, hog, late, waiting])
+    st = p.standing
+    assert st[1]["kind"] == "protected" and 0 < st[1]["left_s"] <= 15 * MIN   # the first 20 minutes are its own
+    assert st[2]["kind"] == "over" and st[2]["share"] > st[2]["fair"]         # its agent holds more than its share
+    assert st[3]["kind"] == "overtime"                                      # runs longer than it said
+    assert 4 not in st                                                      # only running tasks have a standing
+    alone = run([task(5, agent=1, state="running", cpu=16, ram=16)])
+    assert alone.standing[5]["kind"] == "fair"                              # nobody else wants the PC

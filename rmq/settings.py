@@ -163,6 +163,48 @@ DEFAULTS: dict = {
 }
 
 
+# Presets: ready sets of values for the main knobs. Applying one sets every knob any preset touches (to the preset's
+# value, or the default where it says nothing); everything else stays as the owner set it.
+PRESETS: dict[str, tuple[str, str, dict]] = {
+    "standard": ("Стандартный", "Задачам — всё свободное, обычные цели температуры. Подходит большинству ПК.", {}),
+    "gentle": ("Бережный к железу",
+               "Цели температуры ниже (процессор 70°, плата 65°, видеокарта 75°, SSD 55°): ПК меньше греется и "
+               "меньше изнашивается, а при нагреве расчёты идут медленнее.",
+               {"thermal": {"cpu_target_c": 70.0, "cpu_hot_c": 95.0, "cpu_normal_c": 70.0,
+                            "board_target_c": 65.0, "board_hot_c": 80.0, "board_normal_c": 65.0,
+                            "gpu_target_c": 75.0, "gpu_hot_c": 87.0, "gpu_normal_c": 60.0,
+                            "ssd_target_c": 55.0}}),
+    "quiet": ("Тихий",
+              "Пока вы работаете за ПК: задачам примерно 60% свободного процессора, больше запаса памяти и цели "
+              "температуры чуть ниже — вентиляторы тише, ПК отзывчивее.",
+              {"reserve": {"cpu_pct_of_free": 40.0, "cpu_min_cores": 2.0, "ram_pct_of_free": 15.0, "ram_min_gb": 3.0},
+               "thermal": {"cpu_target_c": 75.0, "board_target_c": 70.0, "gpu_target_c": 78.0, "ssd_target_c": 60.0},
+               "gpu": {"user_busy_pct": 15.0}}),
+    "max": ("Максимум расчётов",
+            "Задачам — почти всё свободное. Ваши программы всё равно первые (задачи на самом низком приоритете), "
+            "температура — по обычным правилам.",
+            {"reserve": {"cpu_pct_of_free": 2.0, "ram_pct_of_free": 3.0},
+             "gpu": {"user_busy_pct": 40.0}}),
+}
+PRESET_KEYS = sorted({(sec, key) for _t, _d, over in PRESETS.values() for sec, vals in over.items() for key in vals})
+
+
+def preset_values(name: str) -> dict:
+    over = PRESETS[name][2]
+    out: dict = {}
+    for sec, key in PRESET_KEYS:
+        out.setdefault(sec, {})[key] = over.get(sec, {}).get(key, DEFAULTS[sec][key])
+    return out
+
+
+def active_preset(data: dict) -> str | None:
+    for name in PRESETS:
+        vals = preset_values(name)
+        if all(data[sec][key] == v for sec, keys in vals.items() for key, v in keys.items()):
+            return name
+    return None
+
+
 # settings.json keeps only what the owner changed, so new defaults reach existing installs.
 # Older files stored every value; these defaults changed since and are dropped if left untouched.
 VERSION = 3
@@ -271,6 +313,11 @@ class Settings:
             self.data = candidate
             self._save()
             return copy.deepcopy(self.data)
+
+    def apply_preset(self, name: str) -> dict:
+        if name not in PRESETS:
+            raise SettingsError(f"нет такого режима: {name}")
+        return self.update(preset_values(name))
 
     def reset(self) -> dict:
         with self._lock:

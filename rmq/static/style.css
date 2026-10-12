@@ -7,6 +7,7 @@
   --c2: #eb6834;
   --c3: #1baf7a;
   --c-other: #a5a39c;
+  --t1: #2a78d6; --t2: #eb6834; --t3: #1baf7a; --t4: #eda100; --t5: #e87ba4; --t6: #008300; --t7: #4a3aa7; --t8: #e34948;
   --page: #f9f9f7;
   --surface: #fcfcfb;
   --surface-2: #f2f1ed;
@@ -49,6 +50,7 @@
     --c2: #d95926;
     --c3: #199e70;
     --c-other: #6d6c67;
+    --t1: #3987e5; --t2: #d95926; --t3: #199e70; --t4: #c98500; --t5: #d55181; --t6: #008300; --t7: #9085e9; --t8: #e66767;
     --good-text: #0ca30c;
     --critical-text: #e66767;
     --accent: #3987e5;
@@ -65,6 +67,7 @@
   --c2: #d95926;
   --c3: #199e70;
   --c-other: #6d6c67;
+  --t1: #3987e5; --t2: #d95926; --t3: #199e70; --t4: #c98500; --t5: #d55181; --t6: #008300; --t7: #9085e9; --t8: #e66767;
   --page: #0d0d0d;
   --surface: #1a1a19;
   --surface-2: #232321;
@@ -235,6 +238,26 @@ main { max-width: 1440px; margin: 0 auto; padding: 16px 24px 60px; }
 .chart .na { height: 196px; display: grid; place-items: center; color: var(--muted); }
 .chart.wide { grid-column: 1 / -1; }
 .chart.wide .plot { height: 150px; }
+.chart.taskchart .plot { height: 230px; }
+.chart.taskchart .table-view { max-height: 230px; }
+.legend .task-key { cursor: pointer; }
+.legend .task-key:hover { color: var(--ink); }
+td.score-cell { cursor: help; }
+.score-cell .why { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.events a.tid { color: var(--ink-2); }
+.events .who { color: var(--muted); }
+.presets .modes { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.presets .modes button {
+  text-align: left; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+  cursor: pointer; display: grid; gap: 3px; color: var(--ink); align-content: start;
+}
+.presets .modes button span { color: var(--ink-2); font-size: 12.5px; }
+.presets .modes button[aria-pressed="true"] { border-color: var(--ink); box-shadow: inset 0 0 0 1px var(--ink); }
+.presets .note { margin-top: 8px; }
+.settings-basic .settings-sec:first-child { margin-top: 0; }
+details.settings-more { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 12px; }
+details.settings-more > summary { cursor: pointer; font-weight: 600; }
+@media (max-width: 860px) { .presets .modes { grid-template-columns: minmax(0, 1fr); } }
 .chart header .seg { margin-left: auto; }
 .seg.small button { padding: 2px 8px; font-size: 12px; }
 

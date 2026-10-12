@@ -67,3 +67,18 @@ def test_warm_limits_become_regulator_targets(tmp_path):
     assert t["board_target_c"] == DEFAULTS["thermal"]["board_target_c"]
     assert "warm_cpu_factor" not in t and "cpu_warm_c" not in t
     assert json.loads(path.read_text(encoding="utf-8")) == {"_version": 3, "thermal": {"cpu_target_c": 78.0}}
+
+
+def test_presets_set_the_main_knobs_and_are_recognised(tmp_path):
+    from rmq.settings import PRESETS, Settings, active_preset
+    s = Settings(tmp_path / "settings.json")
+    assert active_preset(s.snapshot()) == "standard"                 # the defaults are the standard preset
+    s.update({"game_mode": {"extra_ram_reserve_gb": 3.0}})            # not a preset knob: stays as it is
+    data = s.apply_preset("gentle")
+    assert data["thermal"]["cpu_target_c"] == 70.0 and active_preset(data) == "gentle"
+    assert data["game_mode"]["extra_ram_reserve_gb"] == 3.0
+    data = s.apply_preset("quiet")
+    assert data["reserve"]["cpu_pct_of_free"] == 40.0 and data["thermal"]["cpu_hot_c"] == 97.0  # gentle's are gone
+    s.update({"reserve": {"cpu_pct_of_free": 33.0}})
+    assert active_preset(s.snapshot()) is None                        # the owner's own values
+    assert set(PRESETS) == {"standard", "gentle", "quiet", "max"}

@@ -110,3 +110,14 @@ def test_only_statistics_files_can_be_downloaded(tmp_path):
     assert book.file_path("README.txt") is not None
     for bad in ("../settings.json", "current.json", "hourly.csv"):     # hourly.csv does not exist yet
         assert book.file_path(bad) is None
+
+
+def test_charts_keep_what_each_task_used_and_average_it():
+    from rmq.metrics import Metrics
+    m = Metrics(coarse_step=3)
+    for i in range(4):
+        m.add(1000.0 + i, {"cpu_tasks": 50.0, "tasks": {7: (40.0, 2.0, 0.0, 0.0), **({9: (10.0, 1.0, 0.5, 30.0)} if i < 2 else {})}})
+    fine = m.series(60)
+    assert fine["tasks"][0] == {"7": [40.0, 2.0, 0.0, 0.0], "9": [10.0, 1.0, 0.5, 30.0]} and "9" not in fine["tasks"][3]
+    coarse = m.series(7200)
+    assert coarse["tasks"][0]["7"][0] == 40.0 and coarse["tasks"][0]["9"][0] == 5.0  # present in 2 of the 4 points it averages

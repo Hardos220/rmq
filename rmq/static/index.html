@@ -75,7 +75,7 @@
         <thead><tr>
           <th>#</th><th>Задача</th><th>Агент</th><th>Состояние</th>
           <th class="num">CPU, яд.</th><th class="num">ОЗУ, ГБ</th><th class="num">VRAM, ГБ</th>
-          <th class="num">Время</th><th>Выполнено</th><th></th>
+          <th class="num">Время</th><th class="num" title="Очки и может ли задачу потеснить задача из очереди">Очки</th><th>Выполнено</th><th></th>
         </tr></thead><tbody></tbody>
       </table></div>
 
@@ -240,17 +240,23 @@
     </section>
 
     <section id="tab-rules" hidden>
-      <h2>Правила очереди (с текущими значениями)</h2>
-      <div class="card rules" id="rules"></div>
-      <h2>Настройки</h2>
+      <h2>Режим работы</h2>
+      <div class="card presets" id="presets"></div>
+      <h2>Основные настройки</h2>
       <form id="settings-form" class="card">
-        <div id="settings-fields"></div>
+        <div id="settings-basic" class="settings-basic"></div>
+        <details id="settings-more" class="settings-more">
+          <summary>Все настройки</summary>
+          <div id="settings-fields"></div>
+        </details>
         <div class="form-actions">
           <button class="primary btn" type="submit">Сохранить</button>
           <button class="btn" type="button" id="settings-reset">Сбросить к умолчаниям</button>
           <span id="settings-msg" class="msg"></span>
         </div>
       </form>
+      <h2>Как работают правила (с текущими значениями)</h2>
+      <div class="card rules" id="rules"></div>
     </section>
 
     <section id="tab-log" hidden>

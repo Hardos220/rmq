@@ -173,7 +173,7 @@
   // A trailing time window: each point is the mean of the samples from the last 5 seconds. Gaps in the
   // data stay gaps and missing values (a sleeping GPU) are skipped, never counted as zeros.
   const SMOOTH_S = 5;
-  const STATE_COLUMNS = new Set(['t', 'game', 'heat', 'running', 'queued', 'suspended']);
+  const STATE_COLUMNS = new Set(['t', 'game', 'heat', 'running', 'queued', 'suspended', 'tasks']);
   let SMOOTH = false;
   try { SMOOTH = localStorage.getItem('rmq_smooth') === '1'; } catch { /* ignore */ }
   let smoothCache = null;
@@ -479,6 +479,235 @@
     }),
   ];
   $('#charts').append(...charts.map((c) => c.root));
+
+  // ================================================================ resources by task (overview)
+  // Every running task as its own band, stacked over the owner's load: who takes how much at every moment.
+  // A task keeps its color while the page is open (color follows the task, not its rank); past eight
+  // tasks at once the rest fold into "Другие задачи".
+  const TASK_COLORS = ['--t1', '--t2', '--t3', '--t4', '--t5', '--t6', '--t7', '--t8'];
+  const taskSlot = new Map();
+  const TASK_NAMES = {};
+  const TASK_VIEWS = {
+    cpu: { label: 'Процессор', i: 0, user: 'cpu_user', max: () => 100, fmt: (v) => pct(v), tick: (v) => `${v}%`, unit: '% всего процессора' },
+    ram: { label: 'ОЗУ', i: 1, user: 'ram_user', max: (s) => s.system.ram.total, fmt: (v) => `${n1(v)} ГБ`, tick: (v) => `${nf2.format(v)}`, unit: 'ГБ' },
+    vram: { label: 'Видеопамять', i: 2, user: 'vram_user', max: (s) => (s.system.vram ? s.system.vram.total : 1), fmt: (v) => `${n1(v)} ГБ`, tick: (v) => `${nf2.format(v)}`, unit: 'ГБ', needsGpu: true },
+  };
+  class TaskChart {
+    constructor() {
+      this.view = 'cpu';
+      this.hover = null;
+      this.showTable = false;
+      this.buttons = {};
+      this.seg = h('div', { class: 'seg small', role: 'group', 'aria-label': 'Ресурс' }, Object.entries(TASK_VIEWS).map(([k, v]) => {
+        const b = h('button', { type: 'button', 'aria-pressed': String(k === this.view) }, v.label);
+        b.addEventListener('click', () => {
+          this.view = k;
+          Object.entries(this.buttons).forEach(([kk, bb]) => bb.setAttribute('aria-pressed', String(kk === k)));
+          this.update();
+        });
+        this.buttons[k] = b;
+        return b;
+      }));
+      this.sub = h('span', { class: 'sub' });
+      this.legend = h('div', { class: 'legend' });
+      this.canvas = h('canvas', { role: 'img', 'aria-label': 'Ресурсы по задачам: сколько берёт каждая задача в каждый момент; те же данные — в таблице' });
+      this.plot = h('div', { class: 'plot' }, this.canvas);
+      this.tableEl = h('div', { class: 'table-view', hidden: true });
+      this.root = h('section', { class: 'chart wide taskchart', 'aria-label': 'Ресурсы по задачам' },
+        h('header', null, h('span', { class: 'title' }, 'Ресурсы по задачам'), this.sub, this.seg, tableToggle(this)),
+        this.legend, this.plot, this.tableEl);
+      this.canvas.addEventListener('pointermove', (e) => this.onMove(e));
+      this.canvas.addEventListener('pointerleave', () => { this.hover = null; tooltip.hidden = true; this.draw(); });
+      new ResizeObserver(() => this.draw()).observe(this.plot);
+    }
+
+    // the bands: the owner's load at the bottom, then each task (fixed order: by task number)
+    series() {
+      const m = METRICS;
+      const v = TASK_VIEWS[this.view];
+      const ids = new Set();
+      if (m && m.tasks) {
+        for (const row of m.tasks) for (const [k, val] of Object.entries(row || {})) if (val[v.i] > 0.005) ids.add(Number(k));
+      }
+      const order = [...ids].sort((a, b) => a - b);
+      const used = new Set(order.map((id) => taskSlot.get(id)).filter((x) => x != null));
+      for (const id of order) {
+        if (taskSlot.has(id) && taskSlot.get(id) >= 0) continue;
+        const free = TASK_COLORS.findIndex((_, i) => !used.has(i));
+        taskSlot.set(id, free);
+        if (free >= 0) used.add(free);
+      }
+      const out = [{ id: 'user', label: 'Вы и система', color: '--axis', get: (i) => (m[v.user] && m[v.user][i]) || 0 }];
+      const other = [];
+      for (const id of order) {
+        const slot = taskSlot.get(id);
+        const get = (i) => { const r = m.tasks[i] && m.tasks[i][id]; return r ? r[v.i] : 0; };
+        if (slot < 0) { other.push(get); continue; }
+        const info = TASK_NAMES[id] || {};
+        out.push({ id, label: `#${id} ${info.name || ''}`.trim(), agent: info.agent, color: TASK_COLORS[slot], get });
+      }
+      if (other.length) out.push({ id: 'other', label: 'Другие задачи', color: '--c-other', get: (i) => other.reduce((a, g) => a + g(i), 0) });
+      return out;
+    }
+
+    update() {
+      if (!STATE) return;
+      const hasGpu = !!STATE.system.vram;
+      this.buttons.vram.hidden = !hasGpu;
+      if (this.view === 'vram' && !hasGpu) this.view = 'cpu';
+      this.plot.hidden = this.showTable;
+      this.tableEl.hidden = !this.showTable;
+      const ser = this.series();
+      const running = (STATE.tasks || []).filter((t) => t.state === 'running').length;
+      setText(this.sub, `${TASK_VIEWS[this.view].unit} · сейчас выполняется ${running}`);
+      this.renderLegend(ser);
+      if (this.showTable) this.renderTable(ser); else this.draw(ser);
+    }
+
+    lastIndex() { return METRICS && METRICS.t.length ? METRICS.t.length - 1 : -1; }
+
+    renderLegend(ser) {
+      const f = TASK_VIEWS[this.view].fmt;
+      const last = this.lastIndex();
+      this.legend.replaceChildren(...ser.map((s) => {
+        const val = last >= 0 ? s.get(last) : null;
+        const el = h('span', { class: typeof s.id === 'number' ? 'task-key' : null, title: s.agent ? `${s.label} · ${s.agent} — открыть карточку` : null },
+          h('span', { class: 'key', style: `background: var(${s.color})` }), `${s.label} `, h('b', null, val == null ? '–' : f(val)));
+        if (typeof s.id === 'number') el.addEventListener('click', () => openTask(s.id));
+        return el;
+      }));
+    }
+
+    renderTable(ser) {
+      const m = METRICS;
+      if (!m || !m.t.length) { this.tableEl.replaceChildren(h('p', { class: 'muted' }, 'Нет данных')); return; }
+      const n = m.t.length;
+      const stride = Math.max(1, Math.floor(n / 30));
+      const rowsI = [];
+      for (let i = n - 1; i >= 0; i -= stride) rowsI.push(i);
+      const f = TASK_VIEWS[this.view].fmt;
+      this.tableEl.replaceChildren(h('table', null,
+        h('thead', null, h('tr', null, h('th', null, 'Время'), ser.map((s) => h('th', { class: 'num' }, s.label)))),
+        h('tbody', null, rowsI.map((i) => h('tr', null, h('td', { class: 'num' }, clock(m.t[i], true)),
+          ser.map((s) => h('td', { class: 'num' }, f(s.get(i)))))))));
+    }
+
+    geometry() {
+      const w = this.plot.clientWidth;
+      const ht = this.plot.clientHeight;
+      const pad = { l: 46, r: 12, t: 8, b: 24 };
+      const max = Math.max(1e-6, TASK_VIEWS[this.view].max(STATE) || 1);
+      const t1 = METRICS && METRICS.t.length ? METRICS.t[METRICS.t.length - 1] : Date.now() / 1000;
+      const t0 = t1 - RANGE;
+      const pw = Math.max(10, w - pad.l - pad.r);
+      const ph = Math.max(10, ht - pad.t - pad.b);
+      return { w, ht, pad, max, t0, t1, pw, ph,
+        X: (t) => pad.l + ((t - t0) / (t1 - t0)) * pw,
+        Y: (v) => pad.t + ph - (Math.max(0, Math.min(max, v)) / max) * ph };
+    }
+
+    draw(ser) {
+      if (this.plot.hidden || !STATE) return;
+      ser = ser || this.series();
+      const dpr = window.devicePixelRatio || 1;
+      const g = this.geometry();
+      this.canvas.width = Math.round(g.w * dpr);
+      this.canvas.height = Math.round(g.ht * dpr);
+      const c = this.canvas.getContext('2d');
+      c.setTransform(dpr, 0, 0, dpr, 0, 0);
+      c.clearRect(0, 0, g.w, g.ht);
+      const col = { grid: cssVar('--grid'), axis: cssVar('--axis'), muted: cssVar('--muted'), surface: cssVar('--surface') };
+      const v = TASK_VIEWS[this.view];
+      c.font = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
+      c.lineWidth = 1;
+      c.textAlign = 'right';
+      c.textBaseline = 'middle';
+      for (const tv of yTicks(g.max, 4)) {
+        const y = Math.round(g.Y(tv)) + 0.5;
+        c.strokeStyle = tv === 0 ? col.axis : col.grid;
+        c.beginPath(); c.moveTo(g.pad.l, y); c.lineTo(g.w - g.pad.r, y); c.stroke();
+        c.fillStyle = col.muted;
+        c.fillText(v.tick(tv), g.pad.l - 6, y);
+      }
+      c.textAlign = 'center';
+      c.textBaseline = 'top';
+      for (const t of xTicks(g.t0, g.t1, g.pw).ticks) {
+        const x = g.X(t);
+        if (x < g.pad.l + 14 || x > g.w - g.pad.r - 14) continue;
+        c.fillStyle = col.muted;
+        c.fillText(clock(t), x, g.pad.t + g.ph + 6);
+      }
+      const m = METRICS;
+      if (!m || m.t.length < 2) {
+        c.fillStyle = col.muted; c.textBaseline = 'middle';
+        c.fillText('Данные появятся через пару секунд', g.pad.l + g.pw / 2, g.pad.t + g.ph / 2);
+        return;
+      }
+      c.save();
+      c.beginPath(); c.rect(g.pad.l, g.pad.t - 2, g.pw, g.ph + 4); c.clip();
+      const segs = charts[0].segments();
+      const n = m.t.length;
+      const base = new Float64Array(n);
+      for (const s of ser) {
+        const top = new Float64Array(n);
+        for (let i = 0; i < n; i += 1) top[i] = base[i] + (s.get(i) || 0);
+        const color = cssVar(s.color);
+        for (const [a, b] of segs) {
+          c.beginPath();
+          for (let i = a; i <= b; i += 1) c.lineTo(g.X(m.t[i]), g.Y(top[i]));
+          for (let i = b; i >= a; i -= 1) c.lineTo(g.X(m.t[i]), g.Y(base[i]));
+          c.closePath();
+          c.fillStyle = s.id === 'user' ? rgba(color, 0.55) : rgba(color, 0.85);
+          c.fill();
+          // a thin gap in the surface color between neighbouring bands
+          c.strokeStyle = col.surface; c.lineWidth = 1.5; c.lineJoin = 'round';
+          c.beginPath();
+          for (let i = a; i <= b; i += 1) c.lineTo(g.X(m.t[i]), g.Y(top[i]));
+          c.stroke();
+        }
+        base.set(top);
+      }
+      c.restore();
+      if (ser.length === 1) {
+        c.fillStyle = col.muted; c.textAlign = 'center'; c.textBaseline = 'middle';
+        c.fillText('В этом окне задачи не выполнялись', g.pad.l + g.pw / 2, g.pad.t + g.ph / 3);
+      }
+      if (this.hover != null && this.hover < n) {
+        const x = Math.round(g.X(m.t[this.hover])) + 0.5;
+        c.strokeStyle = col.axis; c.lineWidth = 1;
+        c.beginPath(); c.moveTo(x, g.pad.t); c.lineTo(x, g.pad.t + g.ph); c.stroke();
+      }
+    }
+
+    onMove(e) {
+      const m = METRICS;
+      if (!m || m.t.length < 2) return;
+      const g = this.geometry();
+      const rect = this.canvas.getBoundingClientRect();
+      const t = g.t0 + ((e.clientX - rect.left - g.pad.l) / g.pw) * (g.t1 - g.t0);
+      let lo = 0; let hi = m.t.length - 1;
+      while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (m.t[mid] < t) lo = mid; else hi = mid; }
+      const i = Math.abs(m.t[lo] - t) < Math.abs(m.t[hi] - t) ? lo : hi;
+      this.hover = i;
+      const ser = this.series();
+      this.draw(ser);
+      const f = TASK_VIEWS[this.view].fmt;
+      const rowsT = ser.slice().reverse().filter((s) => s.id === 'user' || s.get(i) > 0.005)
+        .map((s) => h('div', { class: 'r' }, h('span', { class: 'lk', style: `border-top-color: var(${s.color})` }),
+          h('b', null, f(s.get(i))), h('span', null, s.agent ? `${s.label} · ${s.agent}` : s.label)));
+      tooltip.replaceChildren(h('div', { class: 't' }, clock(m.t[i], true)), ...rowsT);
+      tooltip.hidden = false;
+      const tw = tooltip.offsetWidth; const th = tooltip.offsetHeight;
+      let left = e.clientX + 14; let top = e.clientY + 14;
+      if (left + tw > window.innerWidth - 8) left = e.clientX - tw - 14;
+      if (top + th > window.innerHeight - 8) top = e.clientY - th - 14;
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${top}px`;
+    }
+  }
+  const taskChart = new TaskChart();
+  $('#charts').append(taskChart.root);
+  charts.push(taskChart);
 
   // ================================================================ level charts: temperatures and the regulator's share
   // Small multiples, each on its own fixed scale, with reference lines for the limits and quiet bands for
@@ -1029,6 +1258,35 @@
       bar, h('div', { class: 'ptext' }, progressText(p))));
   };
 
+  // Running and frozen tasks have scores too; whether a waiting task may take the place of a running one is not
+  // a matter of scores alone (see planner.pick_victims), so the cell says it in words.
+  // [short text for the cell, the full explanation for its tooltip]
+  function standing(t) {
+    const st = t.standing;
+    if (t.state === 'suspended') {
+      return t.position ? [`${t.position}-я на возобновление`, 'Замороженные задачи возобновляются в порядке очков, когда для них освободится место.'] : ['', ''];
+    }
+    if (!st) return ['', ''];
+    const share = st.share != null ? ` Её агент занимает ${Math.round(st.share * 100)}% пула при честной доле ${Math.round(st.fair * 100)}%.` : '';
+    const rule = ' Задача из очереди может потеснить выполняющуюся, только если ждёт дольше 2 мин (короткая) или 10 мин и ей не хватает места, — очки решают лишь, кого из таких уступить первым.';
+    return {
+      protected: [`защищена ещё ${dur(st.left_s)}`, `Первые 20 мин после запуска или возобновления задачу не трогают.${rule}`],
+      overtime: ['может уступить место', `Работает дольше заявленного времени.${rule}`],
+      over: ['может уступить место', `Её агент занимает больше своей честной доли.${share}${rule}`],
+      fair: ['не вытесняется', `Её агент в пределах своей честной доли: задача из очереди её не потеснит.${share}`],
+      owner: ['не вытесняется', 'Ваша задача с высоким приоритетом укладывается в заявленное время.'],
+      stopping: ['останавливается', 'Сохраняет чекпоинт перед остановкой.'],
+    }[st.kind] || ['', ''];
+  }
+  const scoreCell = (td, t) => {
+    const [why, full] = standing(t);
+    const sig = `${t.score}|${why}`;
+    if (td._sig === sig) return;
+    td._sig = sig;
+    td.title = full;
+    fill(td, h('div', null, t.score != null ? String(Math.round(t.score)) : '–'), why ? h('div', { class: 'why' }, why) : null);
+  };
+
   const activeCols = [
     ['num', textCell((t) => String(t.id))],
     [null, nameCell],
@@ -1039,6 +1297,7 @@
     ['num', textCell((t) => `${t.used ? n1(t.used.ram) : '–'} / ${num(t.ram)}`)],
     ['num', textCell((t) => (t.vram || (t.used && t.used.vram > 0.05) ? `${t.used ? n1(t.used.vram) : '–'} / ${num(t.vram)}` : '–'))],
     ['num', textCell((t) => `${dur(t.run_s)} / ${dur(t.time_s)}`)],
+    ['num score-cell', scoreCell],
     [null, progressCell],
     ['actions', actionsCell],
   ];
@@ -1304,30 +1563,66 @@
     'tasks.default_preempt': ['suspend', 'requeue'], 'agents.default_max_priority': ['low', 'normal', 'high'],
   };
 
+  // The main knobs, shown first; everything else is under "Все настройки"
+  const BASIC = [
+    ['Резерв для вас', [['reserve.cpu_pct_of_free', 'Процессор: оставлять вам, % свободного'], ['reserve.ram_pct_of_free', 'Память: оставлять вам, % свободной']]],
+    ['Цели температуры', [['thermal.cpu_target_c', 'Процессор, °C'], ['thermal.board_target_c', 'Плата (ACPI), °C'], ['thermal.gpu_target_c', 'Видеокарта, °C'], ['thermal.ssd_target_c', 'SSD, °C']]],
+    ['Игры', [['game_mode.pause_gpu_tasks', 'Ставить GPU-задачи на паузу во время игры'], ['game_mode.cpu_cores', 'Ядра для задач во время игры (efficiency — E-ядра, all — все)']]],
+    ['Сон, диск, обновления', [['power.keep_awake_while_running', 'Не давать ПК уснуть, пока идут расчёты'], ['power.keep_awake_on_battery', 'Не давать уснуть и при работе от батареи'],
+      ['disk.min_free_gb', 'Замораживать задачи, если на диске свободно меньше, ГБ'], ['update.auto', 'Проверять и ставить обновления автоматически']]],
+  ];
+  const BASIC_NAMES = new Set(BASIC.flatMap(([, f]) => f.map(([n]) => n)));
+
+  function settingField(S, name, label) {
+    const [sec, key] = name.split('.');
+    const v = S[sec][key];
+    let input;
+    if (typeof v === 'boolean') {
+      input = h('input', { type: 'checkbox', name });
+      input.checked = v;
+      return h('label', { class: 'chk wide' }, input, label);
+    }
+    if (Array.isArray(v)) input = h('textarea', { name }, v.join('\n'));
+    else if (ENUMS[name]) { input = h('select', { name }, ENUMS[name].map((o) => h('option', { value: o }, o))); input.value = v; }
+    else if (typeof v === 'number') input = h('input', { type: 'number', name, step: 'any', min: '0', value: String(v) });
+    else input = h('input', { name, value: v });
+    return h('label', { class: `f${Array.isArray(v) ? ' wide' : ''}` }, label, input);
+  }
+
   function renderSettingsForm(S) {
-    const box = $('#settings-fields');
+    $('#settings-basic').replaceChildren(...BASIC.map(([title, fields]) => h('div', { class: 'settings-sec' }, h('h3', null, title),
+      h('div', { class: 'form-grid' }, fields.map(([name, label]) => settingField(S, name, label))))));
     const secs = [];
     for (const [sec, [title, labels]] of Object.entries(LABELS)) {
-      const fields = [];
-      for (const [key, label] of Object.entries(labels)) {
-        const v = S[sec][key];
-        const name = `${sec}.${key}`;
-        let input;
-        if (typeof v === 'boolean') {
-          input = h('input', { type: 'checkbox', name });
-          input.checked = v;
-          fields.push(h('label', { class: 'chk wide' }, input, label));
-          continue;
-        }
-        if (Array.isArray(v)) input = h('textarea', { name }, v.join('\n'));
-        else if (ENUMS[name]) { input = h('select', { name }, ENUMS[name].map((o) => h('option', { value: o }, o))); input.value = v; }
-        else if (typeof v === 'number') input = h('input', { type: 'number', name, step: 'any', min: '0', value: String(v) });
-        else input = h('input', { name, value: v });
-        fields.push(h('label', { class: `f${Array.isArray(v) ? ' wide' : ''}` }, label, input));
-      }
-      secs.push(h('div', { class: 'settings-sec' }, h('h3', null, title), h('div', { class: 'form-grid' }, fields)));
+      const fields = Object.entries(labels).filter(([key]) => !BASIC_NAMES.has(`${sec}.${key}`))
+        .map(([key, label]) => settingField(S, `${sec}.${key}`, label));
+      if (fields.length) secs.push(h('div', { class: 'settings-sec' }, h('h3', null, title), h('div', { class: 'form-grid' }, fields)));
     }
-    box.replaceChildren(...secs);
+    $('#settings-fields').replaceChildren(...secs);
+    renderPresets(S);
+  }
+
+  function renderPresets(S) {
+    const pr = S._presets;
+    if (!pr) return;
+    const own = !pr.active;
+    $('#presets').replaceChildren(
+      h('div', { class: 'modes', role: 'group', 'aria-label': 'Режим работы' }, pr.list.map((p) => {
+        const b = h('button', { type: 'button', 'aria-pressed': String(pr.active === p.id) }, h('b', null, p.title), h('span', null, p.text));
+        b.addEventListener('click', async () => {
+          if (pr.active === p.id) return;
+          if (own && !confirm(`Ваши собственные значения резерва, целей температуры и порога GPU заменятся значениями режима «${p.title}». Остальные настройки не изменятся. Продолжить?`)) return;
+          try {
+            SETTINGS = await api('POST', '/api/settings/preset', { preset: p.id });
+            renderRules(SETTINGS); renderSettingsForm(SETTINGS);
+            const msg = $('#settings-msg'); msg.className = 'msg ok'; setText(msg, `Режим «${p.title}» включён`);
+          } catch (e) { alert(e.message); }
+        });
+        return b;
+      })),
+      h('p', { class: 'small ink2 note' }, own
+        ? 'Сейчас свои настройки: значения отличаются от всех режимов. Выберите режим, чтобы вернуться к готовому набору.'
+        : 'Режим задаёт резерв для вас, цели и пороги температуры и порог загрузки видеокарты. Остальные настройки остаются как есть; их можно менять ниже.'));
   }
 
   function renderRules(S) {
@@ -1400,12 +1695,23 @@
   });
 
   // ================================================================ events
-  function renderEvents(list, box) {
+  function renderEvents(list, box, withTask = true) {
     const sig = list.length ? `${list[0].id}|${list.length}` : '';
     if (box.dataset.sig === sig) return;
     box.dataset.sig = sig;
-    box.replaceChildren(...(list.length ? list.map((e) => h('li', null, h('span', { class: 'ts' }, stamp(e.ts)),
-      h('span', { class: 'tid' }, e.task_id ? `#${e.task_id}` : ''), h('span', null, e.message))) : [h('li', { class: 'muted' }, 'Событий пока нет')]));
+    const tid = (e) => {
+      if (!e.task_id) return h('span', { class: 'tid' }, '');
+      const a = h('a', { class: 'tid', href: '#', title: 'Открыть карточку задачи' }, `#${e.task_id}`);
+      a.addEventListener('click', (ev) => { ev.preventDefault(); openTask(e.task_id); });
+      return a;
+    };
+    const what = (e) => {
+      if (!(withTask && e.task_id && e.task_name)) return [e.message];
+      const msg = e.message === `Поставлена в очередь: ${e.task_name}` ? 'Поставлена в очередь' : e.message;
+      return [h('b', null, `«${e.task_name}»`), e.agent_name ? h('span', { class: 'who' }, ` · ${e.agent_name}`) : null, ' — ', msg];
+    };
+    box.replaceChildren(...(list.length ? list.map((e) => h('li', null, h('span', { class: 'ts' }, stamp(e.ts)), tid(e),
+      h('span', null, ...what(e)))) : [h('li', { class: 'muted' }, 'Событий пока нет')]));
   }
 
   // ================================================================ task drawer
@@ -1479,7 +1785,7 @@
         t.exit_code != null ? ['Код выхода', String(t.exit_code)] : null,
       ].filter(Boolean);
       $('#drawer-kv').replaceChildren(...rowsKV.flatMap(([k, v]) => [h('dt', null, k), h('dd', { class: k === 'Команда' || k === 'Папка' ? 'mono' : null }, v)]));
-      renderEvents(t.events || [], $('#drawer-events'));
+      renderEvents(t.events || [], $('#drawer-events'), false);
       // log tail
       const box = $('#logbox');
       const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
@@ -2678,6 +2984,7 @@
   async function loadMetrics(full) {
     const since = !full && METRICS && METRICS.t.length ? METRICS.t[METRICS.t.length - 1] : 0;
     const m = await api('GET', `/api/metrics?range=${RANGE}&since=${since}`);
+    Object.assign(TASK_NAMES, m.task_names || {});
     if (full || !METRICS || METRICS.step !== m.step) { METRICS = m; return; }
     for (const k of Object.keys(m)) if (Array.isArray(m[k])) METRICS[k].push(...m[k]);
     const cut = METRICS.t.length ? METRICS.t[METRICS.t.length - 1] - RANGE - 5 : 0;
