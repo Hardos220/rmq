@@ -30,8 +30,8 @@ echo Дальше его открывает ярлык «Менеджер рес
 echo.
 echo По желанию:
 echo  - температура процессора: tools\README.md, нужен один запрос UAC;
-echo  - вычислительная сеть с другими ПК: установите Tailscale https://tailscale.com/download ,
-echo    войдите в него и откройте вкладку «Сеть» в дашборде;
+echo  - вычислительная сеть с другими ПК: вкладка «Сеть» в дашборде, там пошаговая инструкция
+echo    (понадобится Tailscale: https://tailscale.com/download );
 echo  - автозапуск при входе в Windows: Win+R, shell:startup, скопируйте туда ярлык.
 echo.
 pause

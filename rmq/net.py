@@ -49,6 +49,7 @@ DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 HELLO_EVERY_S = 30
 SYNC_EVERY_S = 3
 ONLINE_S = 95          # a member is "in the network" if it answered within this time
+REACH_S = 150          # "this PC gets through to that one" if one of its own requests got there within this time
 MAX_JSON = 1 << 20
 
 
@@ -244,6 +245,8 @@ class NetService:
 
     def _hello(self, nid: str, rec: dict) -> None:
         t0 = time.monotonic()
+        with self._lock:
+            self.live.setdefault(nid, {})["out_try"] = time.time()
         try:
             r = self._request(rec["address"], "POST", "/net/v1/hello",
                               body=json.dumps({"info": self.self_info(), "members": self.store.members},
@@ -254,6 +257,8 @@ class NetService:
             return
         rtt = (time.monotonic() - t0) * 1000
         self._note_peer(r.get("info") or {}, rtt)
+        with self._lock:  # whether that PC gets through to this one (None: an older version that does not say)
+            self.live.setdefault(nid, {})["they_reach"] = r.get("reached")
         if self.store.merge(r.get("members") or {}):
             self.poke()
 
@@ -263,14 +268,29 @@ class NetService:
             return
         with self._lock:
             cur = self.live.setdefault(nid, {})
-            cur.update(seen=time.time(), info=info, error="")
-            if rtt is not None:
-                cur["rtt_ms"] = round(rtt)
+            cur.update(seen=time.time(), info=info)
+            if rtt is not None:  # this PC's own request got through (its hellos to us say nothing about that)
+                cur.update(rtt_ms=round(rtt), error="", out_ok=time.time())
 
     def online(self, nid: str) -> bool:
         with self._lock:
             seen = self.live.get(nid, {}).get("seen", 0)
         return time.time() - seen <= ONLINE_S
+
+    def reaches(self, nid: str) -> bool | None:
+        """Whether this PC's requests get through to that one lately; None while it has not tried.
+
+        A PC can hear from a member and still be unable to reach it: the member's firewall may block incoming
+        connections, or in Tailscale it may be shared only one way. Each side tells the other in its hello answer,
+        so the dashboard can say on which PC the problem is."""
+        with self._lock:
+            lv = dict(self.live.get(nid, {}))
+        now = time.time()
+        if now - lv.get("out_ok", 0) <= REACH_S:
+            return True
+        if now - lv.get("out_try", 0) <= REACH_S:
+            return False
+        return None
 
     # ------------------------------------------------------------ owner actions
     def create(self, name: str) -> dict:
@@ -398,6 +418,7 @@ class NetService:
                             "left": bool(rec.get("left_at")), "left_at": rec.get("left_at"),
                             "online": not rec.get("left_at") and time.time() - lv.get("seen", 0) <= ONLINE_S,
                             "seen": lv.get("seen"), "rtt_ms": lv.get("rtt_ms"), "error": lv.get("error"),
+                            "reaches": self.reaches(nid), "they_reach": lv.get("they_reach"),
                             "info": lv.get("info"), "joined_at": rec.get("joined_at")})
         net = st.network
         return {"node_id": st.node_id, "node_name": st.node_name, "mode": st.mode, "status": self.status,
@@ -660,7 +681,7 @@ class NetHandler(BaseHTTPRequestHandler):
             svc.store.merge({node: {"name": info.get("name"), "address": info.get("address"),
                                     "joined_at": time.time(), "updated_at": time.time(), "left_at": None}})
         svc._note_peer(info)
-        self._json(200, {"info": svc.self_info(), "members": svc.store.members})
+        self._json(200, {"info": svc.self_info(), "members": svc.store.members, "reached": svc.reaches(node)})
 
     def _join(self, svc: NetService, node: str, body: dict) -> None:
         info, rec = body.get("info") or {}, body.get("record") or {}

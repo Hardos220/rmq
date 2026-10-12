@@ -2395,6 +2395,7 @@
   let NETVIEW = null;
   let netLoadedAt = 0;
   let inviteCode = '';
+  let netHelpOpen = false;
   const MODE_INFO = {
     two_way: ['Двусторонний', 'Ваши агенты могут считать на других ПК, а участники — на вашем (с низким приоритетом).'],
     one_way: ['Только для себя', 'Ваши агенты по-прежнему могут считать на других ПК, а ваш ПК — только ваш: задачи участников здесь стоят.'],
@@ -2423,13 +2424,51 @@
         h('span', { class: 'title' }, v.network ? `Сеть «${v.network.name}»` : 'Вычислительная сеть'),
         h('span', { class: `net-status ${v.status === 'listening' ? 'on' : ''}` }, h('i'), status),
         h('span', { class: 'small ink2' }, `Этот ПК: ${v.node_name}`),
-        h('span', { class: 'small ink2' }, ts ? `Tailscale: ${ts}` : 'Tailscale не найден: установите его с tailscale.com/download и войдите')),
+        h('span', { class: 'small ink2' }, ts ? `Tailscale: ${ts}` : 'Tailscale не найден: установите его и войдите (как — в инструкции ниже)')),
       v.error ? h('div', { class: 'msg err' }, v.error) : null,
       h('div', { class: 'modes', role: 'group', 'aria-label': 'Режим сети' }, Object.entries(MODE_INFO).map(([k, [title, text]]) => {
         const b = h('button', { type: 'button', 'aria-pressed': String(v.mode === k) }, h('b', null, title), h('span', null, text));
         b.addEventListener('click', () => { if (v.mode !== k) netCall('/api/network/mode', { mode: k }); });
         return b;
       })));
+  }
+
+  function netHelp(inNetwork) {
+    const repo = (STATE && STATE.update && STATE.update.repo) || '';
+    const where = repo ? `github.com/${repo}/releases/latest` : 'страницы релизов менеджера на GitHub';
+    const steps = [
+      ['Tailscale на обоих ПК.', 'Установите его с tailscale.com/download и войдите (подойдёт аккаунт Google, Microsoft или GitHub). Значок Tailscale в трее должен показывать «Connected».'],
+      ['ПК видят друг друга в Tailscale.', 'Проще всего пригласить друга в свою сеть Tailscale: login.tailscale.com/admin/users → Invite users. Если в вашей сети Tailscale есть и другие ваши устройства, безопаснее обменяться только ПК: Machines → «⋯» у ПК → Share. Делиться нужно в обе стороны, иначе задачи пойдут только в одну.'],
+      ['Менеджер у друга.', `Архив rmq-….zip с ${where}: распаковать в постоянную папку (например, C:\\RMQ) и запустить install.cmd. Нужен Python 3.10+ с python.org.`],
+      ['Код приглашения.', 'Один ПК создаёт сеть и нажимает «Получить код приглашения», второй вставляет код в «Присоединиться по коду». Код — как пароль от сети: пересылайте его только тому, кого приглашаете.'],
+      ['Брандмауэр Windows.', 'Когда Windows спросит, разрешить ли Python доступ к сети, нажмите «Разрешить доступ» — на обоих ПК. Иначе другой ПК не сможет до вас достучаться.'],
+      ['Понятное имя.', 'Переименуйте ПК в карточке «Этот ПК в сети» (например, «Иван»): по этому имени агенты отправляют туда задачи (rmq submit --where Иван …).'],
+    ];
+    const trouble = [
+      'ПК «не в сети» — на нём выключен сам ПК, менеджер или Tailscale. В Tailscale (Machines) оба ПК должны быть видны и подключены.',
+      'В таблице ниже написано, что ПК не может связаться с другим, — на том ПК брандмауэр не пускает Python или ПК не поделился в Tailscale.',
+      'Если Python в брандмауэре случайно запретили: Панель управления → Брандмауэр Защитника Windows → Разрешение взаимодействия с приложением → «Изменить параметры» → у Python (pythonw.exe) отметить «Частная».',
+      'Включённый VPN может мешать Tailscale. Если связь пропадает только с VPN, исключите Tailscale из VPN или выключите VPN.',
+      '«Часы расходятся больше чем на 5 минут» — включите в Windows «Установить время автоматически» (Параметры → Время и язык).',
+    ];
+    const body = [
+      h('p', { class: 'small ink2' }, 'Обоим ПК нужны этот менеджер и Tailscale — бесплатная зашифрованная частная сеть, которая работает через любой роутер.'),
+      h('ol', null, steps.map(([b, t]) => h('li', null, h('b', null, b), ' ', t))),
+      h('h4', null, 'Если связи нет'),
+      h('ul', null, trouble.map((t) => h('li', null, t))),
+    ];
+    if (!inNetwork) return h('div', { class: 'card net-help' }, h('h3', null, 'Как подключить ПК друга'), body);
+    return h('details', { class: 'card net-help', open: netHelpOpen, ontoggle: (e) => { netHelpOpen = e.currentTarget.open; } },
+      h('summary', null, h('b', null, 'Как подключить ещё один ПК и что делать, если нет связи')), body);
+  }
+
+  function netNotes(m) {
+    // only for a member that is alive (its hellos arrive): then a failure in one direction is a setting, not an outage
+    if (m.self || m.left || !m.online) return [];
+    const out = [];
+    if (m.error && m.reaches === false) out.push(['Этот ПК не может связаться с ним. Скорее всего, там брандмауэр Windows не пускает Python или ПК не поделился с вами в Tailscale.', m.error]);
+    if (m.they_reach === false) out.push(['Он не может связаться с этим ПК. Разрешите Python в брандмауэре Windows (частные сети) и проверьте, что этот ПК виден ему в Tailscale.', null]);
+    return out.map(([t, why]) => h('div', { class: 'net-note', title: why }, t));
   }
 
   function renderNetActions(v) {
@@ -2442,8 +2481,9 @@
         name, h('div', null, h('button', { class: 'btn primary', type: 'button', onclick: () => netCall('/api/network/create', { name: name.value }) }, 'Создать'))));
       const code = h('textarea', { id: 'net-join-code', placeholder: 'rmq1-…', 'aria-label': 'Код приглашения' });
       cards.push(h('div', { class: 'card' }, h('h3', null, 'Присоединиться по коду'),
-        h('p', { class: 'small ink2' }, 'Вставьте код приглашения, который прислал участник сети. Нужен запущенный Tailscale в той же сети Tailscale.'),
+        h('p', { class: 'small ink2' }, 'Вставьте код приглашения, который прислал участник сети. Нужен запущенный Tailscale, в котором ПК видят друг друга (см. инструкцию).'),
         code, h('div', null, h('button', { class: 'btn primary', type: 'button', onclick: () => netCall('/api/network/join', { code: code.value }) }, 'Присоединиться'))));
+      cards.push(netHelp(false));
     } else {
       const codeBox = h('div', { class: 'invite-code', hidden: !inviteCode }, inviteCode);
       const copy = h('button', { class: 'btn', type: 'button', hidden: !inviteCode }, 'Скопировать');
@@ -2451,7 +2491,7 @@
         try { await navigator.clipboard.writeText(inviteCode); setText(copy, 'Скопировано'); } catch { /* the code is selectable */ }
       });
       cards.push(h('div', { class: 'card' }, h('h3', null, 'Пригласить ПК'),
-        h('p', { class: 'small ink2' }, 'Код — как пароль от сети: отправьте его только тому, кому доверяете (в мессенджере). Второму ПК нужны Tailscale в вашей сети Tailscale и этот менеджер.'),
+        h('p', { class: 'small ink2' }, 'Код — как пароль от сети: отправьте его только тому, кому доверяете (в мессенджере). Второму ПК нужны этот менеджер и Tailscale, в котором он видит ваш ПК.'),
         h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', type: 'button', onclick: async () => {
           try { inviteCode = (await api('POST', '/api/network/invite', {})).code; renderNetActions(NETVIEW); } catch (e) { alert(e.message); }
         } }, 'Получить код приглашения'), copy), codeBox));
@@ -2466,6 +2506,7 @@
               netCall('/api/network/leave');
             }
           } }, 'Выйти из сети'))));
+      cards.push(netHelp(true));
     }
     box.replaceChildren(...cards);
   }
@@ -2493,7 +2534,7 @@
       const known = m.online || m.self;
       return h('tr', { class: m.left ? 'off' : null },
         h('td', null, h('div', { class: 'name' }, m.name), h('div', { class: 'cmd' }, hw.os || '')),
-        h('td', null, link),
+        h('td', null, link, netNotes(m)),
         h('td', null, known ? `${(MODE_INFO[info.mode] || ['?'])[0]}${flags.length ? ` · ${flags.join(', ')}` : ''}` : '–'),
         h('td', null, hw.cpu ? `${hw.cpu}, ${hw.threads} потоков` : '–'),
         num(hw.ram_gb ? `${n1(hw.ram_gb)} ГБ` : '–'),

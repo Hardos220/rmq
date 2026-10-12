@@ -5,9 +5,10 @@ import zipfile
 
 import pytest
 
+from rmq.net import NetService
 from rmq.netbase import (NetError, NetStore, NonceCache, body_hash, changed_files, collect_files, make_invite,
                          make_zip, matches_any, parse_invite, requirements_hash, safe_extract, safe_name, sign_headers,
-                         verify)
+                         tailscale_address, verify)
 from test_planner import acts, run, task
 
 KEY = b"k" * 32
@@ -64,6 +65,34 @@ def test_membership_newest_record_wins_and_departures_spread(tmp_path):
     st.merge({st.node_id: {"name": "impostor", "updated_at": 99}})          # nobody rewrites this PC's record
     assert st.node_id not in st.members or st.members[st.node_id].get("name") != "impostor"
     assert NetStore(tmp_path / "network.json").members["n-b"]["address"] == "2:2"   # saved
+
+
+def test_each_side_knows_whether_its_own_requests_get_through(tmp_path):
+    class Manager:
+        netstore = NetStore(tmp_path / "network.json")
+
+    svc = NetService(Manager())
+    assert svc.reaches("n-b") is None                     # has not tried yet: no verdict
+    svc.live["n-b"] = {"out_try": time.time()}
+    assert svc.reaches("n-b") is False                    # tried, nothing got through
+    svc._note_peer({"node_id": "n-b"})                    # its hellos to us arrive: says nothing about ours
+    assert svc.reaches("n-b") is False and svc.online("n-b")
+    svc._note_peer({"node_id": "n-b"}, rtt=18.0)          # our own hello got an answer
+    assert svc.reaches("n-b") is True and svc.live["n-b"]["rtt_ms"] == 18
+    svc.pool.shutdown()
+
+
+def test_the_tailscale_adapter_wins_over_a_provider_address_in_the_same_range(monkeypatch):
+    psutil = pytest.importorskip("psutil")
+    from collections import namedtuple
+    import socket
+    addr, stat = namedtuple("addr", "family address"), namedtuple("stat", "isup")
+    monkeypatch.setattr(psutil, "net_if_addrs", lambda: {"Mobile": [addr(socket.AF_INET, "100.70.1.2")],
+                                                         "Tailscale": [addr(socket.AF_INET, "100.101.1.1")]})
+    monkeypatch.setattr(psutil, "net_if_stats", lambda: {"Mobile": stat(True), "Tailscale": stat(True)})
+    assert tailscale_address() == "100.101.1.1"
+    monkeypatch.setattr(psutil, "net_if_stats", lambda: {"Mobile": stat(True), "Tailscale": stat(False)})
+    assert tailscale_address() == "100.70.1.2"            # Tailscale is off: the only address in the range
 
 
 # ---------------------------------------------------------------- the project goes there, the results come back

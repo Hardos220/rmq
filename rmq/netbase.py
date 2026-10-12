@@ -176,19 +176,21 @@ def verify(headers, key: bytes, network_id: str, method: str, path: str, nonces:
 
 # ---------------------------------------------------------------- where this PC is reachable
 def tailscale_address() -> str | None:
-    """This PC's Tailscale IPv4 (100.64.0.0/10), if Tailscale is installed and connected."""
+    """This PC's Tailscale IPv4 (100.64.0.0/10), if Tailscale is installed and connected. Tailscale's own adapter
+    comes first: a provider's shared (CGNAT) address on another adapter can fall in the same range."""
     try:
         import psutil
         stats = psutil.net_if_stats()
+        found = []
         for name, addrs in psutil.net_if_addrs().items():
             if name in stats and not stats[name].isup:
                 continue
             for a in addrs:
                 if a.family == socket.AF_INET and ipaddress.ip_address(a.address) in TAILSCALE_NET:
-                    return a.address
+                    found.append((0 if "tailscale" in name.lower() else 1, a.address))
     except Exception:
         return None
-    return None
+    return min(found)[1] if found else None
 
 
 # ---------------------------------------------------------------- packing a project for another PC

@@ -280,6 +280,13 @@ ul.files li .btn { margin-left: auto; font-size: 12px; padding: 2px 8px; }
 .net-status i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--axis); }
 .net-status.on i { background: var(--good); }
 .net-status.self i { background: var(--accent); }
+.net-note { font-size: 12px; color: var(--ink-2); white-space: normal; max-width: 360px; margin-top: 4px; }
+.net-note::before { content: "▲ "; color: var(--serious); }
+.net-actions .net-help { grid-column: 1 / -1; }
+.net-help ol, .net-help ul { margin: 0; padding-left: 22px; display: grid; gap: 6px; max-width: 980px; }
+.net-help h4 { margin: 6px 0 0; }
+.net-help summary { cursor: pointer; }
+details.net-help[open] summary { margin-bottom: 8px; }
 @media (max-width: 860px) { .net-head .modes { grid-template-columns: minmax(0, 1fr); } }
 
 /* ---------------------------------------------------------------- chronicle */
