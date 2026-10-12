@@ -74,6 +74,17 @@ class Updater:
         self._busy = threading.Lock()
         self._last_try = 0.0
         self._report_finished_update()
+        if self.status["state"] != "dev":  # the owner of a developer copy makes his own shortcut
+            threading.Thread(target=self._ensure_shortcut, name="rmq-shortcut", daemon=True).start()
+
+    def _ensure_shortcut(self) -> None:
+        try:
+            from .install import ensure_shortcut
+            done = ensure_shortcut(self.m.home)
+            if done:
+                log.info("%s", done)
+        except (Exception, SystemExit) as e:
+            log.warning("could not make the desktop shortcut: %s", e)
 
     def _report_finished_update(self) -> None:
         for stage in self.dir.glob("*"):  # unpacked releases left from an earlier update
@@ -93,6 +104,9 @@ class Updater:
                 install_agent_rules(only_present=True)
             except Exception as e:
                 log.warning("could not refresh the agents' rules after the update: %s", e)
+            if not self.m.db.kv_get("dashboard_seen"):
+                # the dashboard never worked here (version 1.1.1 could fail to show it): show it once, now fixed
+                self.m.open_dashboard_once = True
         else:
             self.m.db.event("update", f"Обновление до {info.get('version')} не удалось: {info.get('error')}")
         info["reported"] = True

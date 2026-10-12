@@ -604,7 +604,7 @@ def cmd_serve(args) -> int:
 
 def cmd_install_shortcut(args) -> int:
     from rmq.install import install_shortcut
-    print(install_shortcut())
+    print(install_shortcut(home()))
     return 0
 
 

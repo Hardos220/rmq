@@ -16,7 +16,7 @@ if not exist ".venv\Scripts\python.exe" %PY% -m venv .venv || goto :fail
 ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -q -r requirements.txt || goto :fail
 
 echo [rmq] 2/4 ярлык на рабочем столе...
-".venv\Scripts\python.exe" rmq_cli.py install-shortcut || goto :fail
+".venv\Scripts\python.exe" rmq_cli.py install-shortcut || echo [rmq] ярлыка нет: открывайте менеджер файлом start.cmd в этой папке
 
 echo [rmq] 3/4 правила для ИИ-агентов...
 ".venv\Scripts\python.exe" rmq_cli.py install-agents

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-import mimetypes
+import pathlib
 import re
 import socket
 import sys
@@ -37,6 +37,19 @@ def route(method: str, pattern: str):
         ROUTES.append((method, re.compile(f"^{pattern}$"), fn.__name__))
         return fn
     return deco
+
+
+# Types of the dashboard's own files. Python's mimetypes reads them from the Windows registry, where other software
+# sometimes registers .js as text/plain; the browser then refuses to run the dashboard's script (nosniff).
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8", ".svg": "image/svg+xml; charset=utf-8", ".ico": "image/x-icon",
+    ".png": "image/png", ".txt": "text/plain; charset=utf-8", ".csv": "text/csv; charset=utf-8",
+}
+
+
+def content_type(name: str) -> str:
+    return CONTENT_TYPES.get(pathlib.PurePath(name).suffix.lower(), "application/octet-stream")
 
 
 class Server(ThreadingHTTPServer):
@@ -138,10 +151,7 @@ class Handler(BaseHTTPRequestHandler):
         target = (STATIC / name).resolve()
         if STATIC.resolve() not in target.parents or not target.is_file():
             return self._json(404, {"error": "не найдено"})
-        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        if ctype.startswith("text/") or ctype in ("application/javascript", "image/svg+xml"):
-            ctype += "; charset=utf-8"
-        self._send(200, target.read_bytes(), ctype, {
+        self._send(200, target.read_bytes(), content_type(target.name), {
             "Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
         })
 
@@ -181,6 +191,8 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", "/api/state")
     def state(self, ident, body, q):
+        if ident.admin:
+            self.manager.dashboard_seen()
         return self.manager.get_state(ident)
 
     @route("GET", "/api/metrics")
@@ -391,7 +403,7 @@ def serve(home: Path, open_browser: bool = False) -> int:
     (home / "dashboard_url.txt").write_text(url, encoding="utf-8")
     log.info("RMQ %s is running. Dashboard: http://127.0.0.1:%d (full link with the token: %s)",
              __version__, port, home / "dashboard_url.txt")
-    if open_browser:
+    if open_browser or manager.open_dashboard_once:
         webbrowser.open(url)
     try:
         httpd.serve_forever(poll_interval=0.5)

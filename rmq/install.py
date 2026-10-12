@@ -113,7 +113,50 @@ def install_agent_rules(remove: bool = False, only_present: bool = False) -> str
     return "\n".join(lines) or "Не найдено ни одного установленного ИИ-инструмента"
 
 
-def install_shortcut() -> str:
+def desktop_folder() -> Path:
+    """The user's real Desktop folder (it may live in OneDrive)."""
+    try:
+        import ctypes
+        import uuid
+        shell32, ole32 = ctypes.WinDLL("shell32"), ctypes.WinDLL("ole32")
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+        shell32.SHGetKnownFolderPath.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+                                                 ctypes.POINTER(ctypes.c_wchar_p)]
+        guid = (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID("B4BFCC3A-DB2C-424C-B029-7FE99A87C641").bytes_le)
+        out = ctypes.c_wchar_p()
+        if shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(out)) == 0 and out.value:
+            path = out.value
+            ole32.CoTaskMemFree(out)
+            return Path(path)
+    except (OSError, AttributeError, ValueError):
+        pass
+    return Path.home() / "Desktop"
+
+
+SHORTCUT = "Менеджер ресурсов.lnk"
+LAUNCHER = "Менеджер ресурсов.cmd"   # made instead of the shortcut where PowerShell may not create one
+
+
+def _shortcut_mark(home: Path | None) -> Path:
+    return Path(home or ROOT / "data") / "shortcut.txt"
+
+
+def ensure_shortcut(home: Path | None = None) -> str | None:
+    """Once per installation: make the desktop shortcut if this installation never got one (version 1.1.1 could
+    fail at it silently). A shortcut the owner deletes later is not brought back."""
+    mark = _shortcut_mark(home)
+    if mark.exists():
+        return None
+    desk = desktop_folder()
+    for name in (SHORTCUT, LAUNCHER):
+        if (desk / name).exists():
+            mark.parent.mkdir(parents=True, exist_ok=True)
+            mark.write_text(str(desk / name), encoding="utf-8")
+            return None
+    return install_shortcut(home)
+
+
+def install_shortcut(home: Path | None = None) -> str:
     pyw = ROOT / ".venv" / "Scripts" / "pythonw.exe"
     if not pyw.exists():
         raise SystemExit(f"сначала подготовьте окружение: {ROOT / 'setup.cmd'}")
@@ -121,10 +164,14 @@ def install_shortcut() -> str:
     def q(p) -> str:  # single-quoted PowerShell string
         return "'" + str(p).replace("'", "''") + "'"
 
+    desk = desktop_folder()
+    lnk, launcher = desk / SHORTCUT, desk / LAUNCHER
+    mark = _shortcut_mark(home)
+    mark.parent.mkdir(parents=True, exist_ok=True)
     script = f"""
+$ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
-$desk = [Environment]::GetFolderPath('Desktop')
-$path = Join-Path $desk 'Менеджер ресурсов.lnk'
+$path = {q(lnk)}
 $s = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
 $s.TargetPath = {q(pyw)}
 $s.Arguments = {q('"' + str(ROOT / 'rmq_cli.py') + '" launch')}
@@ -132,10 +179,25 @@ $s.WorkingDirectory = {q(ROOT)}
 $s.IconLocation = {q(str(ROOT / 'rmq' / 'static' / 'rmq.ico') + ',0')}
 $s.Description = 'Менеджер ресурсов ПК: запускает очередь задач агентов и открывает дашборд'
 $s.Save()
-Write-Output $path
 """
-    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                       capture_output=True, encoding="utf-8", errors="replace")
-    if r.returncode != 0:
-        raise SystemExit(f"не удалось создать ярлык: {r.stderr.strip()}")
-    return f"ярлык создан: {r.stdout.strip()}"
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                           capture_output=True, encoding="utf-8", errors="replace", timeout=60)
+        why = (r.stderr or "").strip().splitlines()[:1]
+    except (OSError, subprocess.TimeoutExpired) as e:
+        why = [str(e)]
+    if lnk.exists():
+        if launcher.exists() and "rmq_cli.py" in launcher.read_text(encoding="utf-8", errors="replace"):
+            launcher.unlink()  # a launcher left from an earlier install that could not make the shortcut
+        mark.write_text(str(lnk), encoding="utf-8")
+        return f"ярлык создан: {lnk}"
+    # PowerShell could not make a shortcut (a security policy, an antivirus): a small launcher file does the same
+    try:
+        launcher.write_bytes((f'@echo off\r\nchcp 65001 >nul\r\nstart "" "{pyw}" "{ROOT / "rmq_cli.py"}" launch\r\n')
+                             .encode("utf-8"))
+    except OSError as e:
+        raise SystemExit(f"не удалось создать ни ярлык, ни файл запуска на рабочем столе ({e}); "
+                         f"открывайте менеджер файлом start.cmd в папке {ROOT}") from None
+    mark.write_text(str(launcher), encoding="utf-8")
+    return (f"ярлык создать не удалось ({why[0] if why else 'причина неизвестна'}), "
+            f"вместо него на рабочем столе файл запуска: {launcher}")

@@ -202,6 +202,8 @@ class Manager:
         self.net = NetService(self)
         self._hw: dict | None = None
         self._net_disk = (0.0, 0.0)  # (when, GB used by members' files)
+        self.open_dashboard_once = False   # set by the updater: the server opens the dashboard when it starts
+        self._dashboard_seen = bool(self.db.kv_get("dashboard_seen"))
         self.updater = Updater(self)
         self.restart_cb = None  # set by the server: stops it, so that an update can be installed
 
@@ -209,6 +211,12 @@ class Manager:
     def task_dir(self, tid: int) -> Path:
         """A task's log, exit code, progress and stop file. Members' tasks keep them under LocalLow."""
         return (self.net_root / "tasks" / str(tid)) if tid in self.hosted else (self.tasks_dir / str(tid))
+
+    def dashboard_seen(self) -> None:
+        """The owner's dashboard loaded and asked for the state: remembered once."""
+        if not self._dashboard_seen:
+            self._dashboard_seen = True
+            self.db.kv_set("dashboard_seen", str(int(time.time())))
 
     def net_dir(self, name: str) -> Path:
         """Folders of the network: what members' tasks use lives under LocalLow, the rest in data/net."""
