@@ -140,6 +140,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(e.status, {"error": e.message})
         except json.JSONDecodeError:
             self._json(400, {"error": "тело запроса — не JSON"})
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass  # the browser closed the page or gave up waiting: nobody to answer
         except Exception:
             log.exception("API error on %s %s", method, self.path)
             self._json(500, {"error": "внутренняя ошибка, подробности в data/manager.log"})
