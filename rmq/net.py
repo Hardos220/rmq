@@ -66,6 +66,22 @@ MAX_JSON = 1 << 20
 EXT_STATES = {"open": "two_way", "use": "one_way"}
 
 
+def explain(address: str, err) -> str:
+    """A connection failure in words: which PC to look at and what usually causes it."""
+    code = getattr(err, "winerror", None) or getattr(getattr(err, "reason", None), "winerror", None)
+    why = {
+        10013: "Windows на этом ПК не дала менеджеру подключиться: исходящие соединения блокирует VPN (функция "
+               "«блокировать трафик вне VPN»), антивирус или правило брандмауэра. Отключите VPN на время или добавьте "
+               "в нём исключение для Tailscale (адреса 100.64.0.0/10)",
+        10060: "тот ПК не ответил: на нём брандмауэр Windows не пускает Python, ПК выключен или не подключён к Tailscale",
+        10061: "тот ПК отказал в подключении: менеджер на нём не запущен или в режиме «Офлайн»",
+        10065: "до того ПК нет маршрута: проверьте, что Tailscale подключён на обоих ПК",
+        10051: "до того ПК нет маршрута: проверьте, что Tailscale подключён на обоих ПК",
+    }.get(code)
+    detail = getattr(err, "reason", err)
+    return f"нет связи с {address}: {why}" if why else f"нет связи с {address}: {detail}"
+
+
 class PeerError(Exception):
     def __init__(self, message: str, status: int = 0):
         super().__init__(message)
@@ -279,7 +295,7 @@ class NetService:
                 msg = str(e)
             raise PeerError(msg, e.code) from None
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
-            raise PeerError(f"нет связи с {address}: {getattr(e, 'reason', e)}") from None
+            raise PeerError(explain(address, e)) from None
         finally:
             if data_file is not None:
                 payload.close()

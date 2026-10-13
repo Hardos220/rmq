@@ -187,3 +187,17 @@ def test_own_pcs_and_the_shared_network_are_kept_apart(tmp_path):
     assert st.merge_home_meta({"main": "n-b", "main_at": 20.0}) and not st.is_main
     again = NetStore(tmp_path / "network.json")                             # both networks are saved
     assert again.home["main"] == "n-b" and "n-b" in again.home_members and "n-c" in again.members
+
+
+
+def test_connection_failures_are_explained():
+    from rmq.net import explain
+
+    class E(OSError):
+        def __init__(self, code):
+            super().__init__("x")
+            self.winerror = code
+
+    assert "VPN" in explain("100.1.1.1:8778", E(10013)) and "100.1.1.1:8778" in explain("100.1.1.1:8778", E(10013))
+    assert "брандмауэр" in explain("a:1", E(10060)) and "Офлайн" in explain("a:1", E(10061))
+    assert explain("a:1", OSError("boom")).endswith("boom")
