@@ -205,6 +205,11 @@ class Manager:
         self._disk_checked = 0.0
         self._drives: dict[str, str] = {}
         self.stats = StatsBook(home / "stats")
+        # the charts' history survives restarts and updates; after a crash the day comes back from data/stats
+        self._metrics_path = home / "metrics.json.gz"
+        last = self.metrics.load(self._metrics_path, time.time())
+        self.metrics.seed(self.stats.minutes_since(max(last, time.time() - 86400) + 59), time.time())
+        self._metrics_saved = time.time()
         # the compute network: tasks other PCs run here live under LocalLow (they may write nowhere else)
         self.netstore = NetStore(home / "network.json")
         self.net_root = Path(winapi.local_low()) / "RMQ" / self.instance
@@ -272,6 +277,10 @@ class Manager:
         self.keep_awake.close()
         self.nv.close()
         self.stats.close()
+        try:
+            self.metrics.save(self._metrics_path)
+        except OSError as e:
+            log.warning("could not save the charts' history: %s", e)
         with self.lock:
             self._flush(force=True)
             for rt in list(self.runtimes.values()) + list(self.draining.values()):
@@ -546,6 +555,12 @@ class Manager:
                         d *= S["scheduler"]["overtime_usage_mult"]
                     self.agent_usage[v.agent_id] = self.agent_usage.get(v.agent_id, 0.0) + d * dt
             self._flush()
+            if now - self._metrics_saved >= 600:
+                self._metrics_saved = now
+                try:
+                    self.metrics.save(self._metrics_path)
+                except OSError as e:
+                    log.warning("could not save the charts' history: %s", e)
             self._cleanup(now, S)
             self.updater.tick(now)
 

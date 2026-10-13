@@ -318,6 +318,42 @@ class StatsBook:
                 a = self.agents.setdefault(agent, _new_agent())
                 a[AGENT_COUNTS[kind]] += n
 
+    # the dashboard's columns, as the per-minute file names them (for rebuilding the charts after a crash)
+    MINUTE_TO_CHART = {"cpu_user": "cpu_user_pct", "cpu_tasks": "cpu_tasks_pct", "cpu_limit": "cpu_limit_pct",
+                       "ram_user": "ram_user_gb", "ram_tasks": "ram_tasks_gb", "vram_user": "vram_user_gb",
+                       "vram_tasks": "vram_tasks_gb", "gpu_user": "gpu_user_pct", "gpu_tasks": "gpu_tasks_pct",
+                       "running": "running", "queued": "queued", "suspended": "suspended", "game": "game",
+                       "cpu_factor": "cpu_share_pct", "heat": "heat", "temp_cpu": "temp_cpu",
+                       "temp_board": "temp_board", "temp_gpu": "temp_gpu", "temp_ssd": "temp_ssd"}
+
+    def minutes_since(self, since: float) -> list[dict]:
+        """Per-minute rows after `since`, as {"t": the minute's start, chart column: value}."""
+        out = []
+        months = sorted({time.strftime("%Y-%m", time.localtime(t)) for t in (since, time.time())})
+        for month in months:
+            path = self.folder / f"minutes-{month}.csv"
+            try:
+                with open(path, encoding="utf-8-sig", newline="") as f:
+                    rows = list(csv.DictReader(f))
+            except OSError:
+                continue
+            for r in rows:
+                try:
+                    t = time.mktime(time.strptime(r["time"], "%Y-%m-%d %H:%M"))
+                except (KeyError, ValueError):
+                    continue
+                if t <= since:
+                    continue
+                d = {"t": t}
+                for col, name in self.MINUTE_TO_CHART.items():
+                    v = r.get(name)
+                    try:
+                        d[col] = float(v) if v not in (None, "") else None
+                    except ValueError:
+                        d[col] = None
+                out.append(d)
+        return out
+
     def add(self, now: float, dt: float, s: dict) -> None:
         """One scheduler tick: `dt` seconds of observation described by `s` (see Manager._stats_tick)."""
         with self._lock:

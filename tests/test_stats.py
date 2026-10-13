@@ -121,3 +121,29 @@ def test_charts_keep_what_each_task_used_and_average_it():
     assert fine["tasks"][0] == {"7": [40.0, 2.0, 0.0, 0.0], "9": [10.0, 1.0, 0.5, 30.0]} and "9" not in fine["tasks"][3]
     coarse = m.series(7200)
     assert coarse["tasks"][0]["7"][0] == 40.0 and coarse["tasks"][0]["9"][0] == 5.0  # present in 2 of the 4 points it averages
+
+
+
+def test_chart_history_survives_a_restart_and_comes_back_from_minutes(tmp_path):
+    import time as _t
+    from rmq.metrics import Metrics
+    now = _t.time()
+    m = Metrics()
+    for i in range(30):
+        m.add(now - 30 + i, {"cpu_user": 10.0 + i, "tasks": {5: (20.0, 1.0, 0.0, 0.0)}})
+    m.save(tmp_path / "metrics.json.gz")
+    again = Metrics()
+    last = again.load(tmp_path / "metrics.json.gz", now)
+    s = again.series(60)
+    assert last == pytest.approx(now - 1, abs=0.1) and len(s["t"]) == 30
+    assert s["cpu_user"][-1] == 39.0 and s["tasks"][0] == {"5": [20.0, 1.0, 0.0, 0.0]}
+    assert Metrics().load(tmp_path / "missing.gz", now) == 0.0
+    rebuilt = Metrics()                                           # no saved file: per-minute rows instead
+    rebuilt.seed([{"t": now - 600, "cpu_user": 30.0}, {"t": now - 540, "cpu_user": 40.0}], now)
+    day = rebuilt.series(86400)
+    assert day["step"] == 15 and len(day["t"]) == 8 and day["cpu_user"][0] == 30.0 and day["cpu_user"][-1] == 40.0
+    late = Metrics()                                              # the minute still going: never past now
+    late.seed([{"t": now - 20, "cpu_user": 5.0}], now)
+    assert max(late.series(3600)["t"]) <= now - 1
+    late.add(now + 1, {"cpu_user": 6.0})                          # and new points come in right away
+    assert late.series(3600)["cpu_user"][-1] == 6.0
