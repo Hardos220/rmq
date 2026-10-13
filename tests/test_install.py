@@ -91,3 +91,32 @@ def test_the_shortcut_is_made_once_and_a_deleted_one_is_not_brought_back(tmp_pat
     other = tmp_path / "data2"                            # an installation that already has a shortcut
     (desk / install.SHORTCUT).write_bytes(b"lnk")
     assert install.ensure_shortcut(other) is None and calls == [1] and (other / "shortcut.txt").exists()
+
+
+_PROBE = """
+import ctypes, json, sys
+sys.path.insert(0, sys.argv[1])
+k = ctypes.WinDLL("kernel32")
+before = bool(k.GetConsoleWindow())
+from rmq.cli import leave_stray_console
+leave_stray_console()
+print("pythonw prints nowhere and does not fail")
+open(sys.argv[2], "w").write(json.dumps([before, bool(k.GetConsoleWindow()), sys.stdout is None]))
+"""
+
+
+def test_a_pythonw_that_got_a_console_leaves_it(tmp_path):
+    """Python 3.13.0's venv pythonw.exe starts the console python.exe: the manager must not keep that window."""
+    import json
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    probe, out = tmp_path / "probe.py", tmp_path / "out.json"
+    probe.write_text(_PROBE, encoding="utf-8")
+    python = Path(getattr(sys, "_base_executable", sys.executable)).with_name("python.exe")
+    env = dict(__import__("os").environ, __PYVENV_LAUNCHER__=str(tmp_path / "Scripts" / "pythonw.exe"))
+    si = subprocess.STARTUPINFO(dwFlags=subprocess.STARTF_USESHOWWINDOW, wShowWindow=0)  # a console, but hidden
+    r = subprocess.run([str(python), "-I", str(probe), str(root), str(out)], env=env, startupinfo=si,
+                       creationflags=subprocess.CREATE_NEW_CONSOLE, timeout=60)
+    assert r.returncode == 0
+    assert json.loads(out.read_text()) == [True, False, True]  # had a window, has none, streams as under pythonw

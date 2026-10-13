@@ -182,7 +182,8 @@ $s.Save()
 """
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                           capture_output=True, encoding="utf-8", errors="replace", timeout=60)
+                           capture_output=True, encoding="utf-8", errors="replace", timeout=60,
+                           creationflags=0x08000000)  # CREATE_NO_WINDOW: the manager itself calls it after an update
         why = (r.stderr or "").strip().splitlines()[:1]
     except (OSError, subprocess.TimeoutExpired) as e:
         why = [str(e)]

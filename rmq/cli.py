@@ -192,6 +192,31 @@ def spawn_server(url: str, wait_s: float = 25) -> None:
     raise CliError(f"менеджер не ответил за {wait_s:.0f} с; подробности в {home() / 'manager.log'}")
 
 
+def leave_stray_console() -> None:
+    """Started as pythonw.exe (meant to have no window) yet sitting in a console of its own: leave it.
+
+    The venv pythonw.exe of Python 3.13.0 starts the console python.exe, so Windows opened a black window for the
+    manager - empty, deaf to keys, and closing it stopped the manager."""
+    names = {Path(sys.executable or "").name.lower(), Path((getattr(sys, "orig_argv", None) or [""])[0]).name.lower()}
+    if os.name != "nt" or "pythonw.exe" not in names:
+        return
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.GetConsoleWindow():
+        return
+
+    def on_console(stream) -> bool:
+        try:
+            return stream is not None and stream.isatty()
+        except (ValueError, OSError):
+            return False
+
+    stale = [name for name in ("stdin", "stdout", "stderr") if on_console(getattr(sys, name))]
+    if kernel32.FreeConsole():
+        for name in stale:
+            setattr(sys, name, None)  # as under a real pythonw.exe
+
+
 def err(text: str) -> None:
     print(f"[rmq] {text}", file=sys.stderr, flush=True)
 
@@ -746,6 +771,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    leave_stray_console()
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
