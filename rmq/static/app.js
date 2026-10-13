@@ -82,6 +82,8 @@
     if (t) START_TAB = t[1];
     const k = location.hash.match(/task=(\d+)/);
     if (k) START_TASK = Number(k[1]);
+    const ns = location.hash.match(/net=(overview|home|ext)/);
+    if (ns) NET_SUB = ns[1];
     const sm = location.hash.match(/smooth=([01])/);
     if (sm) {
       SMOOTH = sm[1] === '1';
@@ -176,12 +178,20 @@
   const STATE_COLUMNS = new Set(['t', 'game', 'heat', 'running', 'queued', 'suspended', 'tasks']);
   let SMOOTH = false;
   try { SMOOTH = localStorage.getItem('rmq_smooth') === '1'; } catch { /* ignore */ }
-  let smoothCache = null;
-  function chartData() {
-    const m = METRICS;
+  // Where a chart takes its data: this PC (STATE, METRICS) or one of the owner's other PCs ("Сеть" tab)
+  const TASK_NAMES = {};
+  const taskSlot = new Map();
+  const MAIN_SRC = {
+    get state() { return STATE; },
+    get metrics() { return METRICS; },
+    names: TASK_NAMES, slots: taskSlot, open: (id) => openTask(id), smooth: null,
+  };
+  function chartData(src = MAIN_SRC) {
+    const m = src.metrics;
     if (!SMOOTH || !m || !m.t.length) return m;
     const last = m.t[m.t.length - 1];
-    if (smoothCache && smoothCache.src === m && smoothCache.len === m.t.length && smoothCache.last === last) return smoothCache.out;
+    const sc = src.smooth;
+    if (sc && sc.src === m && sc.len === m.t.length && sc.last === last) return sc.out;
     const out = { step: m.step, t: m.t };
     for (const k of Object.keys(m)) {
       if (!Array.isArray(m[k]) || k === 't') continue;
@@ -199,14 +209,42 @@
       }
       out[k] = r;
     }
-    smoothCache = { src: m, len: m.t.length, last, out };
+    src.smooth = { src: m, len: m.t.length, last, out };
     return out;
   }
   const smoothNote = () => (SMOOTH ? ' · среднее за 5 с' : '');
 
+  // the series split where samples are missing (the manager was not running)
+  function segmentsOf(m) {
+    const t = m.t;
+    const gapAt = Math.max(3, (m.step || 1) * 3.5);
+    const segs = [];
+    let start = 0;
+    for (let i = 1; i <= t.length; i += 1) {
+      if (i === t.length || t[i] - t[i - 1] > gapAt) { segs.push([start, i - 1]); start = i; }
+    }
+    return segs;
+  }
+
+  // new samples appended to the series in hand; older than the chart period are dropped
+  function mergeMetrics(cur, m) {
+    if (!cur || cur.step !== m.step) return m;
+    for (const k of Object.keys(m)) {
+      if (!Array.isArray(m[k])) continue;
+      if (!cur[k]) cur[k] = [];
+      cur[k].push(...m[k]);
+    }
+    const cut = cur.t.length ? cur.t[cur.t.length - 1] - RANGE - 5 : 0;
+    let drop = 0;
+    while (drop < cur.t.length && cur.t[drop] < cut) drop += 1;
+    if (drop) for (const k of Object.keys(cur)) if (Array.isArray(cur[k])) cur[k].splice(0, drop);
+    return cur;
+  }
+
   class Chart {
-    constructor(def) {
+    constructor(def, src = MAIN_SRC) {
       this.def = def;
+      this.src = src;
       this.hover = null;
       this.showTable = false;
       this.tbtn = h('button', { class: 'btn tbtn', type: 'button', 'aria-pressed': 'false', onclick: () => this.toggleTable() }, 'Таблица');
@@ -224,7 +262,7 @@
       new ResizeObserver(() => this.draw()).observe(this.plot);
     }
 
-    available() { return !this.def.needsGpu || (STATE && STATE.system.vram); }
+    available() { return !this.def.needsGpu || (this.src.state && this.src.state.system.vram); }
 
     toggleTable() {
       this.showTable = !this.showTable;
@@ -250,14 +288,14 @@
       this.tableEl.hidden = !ok || !this.showTable;
       this.legend.hidden = !ok;
       this.tbtn.hidden = !ok;
-      if (!ok || !STATE) return;
-      setText(this.sub, this.def.sub(STATE));
+      if (!ok || !this.src.state) return;
+      setText(this.sub, this.def.sub(this.src.state));
       this.renderLegend();
       if (this.showTable) this.renderTable(); else this.draw();
     }
 
     last(key) {
-      const d = chartData();
+      const d = chartData(this.src);
       const arr = d && d[key];
       return arr && arr.length ? arr[arr.length - 1] : null;
     }
@@ -268,13 +306,13 @@
         h('span', { class: `key ${s.kind === 'dash' ? 'line' : s.key.endsWith('user') ? 'user' : 'tasks'}` }),
         `${s.label} `, h('b', null, this.last(s.key) == null ? '–' : f(this.last(s.key)))));
       if (this.def.threshold) {
-        items.push(h('span', null, h('span', { class: 'key thr' }), 'Порог паузы GPU-задач ', h('b', null, pct(this.def.threshold(STATE)))));
+        items.push(h('span', null, h('span', { class: 'key thr' }), 'Порог паузы GPU-задач ', h('b', null, pct(this.def.threshold(this.src.state)))));
       }
       this.legend.replaceChildren(...items);
     }
 
     renderTable() {
-      const m = chartData();
+      const m = chartData(this.src);
       if (!m || !m.t.length) { this.tableEl.replaceChildren(h('p', { class: 'muted' }, 'Нет данных')); return; }
       const n = m.t.length;
       const stride = Math.max(1, Math.floor(n / 30));
@@ -292,8 +330,9 @@
       const w = this.plot.clientWidth;
       const ht = this.plot.clientHeight;
       const pad = { l: 46, r: 12, t: 8, b: 24 };
-      const max = Math.max(1e-6, this.def.max(STATE) || 1);
-      const t1 = METRICS && METRICS.t.length ? METRICS.t[METRICS.t.length - 1] : Date.now() / 1000;
+      const max = Math.max(1e-6, this.def.max(this.src.state) || 1);
+      const mx = this.src.metrics;
+      const t1 = mx && mx.t.length ? mx.t[mx.t.length - 1] : Date.now() / 1000;
       const t0 = t1 - RANGE;
       const pw = Math.max(10, w - pad.l - pad.r);
       const ph = Math.max(10, ht - pad.t - pad.b);
@@ -304,20 +343,10 @@
       };
     }
 
-    segments() {
-      // split the series where samples are missing (manager was not running)
-      const t = METRICS.t;
-      const gapAt = Math.max(3, (METRICS.step || 1) * 3.5);
-      const segs = [];
-      let start = 0;
-      for (let i = 1; i <= t.length; i += 1) {
-        if (i === t.length || t[i] - t[i - 1] > gapAt) { segs.push([start, i - 1]); start = i; }
-      }
-      return segs;
-    }
+    segments() { return segmentsOf(this.src.metrics); }
 
     draw() {
-      if (this.plot.hidden || !STATE) return;
+      if (this.plot.hidden || !this.src.state) return;
       const dpr = window.devicePixelRatio || 1;
       const g = this.geometry();
       this.canvas.width = Math.round(g.w * dpr);
@@ -330,7 +359,7 @@
         surface: cssVar('--surface'), user: cssVar('--s-user'), tasks: cssVar('--s-tasks'), game: cssVar('--game-band'),
       };
       c.font = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
-      const m = chartData();
+      const m = chartData(this.src);
       const has = m && m.t.length > 1;
 
       // game-mode periods as a quiet background band
@@ -406,7 +435,7 @@
       line((i) => lo(i) + T[i], col.tasks, 2);
       if (this.def.limit) line((i) => m[this.def.limit][i], col.ink2, 1.5, [5, 4]);
       if (this.def.threshold) {
-        const y = Math.round(g.Y(this.def.threshold(STATE))) + 0.5;
+        const y = Math.round(g.Y(this.def.threshold(this.src.state))) + 0.5;
         c.strokeStyle = col.muted; c.lineWidth = 1.5; c.setLineDash([2, 3]);
         c.beginPath(); c.moveTo(g.pad.l, y); c.lineTo(g.w - g.pad.r, y); c.stroke(); c.setLineDash([]);
       }
@@ -427,7 +456,7 @@
     }
 
     onMove(e) {
-      const m = chartData();
+      const m = chartData(this.src);
       if (!m || m.t.length < 2) return;
       const g = this.geometry();
       const rect = this.canvas.getBoundingClientRect();
@@ -456,28 +485,29 @@
 
   const fmtPctV = (v) => pct(v);
   const fmtGbV = (v) => `${n1(v)} ГБ`;
-  const charts = [
+  const resourceCharts = (src) => [
     new Chart({
       title: 'Процессор', user: 'cpu_user', tasks: 'cpu_tasks', limit: 'cpu_limit', stacked: true,
       max: () => 100, fmt: fmtPctV, tick: (v) => `${v}%`,
       sub: (s) => `${s.system.cpu.n} потоков${s.system.cpu.ecores ? `, из них ${s.system.cpu.ecores} на E-ядрах` : ''}`,
-    }),
+    }, src),
     new Chart({
       title: 'Оперативная память', user: 'ram_user', tasks: 'ram_tasks', limit: 'ram_limit', stacked: true,
       max: (s) => s.system.ram.total, fmt: fmtGbV, tick: (v) => `${nf2.format(v)}`,
       sub: (s) => `${n1(s.system.ram.total)} ГБ всего`,
-    }),
+    }, src),
     new Chart({
       title: 'Видеопамять', user: 'vram_user', tasks: 'vram_tasks', limit: 'vram_limit', stacked: true, needsGpu: true,
       max: (s) => (s.system.vram ? s.system.vram.total : 1), fmt: fmtGbV, tick: (v) => `${nf2.format(v)}`,
       sub: (s) => (s.system.vram ? `${s.system.vram.name}, ${n1(s.system.vram.total)} ГБ` : ''),
-    }),
+    }, src),
     new Chart({
       title: 'Загрузка видеокарты', user: 'gpu_user', tasks: 'gpu_tasks', limit: null, stacked: false, needsGpu: true,
       max: () => 100, fmt: fmtPctV, tick: (v) => `${v}%`, threshold: (s) => s.system.gpu.threshold,
       sub: () => 'самый загруженный блок GPU, как в Диспетчере задач',
-    }),
+    }, src),
   ];
+  const charts = resourceCharts(MAIN_SRC);
   $('#charts').append(...charts.map((c) => c.root));
 
   // ================================================================ resources by task (overview)
@@ -487,7 +517,6 @@
   // past a hundred the older tasks of the window share one band. A task keeps its color while it keeps one.
   // Names are not listed in the legend: hovering a band shows its task, a click opens its card.
   const TASK_N = 100;
-  const taskSlot = new Map();
   function hslHex(hue, sat, light) {
     const f = (n) => {
       const k = (n + hue / 30) % 12;
@@ -508,14 +537,14 @@
   }
   const colorOf = (c) => (c.startsWith('--') ? cssVar(c) : c);
   const colorCss = (c) => (c.startsWith('--') ? `var(${c})` : c);
-  const TASK_NAMES = {};
   const TASK_VIEWS = {
     cpu: { label: 'Процессор', i: 0, user: 'cpu_user', max: () => 100, fmt: (v) => pct(v), tick: (v) => `${v}%`, unit: '% всего процессора' },
     ram: { label: 'ОЗУ', i: 1, user: 'ram_user', max: (s) => s.system.ram.total, fmt: (v) => `${n1(v)} ГБ`, tick: (v) => `${nf2.format(v)}`, unit: 'ГБ' },
     vram: { label: 'Видеопамять', i: 2, user: 'vram_user', max: (s) => (s.system.vram ? s.system.vram.total : 1), fmt: (v) => `${n1(v)} ГБ`, tick: (v) => `${nf2.format(v)}`, unit: 'ГБ', needsGpu: true },
   };
   class TaskChart {
-    constructor() {
+    constructor(src = MAIN_SRC) {
+      this.src = src;
       this.view = 'cpu';
       this.hover = null;
       this.showTable = false;
@@ -541,13 +570,13 @@
       this.hit = null;  // the task whose band is under the cursor
       this.canvas.addEventListener('pointermove', (e) => this.onMove(e));
       this.canvas.addEventListener('pointerleave', () => { this.hover = null; this.hit = null; tooltip.hidden = true; this.draw(); });
-      this.canvas.addEventListener('click', () => { if (typeof this.hit === 'number') openTask(this.hit); });
+      this.canvas.addEventListener('click', () => { if (typeof this.hit === 'number' && this.src.open) this.src.open(this.hit); });
       new ResizeObserver(() => this.draw()).observe(this.plot);
     }
 
     // the same moving average as the other charts while "Скользящее среднее" is on
     smoothed(get) {
-      const m = METRICS;
+      const m = this.src.metrics;
       if (!SMOOTH || !m) return get;
       const n = m.t.length;
       const r = new Float64Array(n);
@@ -562,7 +591,7 @@
 
     // the bands: the owner's load at the bottom, then each task (fixed order: by task number)
     series() {
-      const m = METRICS;
+      const m = this.src.metrics;
       const v = TASK_VIEWS[this.view];
       // which tasks get a color: those running now first, then the most recent ones
       const lastSeen = new Map();
@@ -579,13 +608,13 @@
       const ranked = [...lastSeen.keys()].sort((a, b) => (running.has(b) - running.has(a))
         || (lastSeen.get(b) - lastSeen.get(a)) || (b - a));
       const keep = new Set(ranked.slice(0, TASK_N));
-      for (const id of [...taskSlot.keys()]) if (!keep.has(id)) taskSlot.delete(id);
-      const used = new Set([...taskSlot.values()]);
+      for (const id of [...this.src.slots.keys()]) if (!keep.has(id)) this.src.slots.delete(id);
+      const used = new Set([...this.src.slots.values()]);
       for (const id of ranked) {
-        if (!keep.has(id) || taskSlot.has(id)) continue;
+        if (!keep.has(id) || this.src.slots.has(id)) continue;
         let free = 0;
         while (used.has(free)) free += 1;
-        taskSlot.set(id, free);
+        this.src.slots.set(id, free);
         used.add(free);
       }
       const out = [{ id: 'user', label: 'Вы и система', color: '--axis', get: this.smoothed((i) => (m[v.user] && m[v.user][i]) || 0) }];
@@ -593,9 +622,9 @@
       let otherRunning = false;
       for (const id of [...ids].sort((a, b) => a - b)) {
         const get = this.smoothed((i) => { const r = m.tasks[i] && m.tasks[i][id]; return r ? r[v.i] : 0; });
-        if (!taskSlot.has(id)) { other.push(get); otherRunning = otherRunning || running.has(id); continue; }
-        const info = TASK_NAMES[id] || {};
-        out.push({ id, label: `#${id} ${info.name || ''}`.trim(), agent: info.agent, color: taskColor(taskSlot.get(id)), get });
+        if (!this.src.slots.has(id)) { other.push(get); otherRunning = otherRunning || running.has(id); continue; }
+        const info = this.src.names[id] || {};
+        out.push({ id, label: `#${id} ${info.name || ''}`.trim(), agent: info.agent, color: taskColor(this.src.slots.get(id)), get });
       }
       if (other.length) {
         out.push({ id: 'other', label: `${otherRunning ? 'Остальные задачи' : 'Более ранние задачи'} (${other.length})`,
@@ -605,20 +634,21 @@
     }
 
     update() {
-      if (!STATE) return;
-      const hasGpu = !!STATE.system.vram;
+      const S = this.src.state;
+      if (!S) return;
+      const hasGpu = !!S.system.vram;
       this.buttons.vram.hidden = !hasGpu;
       if (this.view === 'vram' && !hasGpu) this.view = 'cpu';
       this.plot.hidden = this.showTable;
       this.tableEl.hidden = !this.showTable;
       const ser = this.series();
-      const running = (STATE.tasks || []).filter((t) => t.state === 'running').length;
+      const running = (S.tasks || []).filter((t) => t.state === 'running').length;
       setText(this.sub, `${TASK_VIEWS[this.view].unit} · сейчас выполняется ${running}${smoothNote()}`);
       this.renderLegend(ser);
       if (this.showTable) this.renderTable(ser); else this.draw(ser);
     }
 
-    lastIndex() { return METRICS && METRICS.t.length ? METRICS.t.length - 1 : -1; }
+    lastIndex() { const m = this.src.metrics; return m && m.t.length ? m.t.length - 1 : -1; }
 
     renderLegend(ser) {
       const f = TASK_VIEWS[this.view].fmt;
@@ -632,11 +662,11 @@
           h('b', null, last >= 0 ? f(user.get(last)) : '–')),
         h('span', null, h('span', { class: 'key task-keys' }), `Задачи агентов (${n}${tasks.some((s) => s.id === 'other') ? ' и более ранние' : ''}) `,
           h('b', null, total == null ? '–' : f(total))),
-        h('span', { class: 'muted' }, 'наведите на полосу — увидите задачу, щелчок — её карточка'));
+        h('span', { class: 'muted' }, this.src.open ? 'наведите на полосу — увидите задачу, щелчок — её карточка' : 'наведите на полосу — увидите задачу'));
     }
 
     renderTable(ser) {
-      const m = METRICS;
+      const m = this.src.metrics;
       if (!m || !m.t.length) { this.tableEl.replaceChildren(h('p', { class: 'muted' }, 'Нет данных')); return; }
       const n = m.t.length;
       const stride = Math.max(1, Math.floor(n / 30));
@@ -653,8 +683,9 @@
       const w = this.plot.clientWidth;
       const ht = this.plot.clientHeight;
       const pad = { l: 46, r: 12, t: 8, b: 24 };
-      const max = Math.max(1e-6, TASK_VIEWS[this.view].max(STATE) || 1);
-      const t1 = METRICS && METRICS.t.length ? METRICS.t[METRICS.t.length - 1] : Date.now() / 1000;
+      const max = Math.max(1e-6, TASK_VIEWS[this.view].max(this.src.state) || 1);
+      const mx = this.src.metrics;
+      const t1 = mx && mx.t.length ? mx.t[mx.t.length - 1] : Date.now() / 1000;
       const t0 = t1 - RANGE;
       const pw = Math.max(10, w - pad.l - pad.r);
       const ph = Math.max(10, ht - pad.t - pad.b);
@@ -664,7 +695,7 @@
     }
 
     draw(ser) {
-      if (this.plot.hidden || !STATE) return;
+      if (this.plot.hidden || !this.src.state) return;
       ser = ser || this.series();
       const dpr = window.devicePixelRatio || 1;
       const g = this.geometry();
@@ -694,7 +725,7 @@
         c.fillStyle = col.muted;
         c.fillText(clock(t), x, g.pad.t + g.ph + 6);
       }
-      const m = METRICS;
+      const m = this.src.metrics;
       if (!m || m.t.length < 2) {
         c.fillStyle = col.muted; c.textBaseline = 'middle';
         c.fillText('Данные появятся через пару секунд', g.pad.l + g.pw / 2, g.pad.t + g.ph / 2);
@@ -702,7 +733,7 @@
       }
       c.save();
       c.beginPath(); c.rect(g.pad.l, g.pad.t - 2, g.pw, g.ph + 4); c.clip();
-      const segs = charts[0].segments();
+      const segs = segmentsOf(m);
       const n = m.t.length;
       const base = new Float64Array(n);
       for (const s of ser) {
@@ -738,7 +769,7 @@
     }
 
     onMove(e) {
-      const m = METRICS;
+      const m = this.src.metrics;
       if (!m || m.t.length < 2) return;
       const g = this.geometry();
       const rect = this.canvas.getBoundingClientRect();
@@ -757,7 +788,7 @@
         acc += v;
       }
       this.hit = hit ? hit.id : null;
-      this.canvas.style.cursor = hit && typeof hit.id === 'number' ? 'pointer' : '';
+      this.canvas.style.cursor = hit && typeof hit.id === 'number' && this.src.open ? 'pointer' : '';
       this.draw(ser);
       const f = TASK_VIEWS[this.view].fmt;
       const row = (s) => h('div', { class: 'r' }, h('span', { class: 'lk', style: `border-top-color: ${colorCss(s.color)}` }),
@@ -788,8 +819,9 @@
   class LevelChart {
     // o: { title, series, color, min, max, step, values(), fmt(v), tick(v), refs() -> [{ v, color, dash, cls, label, text }],
     //      sub(), hidden(), empty(), wide }
-    constructor(o) {
+    constructor(o, src = MAIN_SRC) {
       this.o = o;
+      this.src = src;
       this.hover = null;
       this.showTable = false;
       this.tbtn = h('button', { class: 'btn tbtn', type: 'button', 'aria-pressed': 'false', onclick: () => this.toggleTable() }, 'Таблица');
@@ -813,7 +845,7 @@
     }
 
     update() {
-      const off = !STATE || this.o.hidden();
+      const off = !this.src.state || this.o.hidden();
       this.root.hidden = off;
       if (off) return;
       setText(this.sub, this.o.sub());
@@ -832,7 +864,7 @@
     }
 
     renderTable() {
-      const m = chartData();
+      const m = chartData(this.src);
       const v = this.o.values();
       if (!m || !m.t.length) { this.tableEl.replaceChildren(h('p', { class: 'muted' }, 'Нет данных')); return; }
       const n = m.t.length;
@@ -851,7 +883,8 @@
       const ht = this.plot.clientHeight;
       const pad = { l: 40, r: 12, t: 8, b: 24 };
       const { min, max } = this.o;
-      const t1 = METRICS && METRICS.t.length ? METRICS.t[METRICS.t.length - 1] : Date.now() / 1000;
+      const mx = this.src.metrics;
+      const t1 = mx && mx.t.length ? mx.t[mx.t.length - 1] : Date.now() / 1000;
       const t0 = t1 - RANGE;
       const pw = Math.max(10, w - pad.l - pad.r);
       const ph = Math.max(10, ht - pad.t - pad.b);
@@ -863,7 +896,7 @@
     }
 
     draw() {
-      if (this.plot.hidden || this.root.hidden || !STATE) return;
+      if (this.plot.hidden || this.root.hidden || !this.src.state) return;
       const dpr = window.devicePixelRatio || 1;
       const g = this.geometry();
       this.canvas.width = Math.round(g.w * dpr);
@@ -876,7 +909,7 @@
         line: cssVar(this.o.color), hot: cssVar('--critical'), warm: cssVar('--warning'),
       };
       c.font = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
-      const m = chartData();
+      const m = chartData(this.src);
       const v = this.o.values();
       const has = m && m.t.length > 1;
       // periods of regulation and of the freeze as quiet bands
@@ -949,7 +982,7 @@
     }
 
     onMove(e) {
-      const m = chartData();
+      const m = chartData(this.src);
       if (!m || m.t.length < 2) return;
       const g = this.geometry();
       const rect = this.canvas.getBoundingClientRect();
@@ -975,15 +1008,15 @@
     }
   }
 
-  const reading = (key) => (STATE && STATE.thermal ? STATE.thermal.readings.find((r) => r.key === key) : null);
-  const tempChart = (key, title) => new LevelChart({
+  const reading = (src, key) => (src.state && src.state.thermal ? src.state.thermal.readings.find((r) => r.key === key) : null);
+  const tempChart = (key, title, src) => new LevelChart({
     title, series: 'температура', color: '--s-temp', min: 20, max: 110, step: 20,
-    values: () => (chartData() || {})[`temp_${key}`] || [],
+    values: () => (chartData(src) || {})[`temp_${key}`] || [],
     fmt: (v) => `${Math.round(v)}°C`, tick: (v) => `${v}°`,
-    hidden: () => !reading(key),
-    sub: () => { const r = reading(key); return r.temp == null ? (r.note || 'нет данных') : `сейчас ${Math.round(r.temp)}°C`; },
+    hidden: () => !reading(src, key),
+    sub: () => { const r = reading(src, key); return r.temp == null ? (r.note || 'нет данных') : `сейчас ${Math.round(r.temp)}°C`; },
     refs: () => {
-      const r = reading(key);
+      const r = reading(src, key);
       return [
         { v: r.hot, color: '--critical', dash: [5, 4], cls: 'thr-hot', label: 'перегрев', text: `${r.hot}°` },
         { v: r.target, color: '--warning', dash: [5, 4], cls: 'thr-warm', label: 'цель', text: `${r.target}°` },
@@ -991,23 +1024,24 @@
       ];
     },
     empty: () => {
-      const r = reading(key);
+      const r = reading(src, key);
       if (r.temp != null) return 'Данные появятся через пару секунд';
       return r.note ? `Видеокарта ${r.note}: опрашивается, только когда работает` : 'Нет данных';
     },
-  });
-  const shareChart = new LevelChart({
+  }, src);
+  const shareChart = (src) => new LevelChart({
     title: 'Регулятор температуры: доля процессора для задач', series: 'доля процессора', color: '--s-tasks',
     min: 0, max: 100, step: 25, wide: true,
-    values: () => (chartData() || {}).cpu_factor || [],
+    values: () => (chartData(src) || {}).cpu_factor || [],
     fmt: (v) => `${Math.round(v)}%`, tick: (v) => `${v}%`,
-    hidden: () => !(STATE && STATE.thermal && STATE.thermal.enabled && STATE.thermal.regulate),
-    sub: () => `сейчас ${Math.round(STATE.thermal.factor * 100)}% · 100% — без ограничений`,
-    refs: () => [{ v: STATE.thermal.min_cpu_factor * 100, color: '--muted', dash: [2, 3], cls: 'thr', label: 'не меньше', text: `${Math.round(STATE.thermal.min_cpu_factor * 100)}%` }],
+    hidden: () => !(src.state && src.state.thermal && src.state.thermal.enabled && src.state.thermal.regulate),
+    sub: () => `сейчас ${Math.round(src.state.thermal.factor * 100)}% · 100% — без ограничений`,
+    refs: () => [{ v: src.state.thermal.min_cpu_factor * 100, color: '--muted', dash: [2, 3], cls: 'thr', label: 'не меньше', text: `${Math.round(src.state.thermal.min_cpu_factor * 100)}%` }],
     empty: () => 'Данные появятся через пару секунд',
-  });
-  const tempCharts = [tempChart('cpu', 'Процессор'), tempChart('gpu', 'Видеокарта'),
-    tempChart('board', 'Плата (ACPI)'), tempChart('ssd', 'SSD'), shareChart];
+  }, src);
+  const thermalCharts = (src) => [tempChart('cpu', 'Процессор', src), tempChart('gpu', 'Видеокарта', src),
+    tempChart('board', 'Плата (ACPI)', src), tempChart('ssd', 'SSD', src), shareChart(src)];
+  const tempCharts = thermalCharts(MAIN_SRC);
   $('#thermal-charts').append(...tempCharts.map((c) => c.root));
 
   function renderThermal(s) {
@@ -1043,15 +1077,19 @@
     box.className = `card thermal-status ${th.enabled ? th.state : 'normal'}`;
     fill(box, h('span', { class: 'icon', 'aria-hidden': 'true' }, icon),
       h('div', null, h('div', { class: 'head' }, head), h('div', { class: 'ink2' }, body)));
-    $('#thermal-tiles').replaceChildren(...th.readings.map((r) => {
+    $('#thermal-tiles').replaceChildren(...thermalTiles(th));
+    tempCharts.forEach((c) => c.update());
+  }
+
+  function thermalTiles(th) {
+    return th.readings.map((r) => {
       const st = r.temp == null ? 'asleep' : (r.temp >= r.hot || r.throttling) ? 'hot' : r.temp > r.target ? 'warm' : 'normal';
       const label = { asleep: r.note || 'нет данных', hot: r.throttling ? 'BIOS тормозит процессор от нагрева' : 'перегрев', warm: 'выше цели', normal: 'не выше цели' }[st];
       return h('div', { class: 'tile' }, h('div', { class: 'label' }, r.label),
         h('div', { class: 'value' }, r.temp == null ? '–' : String(Math.round(r.temp)), h('span', { class: 'unit' }, '°C')),
         h('div', { class: 'rows' }, h('div', null, h('span', { class: `temp-state ${st}` }, h('i'), label)),
           h('div', null, `цель ${r.target}° · перегрев ${r.hot}° · норма после перегрева ≤ ${r.normal}°`)));
-    }));
-    tempCharts.forEach((c) => c.update());
+    });
   }
 
   // ================================================================ tiles
@@ -1068,9 +1106,9 @@
   }
   const kv = (keyCls, label, val) => [keyCls ? h('span', { class: `key ${keyCls}` }) : null, `${label}: `, h('b', null, val)];
 
-  function renderTiles(s) {
+  function renderTiles(s, box = $('#tiles'), m = METRICS) {
     const { ram, vram } = s.system;
-    const lastM = (k, dflt) => (METRICS && METRICS[k] && METRICS[k].length ? METRICS[k][METRICS[k].length - 1] : dflt);
+    const lastM = (k, dflt) => (m && m[k] && m[k].length ? m[k][m[k].length - 1] : dflt);
     const cpu = { ...s.system.cpu, user: lastM('cpu_user', s.system.cpu.user), tasks: lastM('cpu_tasks', s.system.cpu.tasks) };
     const gpu = { ...s.system.gpu, user: lastM('gpu_user', s.system.gpu.user), tasks: lastM('gpu_tasks', s.system.gpu.tasks) };
     const free = (pool, held) => Math.max(0, pool - held);
@@ -1106,12 +1144,11 @@
     } else {
       tiles.push(tile('Видеокарта', '–', '', h('div'), ['Не найдена: GPU-задачи недоступны']));
     }
-    $('#tiles').replaceChildren(...tiles);
+    box.replaceChildren(...tiles);
   }
 
-  function renderDisks(s) {
+  function renderDisks(s, box = $('#disks')) {
     const d = s.disk;
-    const box = $('#disks');
     box.hidden = !(d && d.enabled && d.drives.length);
     if (box.hidden) return;
     const sig = `${d.min_free_gb}|${d.drives.map((x) => `${x.drive}|${Math.round(x.free * 10)}|${x.low}|${x.tasks}`).join(',')}`;
@@ -1260,7 +1297,10 @@
     const keep = new Set(items.map((i) => i.id));
     for (const [id, tr] of map) if (!keep.has(id)) { tr.remove(); map.delete(id); }
     if (!items.length) {
-      if (!tbody.querySelector('tr.empty')) tbody.replaceChildren(h('tr', { class: 'empty' }, h('td', { colspan: cols }, tbody.dataset.empty || 'Пусто')));
+      const text = tbody.dataset.empty || 'Пусто';
+      const empty = tbody.querySelector('tr.empty');
+      if (!empty) tbody.replaceChildren(h('tr', { class: 'empty' }, h('td', { colspan: cols }, text)));
+      else setText(empty.firstChild, text);
       return;
     }
     const empty = tbody.querySelector('tr.empty');
@@ -1286,11 +1326,14 @@
     return btns;
   }
 
-  function taskRow(cells) {
-    // cells: array of [className, (td, item) => void]; actions cell rebuilt only when state/priority change
+  function taskRow(cells, open = (it) => openTask(it.id)) {
+    // cells: array of [className, (td, item) => void]; actions cell rebuilt only when state/priority change;
+    // open: what a click on the row does (null: nothing, e.g. a task of another PC)
     return (item) => {
       const tds = cells.map(([cls]) => h('td', { class: cls || null }));
-      const tr = h('tr', { class: 'click', tabindex: '0', onclick: () => openTask(item.id), onkeydown: (e) => { if (e.key === 'Enter') openTask(item.id); } }, tds);
+      const tr = open
+        ? h('tr', { class: 'click', tabindex: '0', onclick: () => open(item), onkeydown: (e) => { if (e.key === 'Enter') open(item); } }, tds)
+        : h('tr', null, tds);
       tr._update = (it) => cells.forEach(([, fill], i) => fill(tds[i], it));
       return tr;
     };
@@ -1302,6 +1345,7 @@
     td.replaceChildren(h('div', { class: 'name' }, t.name), h('div', { class: 'cmd', title: t.command }, t.command));
   };
   const textCell = (fn) => (td, t) => setText(td, fn(t));
+  const agentText = (t) => (t.here ? `${t.agent} · отсюда` : t.from ? `${t.agent} · с ПК ${t.from}` : t.agent);
   const actionsCell = (td, t) => {
     const sig = `${t.state}|${t.priority}`;
     if (td._sig === sig) return;
@@ -1370,7 +1414,7 @@
   const activeCols = [
     ['num', textCell((t) => String(t.id))],
     [null, nameCell],
-    [null, textCell((t) => t.agent)],
+    [null, textCell(agentText)],
     [null, stateCell],
     ['num', textCell((t) => (t.state === 'running'
       ? `${n1(used(t, 'cpu'))} / ${num(t.cpu)}${t.cap_cores != null ? ` (кап ${n1(t.cap_cores)})` : ''}` : `– / ${num(t.cpu)}`))],
@@ -1381,16 +1425,43 @@
     [null, progressCell],
     ['actions', actionsCell],
   ];
-  const queueCols = [
+  // The queue holds the paused tasks too: they wait for room in the same score order (a started task gets
+  // the bonus for that); one paused by hand or for hanging waits for "Продолжить" and stands at the end.
+  const waitCell = (td, t) => {
+    const paused = t.state === 'suspended';
+    const why = paused
+      ? `${t.reason_text || 'на паузе'}${t.wait_text && t.wait === 'no_fit' ? `. ${t.wait_text}` : ''}${t.position ? '' : '. Продолжится по кнопке «Продолжить»'}`
+      : t.wait_text || (t.reason && t.reason.startsWith('requeued:') ? t.reason_text : 'Запустится на следующем шаге');
+    const sig = `${t.state}|${t.reason}|${why}`;
+    if (td._sig === sig) return;
+    td._sig = sig;
+    fill(td, paused ? stateBadge(t) : null, paused ? h('div', { class: 'why' }, why) : why);
+  };
+  const queueColsFor = (nowOf) => [
     ['num', textCell((t) => (t.position != null ? String(t.position) : '–'))],
     ['num', textCell((t) => String(t.id))],
     [null, nameCell],
-    [null, textCell((t) => t.agent)],
+    [null, textCell(agentText)],
     ['num', textCell((t) => `${num(t.cpu)} яд · ${num(t.ram)} ГБ${t.vram ? ` · ${num(t.vram)} ГБ VRAM` : ''} · ~${dur(t.time_s)}${t.priority !== 'normal' ? ` · ${PRIO[t.priority]}` : ''}`)],
-    ['num', textCell((t) => dur(STATE.now - t.queued_since))],
+    ['num', textCell((t) => (t.state === 'suspended' ? `пауза · работала ${dur(t.run_s)}` : dur(nowOf() - t.queued_since)))],
     ['num', textCell((t) => (t.score != null ? String(Math.round(t.score)) : '–'))],
-    [null, (td, t) => setText(td, t.wait_text || (t.reason && t.reason.startsWith('requeued:') ? t.reason_text : 'Запустится на следующем шаге'))],
+    [null, waitCell],
     ['actions', actionsCell],
+  ];
+  const queueCols = queueColsFor(() => STATE.now);
+  const waitingOf = (tasks) => tasks.filter((t) => t.state === 'queued' || t.state === 'suspended')
+    .sort((a, b) => (a.position ? 0 : 1) - (b.position ? 0 : 1) || (a.position || 0) - (b.position || 0) || a.id - b.id);
+
+  // what runs right now on the owner's other PCs (from their hellos, every few seconds)
+  const homeRunCols = [
+    [null, textCell((t) => t.pc)],
+    ['num', textCell((t) => String(t.tid))],
+    [null, nameCell],
+    [null, textCell(agentText)],
+    ['num', textCell((t) => `${t.used ? n1(t.used.cpu) : '–'} / ${num(t.cpu)}`)],
+    ['num', textCell((t) => `${t.used ? n1(t.used.ram) : '–'} / ${num(t.ram)}`)],
+    ['num', textCell((t) => `${dur((t.run_s || 0) + Math.max(0, STATE.now - (t.at || STATE.now)))} / ${dur(t.time_s)}`)],
+    [null, progressCell],
   ];
   const allActiveCols = [
     ['num', textCell((t) => String(t.id))],
@@ -1417,22 +1488,38 @@
     ['num', textCell((t) => stamp(t.finished_at))],
   ];
   const builders = new Map();
-  function rows(sel, items, cols, empty) {
+  function rows(sel, items, cols, empty, open) {
     const tbody = $(`${sel} tbody`);
     tbody.dataset.empty = empty;
-    if (!builders.has(sel)) builders.set(sel, taskRow(cols));
+    if (!builders.has(sel)) builders.set(sel, taskRow(cols, open));
     syncRows(tbody, items, cols.length, builders.get(sel));
   }
 
   function renderTasks(s) {
-    const active = s.tasks.filter((t) => t.state !== 'queued');
-    const queued = s.tasks.filter((t) => t.state === 'queued').sort((a, b) => (a.position || 0) - (b.position || 0));
-    rows('#t-active', active, activeCols, 'Сейчас ничего не выполняется');
-    rows('#t-queue', queued, queueCols, 'Очередь пуста');
+    // the main page: this PC only; tasks sent to other PCs are on the "Задачи" and "Сеть" tabs
+    const local = s.tasks.filter((t) => t.state !== 'remote');
+    rows('#t-active', local.filter((t) => t.state === 'running'), activeCols, 'Сейчас ничего не выполняется');
+    rows('#t-queue', waitingOf(local), queueCols, 'Очередь пуста');
+    renderHomeRunning(s);
     if (TAB === 'tasks') {
       rows('#t-all-active', s.tasks, allActiveCols, 'Нет активных задач');
       rows('#t-recent', s.recent, recentCols, 'Пока ничего не завершалось');
     }
+  }
+
+  function renderHomeRunning(s) {
+    const pcs = s.home_running || [];
+    $('#home-running-box').hidden = !pcs.length;
+    if (!pcs.length) return;
+    const items = [];
+    for (const pc of pcs) {
+      for (const t of pc.tasks) items.push({ ...t, tid: t.id, id: `${pc.node_id}:${t.id}`, pc: pc.name, node: pc.node_id, at: pc.at });
+    }
+    const off = pcs.filter((p) => !p.online).map((p) => p.name);
+    const old = pcs.filter((p) => p.online && !p.known).map((p) => p.name);
+    const notes = [off.length ? `не в сети: ${off.join(', ')}` : '', old.length ? `нужно обновить менеджер: ${old.join(', ')}` : ''].filter(Boolean);
+    rows('#t-home-running', items, homeRunCols, `Сейчас ничего не выполняется${notes.length ? ` (${notes.join('; ')})` : ''}`,
+      (it) => openPc('home', it.node));
   }
 
   async function taskAction(id, action) {
@@ -2995,7 +3082,7 @@
         cards.push(inviteCard('Добавить мой ПК', 'Код для другого вашего ПК: на нём «Мои ПК» → «Присоединить этот ПК к моим ПК». Не пересылайте его другим людям — он даёт управление вашими ПК.',
           homeCode, '/api/network/home/invite', (c) => { homeCode = c; }));
         cards.push(h('div', { class: 'card' }, h('h3', null, 'Этот ПК — основной'),
-          h('p', { class: 'small ink2' }, 'С него можно менять настройки всех ваших ПК (кнопка «Настройки» в таблице) и решать, какие из них видны друзьям (столбец «Для друзей»).'),
+          h('p', { class: 'small ink2' }, 'С него можно менять настройки всех ваших ПК («Подробнее» → «Настройки этого ПК») и решать, какие из них видны друзьям (столбец «Для друзей»).'),
           h('div', { class: 'form-actions' }, leave)));
       } else {
         cards.push(h('div', { class: 'card' }, h('h3', null, `Основной ПК: ${H.main_name || '—'}`),
@@ -3026,6 +3113,257 @@
     ];
   }
 
+  // ---------------------------------------------------------------- sub-tabs: Обзор · Внутренняя сеть · Внешняя сеть
+  let NET_SUB = 'overview';
+  const PC_SEL = { home: null, ext: null };
+  try {
+    NET_SUB = localStorage.getItem('rmq_net_sub') || 'overview';
+    Object.assign(PC_SEL, JSON.parse(localStorage.getItem('rmq_pc_sel') || '{}'));
+  } catch { /* ignore */ }
+  function remember() {
+    try { localStorage.setItem('rmq_net_sub', NET_SUB); localStorage.setItem('rmq_pc_sel', JSON.stringify(PC_SEL)); } catch { /* ignore */ }
+  }
+  function netSub(name) {
+    NET_SUB = name;
+    remember();
+    renderNetSub();
+  }
+  $$('#net-sub button').forEach((b) => b.addEventListener('click', () => netSub(b.dataset.sub)));
+  function openPc(kind, node) {
+    PC_SEL[kind] = node;
+    NET_SUB = kind;
+    remember();
+    tab('network');
+  }
+
+  function renderNetSub() {
+    $$('#net-sub button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.sub === NET_SUB)));
+    $('#net-overview').hidden = NET_SUB !== 'overview';
+    $('#net-home').hidden = NET_SUB !== 'home';
+    $('#net-ext').hidden = NET_SUB !== 'ext';
+    if (!NETVIEW) return;
+    if (NET_SUB === 'home') renderHomePane(NETVIEW);
+    if (NET_SUB === 'ext') renderExtPane(NETVIEW);
+  }
+
+  function pcList(box, kind, members) {
+    if (!members.some((m) => m.node_id === PC_SEL[kind])) PC_SEL[kind] = members.length ? members[0].node_id : null;
+    const items = members.map((m) => {
+      const info = m.info || {};
+      const t = info.tasks || {};
+      const sub = !m.online ? `не в сети${m.seen ? ` · был ${ago(m.seen)}` : ''}`
+        : `▶ ${t.running || 0} · ◷ ${t.queued || 0} · свободно CPU ${n1((info.free || {}).cpu)}, ОЗУ ${n1((info.free || {}).ram)} ГБ`;
+      return [m, sub];
+    });
+    const sig = `${PC_SEL[kind]}|${items.map(([m, sub]) => `${m.node_id}|${m.name}|${m.main}|${m.own}|${m.online}|${sub}`).join(',')}`;
+    if (box.dataset.sig === sig) return;
+    box.dataset.sig = sig;
+    box.replaceChildren(...items.map(([m, sub]) => h('button', {
+      type: 'button', class: 'pc-item', 'aria-current': String(m.node_id === PC_SEL[kind]),
+      onclick: () => { PC_SEL[kind] = m.node_id; remember(); renderNetSub(); },
+    }, h('span', { class: 'pc-name' }, h('span', { class: `net-status ${m.online ? 'on' : ''}` }, h('i')), m.name,
+      m.main ? h('span', { class: 'role' }, 'основной') : m.own ? h('span', { class: 'role' }, 'мой ПК') : null),
+    h('span', { class: 'pc-sub' }, sub))));
+  }
+
+  function busyFlags(info) {
+    const b = info.busy || {};
+    return [b.game ? 'игра' : null, b.paused ? 'все задачи на паузе' : null,
+      b.heat === 'hot' ? 'перегрев' : b.heat === 'warm' ? 'регулятор температуры' : null,
+      b.disk_low ? 'мало места на диске' : null].filter(Boolean);
+  }
+  function hwLine(info) {
+    const hw = info.hw || {};
+    return [hw.cpu ? `${hw.cpu}, ${hw.threads} потоков` : null, hw.ram_gb ? `ОЗУ ${n1(hw.ram_gb)} ГБ` : null,
+      hw.gpu ? `${hw.gpu}, ${n1(hw.vram_gb)} ГБ` : hw.cpu ? 'без видеокарты' : null, hw.os || null].filter(Boolean).join(' · ');
+  }
+  function pcHeadRow(m) {
+    const info = m.info || {};
+    return h('div', { class: 'row' }, h('span', { class: 'title' }, m.name),
+      m.main ? h('span', { class: 'role' }, 'основной') : m.own ? h('span', { class: 'role' }, 'мой ПК') : null,
+      linkCell(m), busyFlags(info).map((f) => h('span', { class: 'tag warn' }, f)));
+  }
+
+  // ---------------------------------------------------------------- one of the owner's PCs, in detail
+  // Its state and charts come through this manager from that PC (read-only): what its own main page shows.
+  class PcView {
+    constructor() {
+      this.node = null;
+      this.src = { state: null, metrics: null, names: {}, slots: new Map(), open: null, smooth: null };
+      this.err = '';
+      this.busy = false;
+      this.again = false;
+      this.loadedAt = 0;
+      this.charts = [...resourceCharts(this.src), new TaskChart(this.src)];
+      this.temps = thermalCharts(this.src);
+      this.head = h('div', { class: 'card pc-head' });
+      this.msg = h('div', { class: 'msg err', hidden: true });
+      this.tiles = h('div', { class: 'tiles' });
+      this.disks = h('div', { class: 'disks', hidden: true });
+      this.thermal = h('div', { class: 'tiles' });
+      const th = (t, cls) => h('th', { class: cls || null }, t);
+      const table = (id, heads) => h('div', { class: 'tbl-wrap' }, h('table', { id }, h('thead', null, h('tr', null, heads)), h('tbody')));
+      const ranges = [[300, '5 мин'], [900, '15 мин'], [3600, '1 ч'], [21600, '6 ч'], [86400, '24 ч']];
+      this.body = h('div', { class: 'pc-body', hidden: true },
+        h('div', { class: 'filters' }, h('span', { class: 'label' }, 'Период графиков'),
+          h('div', { class: 'seg range-seg', role: 'group', 'aria-label': 'Период графиков' },
+            ranges.map(([r, t]) => h('button', { type: 'button', 'data-range': String(r), 'aria-pressed': String(r === RANGE) }, t))),
+          h('label', { class: 'chk smooth' }, h('input', { type: 'checkbox', class: 'smooth-toggle' }), ' Скользящее среднее за 5 с')),
+        this.tiles, this.disks,
+        h('div', { class: 'charts' }, this.charts.map((c) => c.root)),
+        h('h2', null, 'Выполняются'),
+        table('pc-active', [th('#', 'num'), th('Задача'), th('Агент'), th('Состояние'), th('CPU, яд.', 'num'), th('ОЗУ, ГБ', 'num'),
+          th('VRAM, ГБ', 'num'), th('Время', 'num'), th('Очки', 'num'), th('Выполнено')]),
+        h('h2', null, 'Очередь'),
+        table('pc-queue', [th('Поз.', 'num'), th('#', 'num'), th('Задача'), th('Агент'), th('Заявка', 'num'), th('Ждёт', 'num'),
+          th('Очки', 'num'), th('Почему ждёт')]),
+        h('h2', null, 'Температура'), this.thermal,
+        h('div', { class: 'charts' }, this.temps.map((c) => c.root)),
+        h('h2', null, 'Недавно завершённые'),
+        table('pc-recent', [th('#', 'num'), th('Задача'), th('Агент'), th('Итог'), th('Код', 'num'), th('Работала', 'num'),
+          th('Пик ОЗУ', 'num'), th('Завершена', 'num')]));
+      this.empty = h('div', { class: 'card muted', hidden: true });
+      this.root = h('div', { class: 'pc-view' }, this.empty, this.head, this.msg, this.body);
+    }
+
+    select(node) {
+      if (node === this.node) return;
+      this.node = node;
+      Object.assign(this.src, { state: null, metrics: null, smooth: null, names: {} });
+      this.src.slots.clear();
+      this.err = '';
+      this.loadedAt = 0;
+      for (const id of ['pc-active', 'pc-queue', 'pc-recent']) {
+        const tb = $(`#${id} tbody`);
+        tb._rows = new Map();
+        tb.replaceChildren();
+      }
+      if (node) this.load(true);
+    }
+
+    async load(full) {
+      if (!this.node) return;
+      if (this.busy) { this.again = this.again || full; return; }
+      this.busy = true;
+      const node = this.node;
+      this.loadedAt = Date.now();
+      try {
+        const base = `/api/home/${encodeURIComponent(node)}`;
+        const cur = this.src.metrics;
+        const since = !full && cur && cur.t.length ? cur.t[cur.t.length - 1] : 0;
+        const [st, m] = await Promise.all([api('GET', `${base}/state`), api('GET', `${base}/metrics?range=${RANGE}&since=${since}`)]);
+        if (node === this.node) {
+          this.src.state = st;
+          Object.assign(this.src.names, m.task_names || {});
+          this.src.metrics = mergeMetrics(full ? null : this.src.metrics, m);
+          this.err = '';
+        }
+      } catch (e) {
+        if (node === this.node) this.err = e.message;
+      } finally {
+        this.busy = false;
+      }
+      if (node === this.node && TAB === 'network' && NET_SUB === 'home') this.render();
+      if (this.again) { this.again = false; this.load(true); }
+    }
+
+    tick() {
+      if (this.node && Date.now() - this.loadedAt > 3000) this.load(false);
+    }
+
+    render() {
+      const v = NETVIEW;
+      const m = v && v.home ? v.home.members.find((x) => x.node_id === this.node) : null;
+      this.empty.hidden = !!m;
+      this.head.hidden = !m;
+      if (!m) {
+        setText(this.empty, !v || !v.home ? 'Этот ПК не в «Моих ПК». Создать их или присоединиться — во вкладке «Обзор».'
+          : 'Других ваших ПК пока нет. Добавить: «Обзор» → «Мои ПК» → «Добавить мой ПК».');
+        this.body.hidden = true;
+        this.msg.hidden = true;
+        return;
+      }
+      const info = m.info || {};
+      const hm = info.home || {};
+      const isMain = v.home.is_main;
+      const sig = JSON.stringify([m.name, m.main, m.online, m.rtt_ms, m.reaches, m.they_reach, info.version, hm.preset, hm.external, info.busy, isMain]);
+      if (this.head.dataset.sig !== sig) {
+        this.head.dataset.sig = sig;
+        const acts = [];
+        if (isMain) {
+          acts.push(h('button', { class: 'btn', type: 'button', disabled: !m.online, onclick: () => { SETTINGS_NODE = m.node_id; tab('rules'); } }, 'Настройки этого ПК'));
+          acts.push(h('button', { class: 'btn', type: 'button', onclick: () => {
+            if (confirm(`Сделать основным ПК «${m.name}»? Этот ПК станет обычным и больше не сможет управлять остальными.`)) netCall('/api/network/home/main', { node: m.node_id });
+          } }, 'Сделать основным'));
+        }
+        fill(this.head, pcHeadRow(m), netNotes(m),
+          h('div', { class: 'small ink2' }, hwLine(info)),
+          h('div', { class: 'small ink2' }, `Версия ${info.version || '?'}${hm.preset ? ` · настройки «${hm.preset}»` : ''}${hm.external ? ` · для друзей: ${EXT_TEXT[extState(hm.external)]}` : ''}`),
+          acts.length ? h('div', { class: 'form-actions' }, acts) : null);
+      }
+      this.msg.hidden = !this.err;
+      setText(this.msg, this.err);
+      const s = this.src.state;
+      this.body.hidden = !s;
+      if (!s) return;
+      renderTiles(s, this.tiles, this.src.metrics);
+      renderDisks(s, this.disks);
+      this.charts.forEach((c) => c.update());
+      if (s.thermal) this.thermal.replaceChildren(...thermalTiles(s.thermal));
+      this.temps.forEach((c) => c.update());
+      const local = s.tasks.filter((t) => t.state !== 'remote');
+      rows('#pc-active', local.filter((t) => t.state === 'running'), pcActiveCols, 'Сейчас ничего не выполняется', null);
+      rows('#pc-queue', waitingOf(local), pcQueueCols, 'Очередь пуста', null);
+      rows('#pc-recent', s.recent || [], recentCols, 'Пока ничего не завершалось', null);
+    }
+  }
+  const pcActiveCols = activeCols.filter(([cls]) => cls !== 'actions');
+  const homeView = new PcView();
+  const pcQueueCols = queueColsFor(() => (homeView.src.state || {}).now || Date.now() / 1000).filter(([cls]) => cls !== 'actions');
+  $('#home-pane').append(homeView.root);
+
+  function renderHomePane(v) {
+    const members = v.home ? v.home.members.filter((m) => !m.self && !m.left) : [];
+    pcList($('#home-pcs'), 'home', members);
+    $('#home-pcs').hidden = !members.length;
+    homeView.select(PC_SEL.home);
+    homeView.render();
+  }
+
+  // ---------------------------------------------------------------- a friend's PC: what it tells, and the tasks between us
+  function renderExtPane(v) {
+    const members = v.network ? v.members.filter((m) => !m.self && !m.left) : [];
+    pcList($('#ext-pcs'), 'ext', members);
+    $('#ext-pcs').hidden = !members.length;
+    const m = members.find((x) => x.node_id === PC_SEL.ext);
+    $('#ext-body').hidden = !m;
+    const head = $('#ext-head');
+    if (!m) {
+      fill(head, h('p', { class: 'muted' }, v.network ? 'В сети с друзьями пока нет других ПК. Пригласить друга — во вкладке «Обзор».'
+        : 'Этот ПК не в сети с друзьями. Создать её или присоединиться — во вкладке «Обзор».'));
+      return;
+    }
+    const info = m.info || {};
+    const free = info.free || {};
+    const t = info.tasks || {};
+    const sig = JSON.stringify([m.name, m.own, m.online, m.rtt_ms, m.reaches, m.they_reach, info.version, info.mode, info.busy, free, t, info.hosted]);
+    if (head.dataset.sig !== sig) {
+      head.dataset.sig = sig;
+      fill(head, pcHeadRow(m), netNotes(m),
+        h('div', { class: 'small ink2' }, hwLine(info)),
+        h('div', { class: 'small ink2' }, m.online || info.mode
+          ? `${(MODE_INFO[info.mode] || ['?'])[0]} · свободно сейчас: CPU ${n1(free.cpu)}, ОЗУ ${n1(free.ram)} ГБ, VRAM ${n1(free.vram)} ГБ · задачи: ▶ ${t.running || 0} ◷ ${t.queued || 0} · версия ${info.version || '?'}`
+          : 'Нет данных: ПК не в сети'),
+        m.own
+          ? h('div', { class: 'form-actions' }, h('span', { class: 'small muted' }, 'Это ваш ПК: его очередь и графики — во внутренней сети.'),
+            h('button', { class: 'btn', type: 'button', onclick: () => openPc('home', m.node_id) }, 'Открыть во внутренней сети'))
+          : h('p', { class: 'small muted' }, 'Очередь и графики ПК друга не видны: его менеджер сообщает другим только своё железо, свободные ресурсы и число задач.'));
+    }
+    const all = [...(STATE ? STATE.tasks : []), ...(STATE ? STATE.recent : [])];
+    rows('#ext-mine', all.filter((x) => x.where_node === m.node_id).slice(0, 40), netTaskCols, 'Ваших задач на этом ПК пока не было');
+    rows('#ext-theirs', all.filter((x) => x.from_node === m.node_id).slice(0, 40), netTaskCols, 'Задач с этого ПК здесь пока не было');
+  }
+
   function renderHomeTable(v) {
     $('#home-table').hidden = !v.home;
     if (!v.home) return;
@@ -3045,14 +3383,11 @@
         extCell = sel;
       }
       const acts = [];
-      if (main && !m.left) {
-        acts.push(h('button', { class: 'btn', type: 'button', disabled: !known, title: known ? 'Открыть настройки этого ПК' : 'ПК не в сети', onclick: () => {
-          SETTINGS_NODE = m.self ? null : m.node_id;
-          tab('rules');
-        } }, 'Настройки'));
-        if (!m.self) acts.push(h('button', { class: 'btn', type: 'button', onclick: () => {
-          if (confirm(`Сделать основным ПК «${m.name}»? Этот ПК станет обычным и больше не сможет управлять остальными.`)) netCall('/api/network/home/main', { node: m.node_id });
-        } }, 'Сделать основным'));
+      // another PC: its tasks, charts, settings and "make main" are on its page in "Внутренняя сеть"
+      if (!m.self && !m.left) {
+        acts.push(h('button', { class: 'btn', type: 'button', title: 'Задачи, графики и настройки этого ПК', onclick: () => openPc('home', m.node_id) }, 'Подробнее'));
+      } else if (m.self && main) {
+        acts.push(h('button', { class: 'btn', type: 'button', onclick: () => { SETTINGS_NODE = null; tab('rules'); } }, 'Настройки'));
       }
       return h('tr', { class: m.left ? 'off' : null },
         h('td', null, h('div', { class: 'name' }, m.name, m.main ? h('span', { class: 'role' }, 'основной') : null),
@@ -3099,7 +3434,7 @@
     const tbody = $('#t-nodes tbody');
     const rowsN = v.members.filter((m) => !m.left || m.left_at > Date.now() / 1000 - 7 * 86400);
     if (!v.network || !rowsN.length) {
-      tbody.replaceChildren(h('tr', { class: 'empty' }, h('td', { colspan: 9 }, 'Этот ПК не в сети с друзьями')));
+      tbody.replaceChildren(h('tr', { class: 'empty' }, h('td', { colspan: 10 }, 'Этот ПК не в сети с друзьями')));
       return;
     }
     tbody.replaceChildren(...rowsN.map((m) => {
@@ -3112,7 +3447,9 @@
           h('div', { class: 'cmd' }, (info.hw || {}).os || '')),
         h('td', null, linkCell(m), netNotes(m)),
         h('td', null, known ? `${(MODE_INFO[info.mode] || ['?'])[0]}${flags.length ? ` · ${flags.join(', ')}` : ''}` : '–'),
-        ...hwCells(m, known));
+        ...hwCells(m, known),
+        h('td', { class: 'actions' }, m.self || m.left ? null
+          : h('button', { class: 'btn', type: 'button', onclick: () => openPc(m.own ? 'home' : 'ext', m.node_id) }, 'Подробнее')));
     }));
   }
 
@@ -3164,6 +3501,7 @@
       renderHomeTable(NETVIEW);
     }
     renderNodes(NETVIEW);
+    renderNetSub();
   }
 
   async function loadNetwork() {
@@ -3185,7 +3523,7 @@
     if (name === 'thermal') tempCharts.forEach((c) => c.update());
     if (name === 'stats') { if (REPORT) renderStats(); loadStats(); }
     if (name === 'chronicle') { if (CHRON) renderChronicle(); loadChronicle(); }
-    if (name === 'network') { if (NETVIEW) renderNetwork(); loadNetwork(); }
+    if (name === 'network') { renderNetSub(); if (NETVIEW) renderNetwork(); loadNetwork(); }
     if (STATE) render();
   }
   $$('.tabs button').forEach((b) => b.addEventListener('click', () => tab(b.dataset.tab)));
@@ -3199,15 +3537,16 @@
     syncSmooth();
     charts.forEach((x) => x.update());
     tempCharts.forEach((x) => x.update());
+    [...homeView.charts, ...homeView.temps].forEach((x) => x.update());
   }));
   syncSmooth();
 
   $$('.range-seg button').forEach((b) => b.addEventListener('click', async () => {
     RANGE = Number(b.dataset.range);
     $$('.range-seg button').forEach((x) => x.setAttribute('aria-pressed', String(x.dataset.range === b.dataset.range)));
-    const all = [...charts, ...tempCharts];
+    const all = [...charts, ...tempCharts, ...homeView.charts, ...homeView.temps];
     all.forEach((c) => c.plot.classList.add('loading'));
-    await loadMetrics(true);
+    await Promise.all([loadMetrics(true), homeView.node ? homeView.load(true) : null]);
     all.forEach((c) => { c.plot.classList.remove('loading'); c.update(); });
   }));
 
@@ -3216,12 +3555,7 @@
     const since = !full && METRICS && METRICS.t.length ? METRICS.t[METRICS.t.length - 1] : 0;
     const m = await api('GET', `/api/metrics?range=${RANGE}&since=${since}`);
     Object.assign(TASK_NAMES, m.task_names || {});
-    if (full || !METRICS || METRICS.step !== m.step) { METRICS = m; return; }
-    for (const k of Object.keys(m)) if (Array.isArray(m[k])) METRICS[k].push(...m[k]);
-    const cut = METRICS.t.length ? METRICS.t[METRICS.t.length - 1] - RANGE - 5 : 0;
-    let drop = 0;
-    while (drop < METRICS.t.length && METRICS.t[drop] < cut) drop += 1;
-    if (drop) for (const k of Object.keys(METRICS)) if (Array.isArray(METRICS[k])) METRICS[k].splice(0, drop);
+    METRICS = mergeMetrics(full ? null : METRICS, m);
   }
 
   function render() {
@@ -3239,6 +3573,8 @@
       if (Date.now() - netLoadedAt > 5000) loadNetwork();
       renderNetTasks(s);
       renderUpdate(s);
+      if (NET_SUB === 'home') homeView.tick();
+      if (NET_SUB === 'ext' && NETVIEW) renderExtPane(NETVIEW);
     }
     renderTasks(s);
     if (TAB === 'agents') renderAgents(s);

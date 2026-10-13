@@ -203,10 +203,7 @@ class Handler(BaseHTTPRequestHandler):
             rng, since = float(q.get("range", 900)), float(q.get("since", 0))
         except ValueError:
             raise ApiError(400, "range/since: числа") from None
-        res = self.manager.metrics.series(max(10.0, min(86400.0, rng)), since)
-        ids = {int(k) for row in res.get("tasks", []) for k in (row or {})}
-        res["task_names"] = self.manager.db.task_labels(ids)  # for the chart of resources by task
-        return res
+        return self.manager.metrics_view(rng, since)
 
     @route("GET", "/api/tasks")
     def tasks(self, ident, body, q):
@@ -410,6 +407,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.manager.net.rename(name)
         self.manager.net.manage(nid, "POST", "rename", {"name": name})
         return self.manager.net.view()
+
+    # one's other PCs, read-only: their tasks, load and charts on the "Сеть" tab
+    @route("GET", r"/api/home/([\w.-]+)/state")
+    def home_state(self, ident, body, q, node):
+        self._admin(ident)
+        net = self.manager.net
+        return net.peek(net.find_home(node), "state")
+
+    @route("GET", r"/api/home/([\w.-]+)/metrics")
+    def home_metrics(self, ident, body, q, node):
+        self._admin(ident)
+        net = self.manager.net
+        return net.peek(net.find_home(node), "metrics", {"range": q.get("range", 900), "since": q.get("since", 0)})
 
     @route("POST", "/api/update/check")
     def update_check(self, ident, body, q):

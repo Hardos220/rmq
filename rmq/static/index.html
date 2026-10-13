@@ -39,7 +39,7 @@
     <button type="button" id="shutdown-btn" class="ghost danger" title="Выключить менеджер ресурсов">Выключить</button>
   </header>
   <nav class="tabs" role="tablist" aria-label="Разделы">
-    <button role="tab" data-tab="overview" aria-selected="true">Обзор</button>
+    <button role="tab" data-tab="overview" aria-selected="true">Главная</button>
     <button role="tab" data-tab="tasks" aria-selected="false">Задачи</button>
     <button role="tab" data-tab="network" aria-selected="false">Сеть</button>
     <button role="tab" data-tab="thermal" aria-selected="false">Температура</button>
@@ -70,7 +70,7 @@
       <div class="disks" id="disks" hidden></div>
       <div class="charts" id="charts"></div>
 
-      <h2>Выполняются и на паузе</h2>
+      <h2>Выполняются</h2>
       <div class="tbl-wrap"><table id="t-active">
         <thead><tr>
           <th>#</th><th>Задача</th><th>Агент</th><th>Состояние</th>
@@ -79,7 +79,19 @@
         </tr></thead><tbody></tbody>
       </table></div>
 
+      <div id="home-running-box" hidden>
+        <h2>Выполняются на других моих ПК</h2>
+        <div class="tbl-wrap"><table id="t-home-running">
+          <thead><tr>
+            <th>ПК</th><th class="num">#</th><th>Задача</th><th>Агент</th>
+            <th class="num">CPU, яд.</th><th class="num">ОЗУ, ГБ</th><th class="num">Время</th><th>Выполнено</th>
+          </tr></thead><tbody></tbody>
+        </table></div>
+      </div>
+
       <h2>Очередь</h2>
+      <p class="small muted">Задачи на паузе стоят здесь же, в общем порядке очков: уже начатые получают прибавку и
+        возобновляются, как только для них освободится место.</p>
       <div class="tbl-wrap"><table id="t-queue">
         <thead><tr>
           <th class="num">Поз.</th><th>#</th><th>Задача</th><th>Агент</th>
@@ -126,6 +138,34 @@
     </section>
 
     <section id="tab-network" hidden>
+      <div class="seg net-sub" id="net-sub" role="group" aria-label="Разделы сети">
+        <button type="button" data-sub="overview" aria-pressed="true">Обзор</button>
+        <button type="button" data-sub="home" aria-pressed="false">Внутренняя сеть · мои ПК</button>
+        <button type="button" data-sub="ext" aria-pressed="false">Внешняя сеть · друзья</button>
+      </div>
+      <div id="net-home" class="pcs" hidden>
+        <nav class="pc-list" id="home-pcs" aria-label="Мои ПК"></nav>
+        <div class="pc-pane" id="home-pane"></div>
+      </div>
+      <div id="net-ext" class="pcs" hidden>
+        <nav class="pc-list" id="ext-pcs" aria-label="ПК друзей"></nav>
+        <div class="pc-pane">
+          <div class="card pc-head" id="ext-head"></div>
+          <div id="ext-body">
+            <h2>Ваши задачи на этом ПК</h2>
+            <div class="tbl-wrap"><table id="ext-mine">
+              <thead><tr><th>#</th><th>Задача</th><th>Агент</th><th>Где</th><th>Состояние</th><th class="num">Время</th><th>Выполнено</th></tr></thead>
+              <tbody></tbody>
+            </table></div>
+            <h2>Его задачи на этом ПК</h2>
+            <div class="tbl-wrap"><table id="ext-theirs">
+              <thead><tr><th>#</th><th>Задача</th><th>Агент</th><th>Где</th><th>Состояние</th><th class="num">Время</th><th>Выполнено</th></tr></thead>
+              <tbody></tbody>
+            </table></div>
+          </div>
+        </div>
+      </div>
+      <div id="net-overview">
       <div class="card net-head" id="net-head"></div>
       <h2>Мои ПК</h2>
       <p class="small muted">Ваши собственные ПК: задачи между ними идут как свои, а основной ПК управляет настройками
@@ -144,7 +184,7 @@
       <div class="tbl-wrap"><table id="t-nodes">
         <thead><tr>
           <th>Компьютер</th><th>Связь</th><th>Режим</th><th>Процессор</th><th class="num">ОЗУ</th><th>Видеокарта</th>
-          <th class="num">Свободно сейчас</th><th class="num">Задачи</th><th class="num">Версия</th>
+          <th class="num">Свободно сейчас</th><th class="num">Задачи</th><th class="num">Версия</th><th></th>
         </tr></thead><tbody></tbody>
       </table></div>
       <div class="net-actions" id="net-help"></div>
@@ -160,6 +200,7 @@
         доступа Windows: читать файлы этого ПК могут, менять и удалять — нет.</p>
       <h2>Обновления</h2>
       <div class="card" id="update-card"></div>
+      </div>
     </section>
 
     <section id="tab-thermal" hidden>

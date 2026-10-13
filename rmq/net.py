@@ -45,7 +45,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from . import __version__, firewall
 from .netbase import (KINDS, MODES, PROTOCOL, NetError, NetStore, NonceCache, body_hash, collect_files, file_sha256,
@@ -58,6 +58,7 @@ log = logging.getLogger("rmq")
 # urllib does to decide whether to bypass one, which cost up to seconds per request)
 DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 HELLO_EVERY_S = 30
+HOME_HELLO_EVERY_S = 10  # one's own PCs: their running tasks show on each other's main page
 SYNC_EVERY_S = 3
 ONLINE_S = 95          # a member is "in the network" if it answered within this time
 REACH_S = 150          # "this PC gets through to that one" if one of its own requests got there within this time
@@ -108,7 +109,7 @@ class NetService:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
-        self._last_hello = 0.0
+        self._last_hello: dict[str, float] = {}  # network -> when its members were greeted last
         self._last_sync = 0.0
         self.firewall: dict = {"state": "unknown"}  # can other PCs get through Windows Firewall to the listener
         self._fw_at = 0.0
@@ -127,7 +128,7 @@ class NetService:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
     def poke(self) -> None:
-        self._last_hello = 0.0
+        self._last_hello.clear()
         self._wake.set()
 
     def _loop(self) -> None:
@@ -149,13 +150,14 @@ class NetService:
             return
         self._ensure_server(cfg)
         now = time.time()
-        if self.server and now - self._last_hello >= HELLO_EVERY_S:
-            self._last_hello = now
-            for kind in KINDS:
-                if st.net(kind):
-                    for nid, rec in st.active_members(kind).items():
-                        if rec.get("address"):
-                            self.pool.submit(self._hello, nid, rec, kind)
+        for kind in KINDS if self.server else ():
+            every = HOME_HELLO_EVERY_S if kind == "home" else HELLO_EVERY_S
+            if not st.net(kind) or now - self._last_hello.get(kind, 0.0) < every:
+                continue
+            self._last_hello[kind] = now
+            for nid, rec in st.active_members(kind).items():
+                if rec.get("address"):
+                    self.pool.submit(self._hello, nid, rec, kind)
         if now - self._last_sync >= SYNC_EVERY_S:
             self._last_sync = now
             self._sync_proxies()
@@ -286,6 +288,7 @@ class NetService:
             info["home"] = {"main": store.is_main, "preset": PRESETS[preset][0] if preset else None,
                             "external": {"in": store.network is not None, "mode": store.mode,
                                          "network": store.network["name"] if store.network else None}}
+            info["running"] = self.m.running_brief()
         return info
 
     def _home_meta(self) -> dict | None:
@@ -690,6 +693,40 @@ class NetService:
         except PeerError as e:
             raise NetError(e.message, e.status or 502) from None
 
+    # ------------------------------------------------------------ looking at one's other PCs
+    def home_running(self) -> list[dict]:
+        """What runs right now on each of one's other PCs, as its last hello said (they come every few seconds)."""
+        st = self.store
+        if not st.home:
+            return []
+        with self._lock:
+            live = {k: dict(v) for k, v in self.live.items()}
+        now = time.time()
+        out = []
+        for nid, rec in st.active_members("home").items():
+            lv = live.get(nid) or {}
+            info = (lv.get("info_by") or {}).get("home") or {}
+            fresh = now - lv.get("seen", 0) <= 3.5 * HOME_HELLO_EVERY_S
+            tasks = [dict(t, here=t.get("origin_node") == st.node_id) for t in info.get("running") or []] if fresh else []
+            out.append({"node_id": nid, "name": rec.get("name") or info.get("name") or nid, "online": fresh,
+                        "at": lv.get("seen"), "known": "running" in info, "tasks": tasks})
+        return out
+
+    def peek(self, nid: str, what: str, query: dict | None = None):
+        """Read one of one's other PCs: its dashboard state or its charts. Any of one's PCs may look; only the
+        main PC manages."""
+        st = self.store
+        if not st.home or nid not in st.active_members("home"):
+            raise NetError("нет такого ПК среди моих ПК", 404)
+        path = f"/net/v1/home/{what}" + (f"?{urlencode(query)}" if query else "")
+        try:
+            return self.call(nid, "GET", path, kind="home", timeout=20)
+        except PeerError as e:
+            if e.status == 404:
+                raise NetError("на том ПК менеджер старой версии: обновите его, и здесь появятся его задачи "
+                               "и графики", 409) from None
+            raise NetError(e.message, e.status or 502) from None
+
     # ------------------------------------------------------------ what the "Сеть" tab shows
     def _member_views(self, kind: str, live: dict) -> list[dict]:
         st = self.store
@@ -976,7 +1013,7 @@ class NetHandler(BaseHTTPRequestHandler):
                 if method == "DELETE" and not rest:
                     return self._json(200, svc.m.net_hosted_delete(node, tid, kind))
             if parts and parts[0] == "home":
-                return self._home(svc, node, method, parts[1:], body, kind)
+                return self._home(svc, node, method, parts[1:], body, kind, q)
             raise NetError("нет такого адреса", 404)
         except NetError as e:
             self._json(e.status, {"error": e.message})
@@ -1042,14 +1079,24 @@ class NetHandler(BaseHTTPRequestHandler):
             out["home"] = svc._home_meta()
         self._json(200, out)
 
-    def _home(self, svc: NetService, node: str, method: str, rest: list[str], body: dict, kind: str) -> None:
-        """The main PC manages this one. Only over "Мои ПК" (other people do not have that key)."""
+    def _home(self, svc: NetService, node: str, method: str, rest: list[str], body: dict, kind: str,
+              q: dict) -> None:
+        """One's other PCs look at this one, and the main PC manages it. Only over "Мои ПК" (other people do not
+        have that key)."""
         st = svc.store
         if kind != "home":
             raise NetError("нет такого адреса", 404)
+        m = svc.m
+        if method == "GET" and rest == ["state"]:
+            return self._json(200, m.home_state())
+        if method == "GET" and rest == ["metrics"]:
+            try:
+                rng, since = float(q.get("range", 900)), float(q.get("since", 0))
+            except ValueError:
+                raise NetError("range/since: числа") from None
+            return self._json(200, m.metrics_view(rng, since))
         if node != (st.home or {}).get("main"):
             raise NetError("управлять этим ПК может только основной ПК", 403)
-        m = svc.m
         if rest == ["settings"] and method == "GET":
             return self._json(200, m.settings_view())
         if rest == ["settings"] and method == "PATCH":

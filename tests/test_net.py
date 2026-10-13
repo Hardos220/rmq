@@ -211,3 +211,24 @@ def test_the_firewall_state_says_whether_other_pcs_get_through():
     assert state_from({"enabled": True, "allow": 1, "block": 1, "inbound": 0}) == "blocked"  # a block rule wins
     assert state_from({"enabled": True, "allow": 0, "block": 0, "inbound": 0}) == "missing"
     assert state_from({"enabled": True, "allow": 0, "block": 0, "inbound": 1}) == "ok"   # inbound allowed by default
+
+
+def test_the_main_page_shows_what_runs_on_ones_other_pcs(tmp_path):
+    class Manager:
+        netstore = NetStore(tmp_path / "network.json")
+
+    st = Manager.netstore
+    st.home = {"id": "home-1", "name": "Мои ПК", "key": base64.urlsafe_b64encode(b"h" * 32).decode(),
+               "main": st.node_id, "main_at": 1.0}
+    st.merge({n: {"name": n.upper(), "address": "1:1", "updated_at": 1} for n in ("n-b", "n-c", "n-d")}, "home")
+    svc = NetService(Manager())
+    mine = {"id": 7, "name": "train", "origin_node": st.node_id}
+    svc._note_peer({"node_id": "n-b", "running": [mine, {"id": 8, "origin_node": None}]}, kind="home")
+    svc._note_peer({"node_id": "n-c"}, kind="home")       # an older manager: says nothing about its tasks
+    svc.live["n-d"] = {"seen": time.time() - 600, "info_by": {"home": {"running": [mine]}}}   # gone quiet
+    by = {p["node_id"]: p for p in svc.home_running()}
+    assert [t["id"] for t in by["n-b"]["tasks"]] == [7, 8]
+    assert by["n-b"]["tasks"][0]["here"] and not by["n-b"]["tasks"][1]["here"]   # 7 was sent from this PC
+    assert by["n-c"]["online"] and not by["n-c"]["known"]
+    assert not by["n-d"]["online"] and by["n-d"]["tasks"] == []                  # nothing stale on the main page
+    svc.pool.shutdown()

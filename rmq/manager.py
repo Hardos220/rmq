@@ -2008,8 +2008,11 @@ class Manager:
                 d["run_s"] = remote.get("run_s") or 0.0
                 d["progress"] = remote.get("progress")
                 d["used"] = remote.get("used")
+        if row["remote_node"]:
+            d["where_node"] = row["remote_node"]
         if row["origin_node"]:
             d["from"] = self.net.node_name(row["origin_node"])
+            d["from_node"] = row["origin_node"]
         if self._stopping(row):
             grace = self.settings.section("tasks")["stop_grace_s"]
             d["stopping"] = {"reason": texts.describe(row["state_reason"][9:]),
@@ -2090,7 +2093,37 @@ class Manager:
             state["agents"] = [self.agent_json(a, counts) for a in agents.values()]
             state["me"] = {"admin": ident.admin, "agent": ident.agent["name"]}
             state["events"] = self.db.events(limit=60)
-            return state
+        state["home_running"] = self.net.home_running()  # outside the lock: it takes the network's own
+        return state
+
+    def running_brief(self) -> list[dict]:
+        """The tasks running on this PC right now, in short: one's other PCs show them on their main page."""
+        with self.lock:
+            agents = {a["id"]: a for a in self.db.agents()}
+            out = []
+            for r in self.db.tasks_active():
+                if r["state"] != "running":
+                    continue
+                t = self.task_json(r, agents)
+                brief = {k: t.get(k) for k in ("id", "name", "command", "agent", "from", "cpu", "ram", "vram", "used",
+                                               "run_s", "time_s", "progress", "priority", "overtime")}
+                brief["origin_node"] = r["origin_node"]
+                out.append(brief)
+            return out
+
+    def home_state(self) -> dict:
+        """This PC's dashboard state as one of the owner's other PCs sees it (read-only, without the journal)."""
+        state = self.get_state(Identity(True, self.db.agent(self.user_agent_id)))
+        for key in ("events", "agents", "home_running"):
+            state.pop(key, None)
+        return state
+
+    def metrics_view(self, rng: float, since: float) -> dict:
+        """The chart series of the last `rng` seconds (newer than `since`) and the names of the tasks in them."""
+        res = self.metrics.series(max(10.0, min(86400.0, rng)), since)
+        ids = {int(k) for row in res.get("tasks", []) for k in (row or {})}
+        res["task_names"] = self.db.task_labels(ids)
+        return res
 
     def get_task(self, ident: Identity, tid: int) -> dict:
         with self.lock:
