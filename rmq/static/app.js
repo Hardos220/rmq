@@ -482,8 +482,8 @@
 
   // ================================================================ resources by task (overview)
   // Every running task as its own band, stacked over the owner's load: who takes how much at every moment.
-  // A task keeps its color while the page is open (color follows the task, not its rank); past eight
-  // tasks at once the rest fold into "Другие задачи".
+  // Eight colors: the tasks running now get them first, then the most recent ones; the older tasks of the
+  // window share one band ("Более ранние задачи"). A task keeps its color while it keeps one.
   const TASK_COLORS = ['--t1', '--t2', '--t3', '--t4', '--t5', '--t6', '--t7', '--t8'];
   const taskSlot = new Map();
   const TASK_NAMES = {};
@@ -540,28 +540,43 @@
     series() {
       const m = METRICS;
       const v = TASK_VIEWS[this.view];
+      // which tasks get one of the eight colors: those running now first, then the most recent ones;
+      // the older ones share one band. A task keeps its color while it keeps one.
+      const lastSeen = new Map();
       const ids = new Set();
       if (m && m.tasks) {
-        for (const row of m.tasks) for (const [k, val] of Object.entries(row || {})) if (val[v.i] > 0.005) ids.add(Number(k));
+        m.tasks.forEach((row, i) => {
+          for (const [k, val] of Object.entries(row || {})) {
+            lastSeen.set(Number(k), i);
+            if (val[v.i] > 0.005) ids.add(Number(k));
+          }
+        });
       }
-      const order = [...ids].sort((a, b) => a - b);
-      const used = new Set(order.map((id) => taskSlot.get(id)).filter((x) => x != null));
-      for (const id of order) {
-        if (taskSlot.has(id) && taskSlot.get(id) >= 0) continue;
+      const running = new Set(Object.keys((m && m.tasks && m.tasks[m.tasks.length - 1]) || {}).map(Number));
+      const ranked = [...lastSeen.keys()].sort((a, b) => (running.has(b) - running.has(a))
+        || (lastSeen.get(b) - lastSeen.get(a)) || (b - a));
+      const keep = new Set(ranked.slice(0, TASK_COLORS.length));
+      for (const id of [...taskSlot.keys()]) if (!keep.has(id)) taskSlot.delete(id);
+      const used = new Set([...taskSlot.values()]);
+      for (const id of ranked) {
+        if (!keep.has(id) || taskSlot.has(id)) continue;
         const free = TASK_COLORS.findIndex((_, i) => !used.has(i));
         taskSlot.set(id, free);
-        if (free >= 0) used.add(free);
+        used.add(free);
       }
       const out = [{ id: 'user', label: 'Вы и система', color: '--axis', get: this.smoothed((i) => (m[v.user] && m[v.user][i]) || 0) }];
       const other = [];
-      for (const id of order) {
-        const slot = taskSlot.get(id);
+      let otherRunning = false;
+      for (const id of [...ids].sort((a, b) => a - b)) {
         const get = this.smoothed((i) => { const r = m.tasks[i] && m.tasks[i][id]; return r ? r[v.i] : 0; });
-        if (slot < 0) { other.push(get); continue; }
+        if (!taskSlot.has(id)) { other.push(get); otherRunning = otherRunning || running.has(id); continue; }
         const info = TASK_NAMES[id] || {};
-        out.push({ id, label: `#${id} ${info.name || ''}`.trim(), agent: info.agent, color: TASK_COLORS[slot], get });
+        out.push({ id, label: `#${id} ${info.name || ''}`.trim(), agent: info.agent, color: TASK_COLORS[taskSlot.get(id)], get });
       }
-      if (other.length) out.push({ id: 'other', label: 'Другие задачи', color: '--c-other', get: (i) => other.reduce((a, g) => a + g(i), 0) });
+      if (other.length) {
+        out.push({ id: 'other', label: `${otherRunning ? 'Остальные задачи' : 'Более ранние задачи'} (${other.length})`,
+          color: '--c-other', get: (i) => other.reduce((a, g) => a + g(i), 0) });
+      }
       return out;
     }
 
