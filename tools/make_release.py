@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 # what an installation needs; data/, .venv/, tests/, snapshots/ and dist/ never go in
 FILES = ["rmq_cli.py", "requirements.txt", "install.cmd", "setup.cmd", "start.cmd", "start_hidden.cmd", "stop.cmd",
-         "README.md", "AGENTS.md", "agent_rules.md", "THIRD_PARTY.md"]
+         "README.md", "AGENTS.md", "agent_rules.md", "THIRD_PARTY.md", "LICENSE", "NOTICE"]
 DIRS = ["rmq", "bin", "tools"]
 SKIP_DIRS = {"__pycache__", ".pytest_cache"}
 SKIP_SUFFIXES = {".pyc", ".pyo", ".log"}

@@ -239,6 +239,8 @@ main { max-width: 1440px; margin: 0 auto; padding: 16px 24px 60px; }
 .chart.wide { grid-column: 1 / -1; }
 .chart.wide .plot { height: 150px; }
 .chart.taskchart .plot { height: 230px; }
+.foot { margin: 28px 0 8px; text-align: center; }
+.foot a { color: inherit; }
 .chart.taskchart .table-view { max-height: 230px; }
 .legend .task-key { cursor: pointer; }
 .legend .task-key:hover { color: var(--ink); }

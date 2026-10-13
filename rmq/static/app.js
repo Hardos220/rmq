@@ -521,6 +521,21 @@
       new ResizeObserver(() => this.draw()).observe(this.plot);
     }
 
+    // the same moving average as the other charts while "Скользящее среднее" is on
+    smoothed(get) {
+      const m = METRICS;
+      if (!SMOOTH || !m) return get;
+      const n = m.t.length;
+      const r = new Float64Array(n);
+      let lo = 0; let sum = 0;
+      for (let i = 0; i < n; i += 1) {
+        sum += get(i) || 0;
+        while (m.t[lo] <= m.t[i] - SMOOTH_S) { sum -= get(lo) || 0; lo += 1; }
+        r[i] = sum / (i - lo + 1);
+      }
+      return (i) => r[i];
+    }
+
     // the bands: the owner's load at the bottom, then each task (fixed order: by task number)
     series() {
       const m = METRICS;
@@ -537,11 +552,11 @@
         taskSlot.set(id, free);
         if (free >= 0) used.add(free);
       }
-      const out = [{ id: 'user', label: 'Вы и система', color: '--axis', get: (i) => (m[v.user] && m[v.user][i]) || 0 }];
+      const out = [{ id: 'user', label: 'Вы и система', color: '--axis', get: this.smoothed((i) => (m[v.user] && m[v.user][i]) || 0) }];
       const other = [];
       for (const id of order) {
         const slot = taskSlot.get(id);
-        const get = (i) => { const r = m.tasks[i] && m.tasks[i][id]; return r ? r[v.i] : 0; };
+        const get = this.smoothed((i) => { const r = m.tasks[i] && m.tasks[i][id]; return r ? r[v.i] : 0; });
         if (slot < 0) { other.push(get); continue; }
         const info = TASK_NAMES[id] || {};
         out.push({ id, label: `#${id} ${info.name || ''}`.trim(), agent: info.agent, color: TASK_COLORS[slot], get });
@@ -559,7 +574,7 @@
       this.tableEl.hidden = !this.showTable;
       const ser = this.series();
       const running = (STATE.tasks || []).filter((t) => t.state === 'running').length;
-      setText(this.sub, `${TASK_VIEWS[this.view].unit} · сейчас выполняется ${running}`);
+      setText(this.sub, `${TASK_VIEWS[this.view].unit} · сейчас выполняется ${running}${smoothNote()}`);
       this.renderLegend(ser);
       if (this.showTable) this.renderTable(ser); else this.draw(ser);
     }
@@ -695,7 +710,7 @@
       const rowsT = ser.slice().reverse().filter((s) => s.id === 'user' || s.get(i) > 0.005)
         .map((s) => h('div', { class: 'r' }, h('span', { class: 'lk', style: `border-top-color: var(${s.color})` }),
           h('b', null, f(s.get(i))), h('span', null, s.agent ? `${s.label} · ${s.agent}` : s.label)));
-      tooltip.replaceChildren(h('div', { class: 't' }, clock(m.t[i], true)), ...rowsT);
+      tooltip.replaceChildren(h('div', { class: 't' }, clock(m.t[i], true) + smoothNote()), ...rowsT);
       tooltip.hidden = false;
       const tw = tooltip.offsetWidth; const th = tooltip.offsetHeight;
       let left = e.clientX + 14; let top = e.clientY + 14;
@@ -1099,6 +1114,11 @@
   function renderUpdateBtn(s) {
     const b = $('#update-btn');
     const u = s.update || {};
+    const foot = $('#foot');
+    if (u.version && foot.dataset.v !== u.version) {
+      foot.dataset.v = u.version;
+      foot.firstChild.textContent = `RMQ ${u.version} · автор Hardos220 · `;
+    }
     b.hidden = !s.me.admin;
     if (pageVersion === null) pageVersion = u.version;
     else if (u.version && u.version !== pageVersion) { location.reload(); return; }  // updated: load the new page
@@ -1106,7 +1126,7 @@
     const answered = updClick && u.checked_at && u.checked_at >= updClick - 1;
     let text = 'Проверить обновления';
     let busy = false;
-    let title = `Установлена версия ${u.version || '?'}. Обновления приходят из github.com/${u.repo || '?'}; менеджер и сам проверяет их раз в несколько часов.`;
+    let title = `Установлена версия ${u.version || '?'}. Обновления приходят из github.com/${u.repo || '?'}; менеджер и сам проверяет их при запуске и раз в несколько часов.`;
     if (['available', 'downloading', 'installing'].includes(u.state)) {
       text = `Обновляется до ${u.latest || 'новой версии'}…`;
       busy = true;
@@ -1524,7 +1544,7 @@
       protect_host: 'Защита записи: задачи участников могут читать, но не менять и не удалять файлы этого ПК',
       keep_results_h: 'Удалять незабранные результаты через, ч',
     }],
-    update: ['Обновления', { auto: 'Проверять и ставить обновления автоматически (кроме рабочей копии разработчика)', check_every_h: 'Проверять раз в, ч' }],
+    update: ['Обновления', { auto: 'Проверять и ставить обновления автоматически (кроме рабочей копии разработчика)', check_every_h: 'Проверять при запуске и затем раз в, ч' }],
     disk: ['Место на диске', {
       enabled: 'Замораживать задачи, когда на диске мало места',
       min_free_gb: 'Минимум свободного места, ГБ (системный диск — для всех задач, другой диск — для задач, работающих на нём)',
@@ -2918,7 +2938,7 @@
     if (box.dataset.sig === sig) return;
     box.dataset.sig = sig;
     fill(box, h('div', { class: 'row' }, h('b', null, `Версия ${u.version || '?'}`), ' — ', state),
-      h('p', { class: 'small ink2' }, `Обновления приходят из релизов github.com/${u.repo || '?'}: выпускает их только автор. Менеджер проверяет их раз в несколько часов, когда есть интернет, сверяет контрольную сумму и перезапускается; задачи продолжают с того же места.`),
+      h('p', { class: 'small ink2' }, `Обновления приходят из релизов github.com/${u.repo || '?'}: выпускает их только автор. Менеджер проверяет их при запуске и затем раз в несколько часов, когда есть интернет, сверяет контрольную сумму и перезапускается; задачи продолжают с того же места.`),
       u.state === 'dev' ? null : h('div', { class: 'form-actions' }, h('button', { class: 'btn', type: 'button', onclick: async () => {
         try { await api('POST', '/api/update/check', {}); poll(true); } catch (e) { alert(e.message); }
       } }, 'Проверить сейчас')));
