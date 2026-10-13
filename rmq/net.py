@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__
+from . import __version__, firewall
 from .netbase import (KINDS, MODES, PROTOCOL, NetError, NetStore, NonceCache, body_hash, collect_files, file_sha256,
                       make_invite, make_zip, member_record, parse_invite, safe_extract, sign_headers,
                       tailscale_address, verify)
@@ -110,6 +110,8 @@ class NetService:
         self._thread: threading.Thread | None = None
         self._last_hello = 0.0
         self._last_sync = 0.0
+        self.firewall: dict = {"state": "unknown"}  # can other PCs get through Windows Firewall to the listener
+        self._fw_at = 0.0
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -158,6 +160,9 @@ class NetService:
             self._last_sync = now
             self._sync_proxies()
             self._expire_uploads(now)
+        if self.server and now - self._fw_at >= 300:
+            self._fw_at = now
+            self.pool.submit(self.check_firewall)
 
     # ------------------------------------------------------------ the listener
     def bind_ip(self, cfg: dict) -> str | None:
@@ -183,6 +188,7 @@ class NetService:
         threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.5}, name="rmq-net-http",
                          daemon=True).start()
         self.server, self.address, self.status, self.error = srv, address, "listening", ""
+        self._fw_at = 0.0  # check the firewall right away for the new listener
         self._update_self_record(address)
         log.info("network listener on %s", address)
 
@@ -217,6 +223,34 @@ class NetService:
         if not ip:
             raise NetError("не найден адрес Tailscale: установите Tailscale, войдите в него и повторите")
         return f"{ip}:{int(cfg['port'])}"
+
+    # ------------------------------------------------------------ Windows Firewall in front of the listener
+    @staticmethod
+    def _program() -> str:
+        """The program that really listens (a venv's pythonw.exe starts the base interpreter's)."""
+        import psutil
+        return psutil.Process().exe()
+
+    def check_firewall(self) -> dict:
+        port = int(self.m.settings.section("network")["port"])
+        try:
+            result = firewall.check(self._program(), port)
+        except Exception as e:
+            log.warning("firewall check failed: %s", e)
+            result = {"state": "unknown", "category": None}
+        result.update(port=port, checked_at=time.time())
+        self.firewall = result
+        return result
+
+    def allow_firewall(self) -> dict:
+        """The owner pressed "Разрешить в брандмауэре": one narrow rule, with Windows asking for consent."""
+        port = int(self.m.settings.section("network")["port"])
+        category = self.firewall.get("category") or "Private"
+        ok, message = firewall.allow(self._program(), port, category)
+        self.check_firewall()
+        if ok:
+            self.m.db.event("net", f"Брандмауэр Windows: разрешены подключения других ПК к менеджеру (порт {port})")
+        return {"ok": ok, "message": message, "view": self.view()}
 
     # ------------------------------------------------------------ what this node tells the others
     def channel(self, nid: str) -> str:
@@ -691,6 +725,7 @@ class NetService:
         main = (home or {}).get("main")
         return {"node_id": st.node_id, "node_name": st.node_name, "mode": st.mode, "status": self.status,
                 "error": self.error, "address": self.address, "tailscale": tailscale_address(),
+                "firewall": self.firewall if self.server else None,
                 "home": {"id": home["id"], "name": home["name"], "main": main, "is_main": st.is_main,
                          "main_name": (st.node_name if main == st.node_id else self.node_name(main)) if main else None,
                          "main_left": bool(main and main != st.node_id

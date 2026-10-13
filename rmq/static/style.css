@@ -310,6 +310,7 @@ ul.files li .btn { margin-left: auto; font-size: 12px; padding: 2px 8px; }
 .net-note::before { content: "▲ "; color: var(--serious); }
 .net-actions .net-help { grid-column: 1 / -1; }
 .net-head .rename-row { gap: 8px; align-items: center; }
+.net-head .fw-note { display: grid; gap: 6px; border-color: var(--serious); margin: 8px 0; }
 .net-head .rename-row input { padding: 4px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--page); color: var(--ink); width: 220px; }
 #t-home select { padding: 3px 6px; border: 1px solid var(--border); border-radius: 7px; background: var(--page); color: var(--ink); }
 #t-home td.actions { white-space: nowrap; }

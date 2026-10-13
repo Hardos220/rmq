@@ -336,6 +336,11 @@ class Handler(BaseHTTPRequestHandler):
         self._admin(ident)
         return self.manager.net.rename(str(body.get("name") or ""))
 
+    @route("POST", "/api/network/firewall")
+    def network_firewall(self, ident, body, q):
+        self._admin(ident)
+        return self.manager.net.allow_firewall()
+
     # ---------------------------------------------------------------- "Мои ПК": the owner's own PCs
     @route("POST", "/api/network/home/create")
     def home_create(self, ident, body, q):

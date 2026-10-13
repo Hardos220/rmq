@@ -201,3 +201,13 @@ def test_connection_failures_are_explained():
     assert "VPN" in explain("100.1.1.1:8778", E(10013)) and "100.1.1.1:8778" in explain("100.1.1.1:8778", E(10013))
     assert "брандмауэр" in explain("a:1", E(10060)) and "Офлайн" in explain("a:1", E(10061))
     assert explain("a:1", OSError("boom")).endswith("boom")
+
+
+
+def test_the_firewall_state_says_whether_other_pcs_get_through():
+    from rmq.firewall import state_from
+    assert state_from({"enabled": False}) == "ok"                                  # firewall off for that network
+    assert state_from({"enabled": True, "allow": 1, "block": 0, "inbound": 0}) == "ok"
+    assert state_from({"enabled": True, "allow": 1, "block": 1, "inbound": 0}) == "blocked"  # a block rule wins
+    assert state_from({"enabled": True, "allow": 0, "block": 0, "inbound": 0}) == "missing"
+    assert state_from({"enabled": True, "allow": 0, "block": 0, "inbound": 1}) == "ok"   # inbound allowed by default

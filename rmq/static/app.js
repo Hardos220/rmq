@@ -1144,7 +1144,7 @@
     nc.hidden = !anyNet;
     if (anyNet) {
       const parts = [];
-      if (net.home) parts.push(`мои ПК ${net.home_online} из ${net.home_members}`);
+      if (net.home) parts.push(net.home_members ? `мои ПК ${net.home_online} из ${net.home_members}` : 'мои ПК: пока только этот');
       if (net.network) parts.push(`друзья ${net.online} из ${net.members}${net.mode === 'one_way' ? ' (ПК только ваш)' : ''}`);
       const allOn = (!net.home || net.home_online >= net.home_members) && (!net.network || net.online >= net.members);
       nc.className = `chip ${net.mode === 'offline' ? 'net-off' : allOn ? 'net-on' : 'net-part'}`;
@@ -2882,6 +2882,7 @@
         h('span', { class: `net-status ${v.status === 'listening' ? 'on' : ''}` }, h('i'), status),
         h('span', { class: 'small ink2' }, ts ? `Tailscale: ${ts}` : 'Tailscale не найден: установите его и войдите (как — в инструкции ниже)')),
       v.error ? h('div', { class: 'msg err' }, v.error) : null,
+      firewallNote(v),
       h('div', { class: 'row rename-row' }, h('span', { class: 'small ink2' }, 'Имя этого ПК в сети'), rename,
         h('button', { class: 'btn', type: 'button', onclick: () => netCall('/api/network/rename', { name: rename.value }) }, 'Сохранить')),
       h('div', { class: 'modes', role: 'group', 'aria-label': 'Режим этого ПК' }, Object.entries(MODE_INFO).map(([k, [title, text]]) => {
@@ -2889,6 +2890,29 @@
         b.addEventListener('click', () => { if (v.mode !== k) netCall('/api/network/mode', { mode: k }); });
         return b;
       })));
+  }
+
+  function firewallNote(v) {
+    const fw = v.firewall;
+    if (!fw || !['missing', 'blocked'].includes(fw.state)) return null;
+    const why = fw.state === 'blocked'
+      ? 'Подключения других ПК к менеджеру запрещает правило брандмауэра Windows (так бывает, если в окне Windows нажали «Отмена»). Другие ПК увидят «нет связи».'
+      : 'Брандмауэр Windows не пропускает подключения других ПК к менеджеру: они увидят «нет связи».';
+    const btn = h('button', { class: 'btn primary', type: 'button' }, 'Разрешить в брандмауэре');
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      setText(btn, 'Подтвердите в окне Windows…');
+      try {
+        const r = await api('POST', '/api/network/firewall', {});
+        NETVIEW = r.view;
+        renderNetwork();
+        alert(r.message);
+      } catch (e) { alert(e.message); btn.disabled = false; setText(btn, 'Разрешить в брандмауэре'); }
+    });
+    return h('div', { class: 'card fw-note' },
+      h('div', null, h('b', null, 'Брандмауэр. '), why),
+      h('div', { class: 'small ink2' }, `Кнопка добавит одно узкое правило: входящие TCP на порт ${fw.port} только для менеджера, в сети типа «${fw.category === 'Public' ? 'Общественная' : 'Частная'}»${fw.state === 'blocked' ? ', и уберёт запрещающее правило для этой программы' : ''}. Windows попросит подтвердить.`),
+      h('div', { class: 'form-actions' }, btn));
   }
 
   function netHelp(compact) {
