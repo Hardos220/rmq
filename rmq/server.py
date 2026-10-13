@@ -336,6 +336,76 @@ class Handler(BaseHTTPRequestHandler):
         self._admin(ident)
         return self.manager.net.rename(str(body.get("name") or ""))
 
+    # ---------------------------------------------------------------- "Мои ПК": the owner's own PCs
+    @route("POST", "/api/network/home/create")
+    def home_create(self, ident, body, q):
+        self._admin(ident)
+        return self.manager.net.home_create(str(body.get("name") or ""))
+
+    @route("POST", "/api/network/home/invite")
+    def home_invite(self, ident, body, q):
+        self._admin(ident)
+        return {"code": self.manager.net.home_invite()}
+
+    @route("POST", "/api/network/home/leave")
+    def home_leave(self, ident, body, q):
+        self._admin(ident)
+        return self.manager.net.home_leave()
+
+    @route("POST", "/api/network/home/main")
+    def home_main(self, ident, body, q):
+        self._admin(ident)
+        net = self.manager.net
+        return net.make_main(net.find_home(str(body.get("node") or "")))
+
+    @route("POST", "/api/network/home/external")
+    def home_external(self, ident, body, q):
+        self._admin(ident)
+        net = self.manager.net
+        return net.set_external(net.find_home(str(body.get("node") or "")), str(body.get("state") or ""))
+
+    # the main PC edits the settings of one of its PCs (this PC's own id: the local settings)
+    def _home_target(self, node: str):
+        net = self.manager.net
+        nid = net.find_home(node)
+        return None if nid == net.store.node_id else nid
+
+    @route("GET", r"/api/home/([\w.-]+)/settings")
+    def home_settings(self, ident, body, q, node):
+        self._admin(ident)
+        nid = self._home_target(node)
+        return self.manager.settings_view() if nid is None else self.manager.net.manage(nid, "GET", "settings")
+
+    @route("PATCH", r"/api/home/([\w.-]+)/settings")
+    def home_settings_patch(self, ident, body, q, node):
+        self._admin(ident)
+        nid = self._home_target(node)
+        return self.manager.update_settings(body) if nid is None else self.manager.net.manage(nid, "PATCH", "settings", body)
+
+    @route("POST", r"/api/home/([\w.-]+)/preset")
+    def home_preset(self, ident, body, q, node):
+        self._admin(ident)
+        nid = self._home_target(node)
+        preset = str(body.get("preset") or "")
+        return self.manager.apply_preset(preset) if nid is None else \
+            self.manager.net.manage(nid, "POST", "preset", {"preset": preset})
+
+    @route("POST", r"/api/home/([\w.-]+)/reset")
+    def home_reset(self, ident, body, q, node):
+        self._admin(ident)
+        nid = self._home_target(node)
+        return self.manager.reset_settings() if nid is None else self.manager.net.manage(nid, "POST", "reset", {})
+
+    @route("POST", r"/api/home/([\w.-]+)/rename")
+    def home_rename(self, ident, body, q, node):
+        self._admin(ident)
+        nid = self._home_target(node)
+        name = str(body.get("name") or "")
+        if nid is None:
+            return self.manager.net.rename(name)
+        self.manager.net.manage(nid, "POST", "rename", {"name": name})
+        return self.manager.net.view()
+
     @route("POST", "/api/update/check")
     def update_check(self, ident, body, q):
         self._admin(ident)

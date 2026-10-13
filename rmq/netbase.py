@@ -19,6 +19,9 @@ from pathlib import Path, PurePosixPath
 
 PROTOCOL = 1
 MODES = ("two_way", "one_way", "offline")
+# the two networks a PC can belong to: "home" - the owner's own PCs (their own key, one main PC that manages
+# the others); "ext" - the network shared with other people
+KINDS = ("home", "ext")
 TAILSCALE_NET = ipaddress.ip_network("100.64.0.0/10")
 CLOCK_SKEW_S = 300
 # folders never worth sending to another PC
@@ -42,7 +45,14 @@ def computer_name() -> str:
 
 
 class NetStore:
-    """This node's identity, the chosen mode, and the network it belongs to (with the members it knows)."""
+    """This PC's identity, the chosen mode and the two networks it may belong to, with the members it knows:
+
+    home, home_members  - "Мои ПК": the owner's own PCs. Their own key, known to no one else; home["main"] is
+                          the main PC, which manages the settings of the others and lets them into the network
+                          with other people
+    network, members    - "Сеть с друзьями": PCs of several people, with a key shared among them
+    mode                - two_way / one_way: whether other people's tasks may run here; offline: no connections
+    """
 
     def __init__(self, path: Path):
         self.path = path
@@ -57,6 +67,8 @@ class NetStore:
         self.mode: str = data.get("mode") if data.get("mode") in MODES else "offline"
         self.network: dict | None = data.get("network")
         self.members: dict[str, dict] = data.get("members") or {}
+        self.home: dict | None = data.get("home")
+        self.home_members: dict[str, dict] = data.get("home_members") or {}
         if not path.exists():
             self.save()
 
@@ -64,34 +76,71 @@ class NetStore:
     def key(self) -> bytes | None:
         return base64.urlsafe_b64decode(self.network["key"]) if self.network else None
 
+    def net(self, kind: str) -> dict | None:
+        return self.home if kind == "home" else self.network
+
+    def book(self, kind: str) -> dict[str, dict]:
+        return self.home_members if kind == "home" else self.members
+
+    def key_of(self, kind: str) -> bytes | None:
+        net = self.net(kind)
+        return base64.urlsafe_b64decode(net["key"]) if net else None
+
+    def kind_of(self, network_id: str | None) -> str | None:
+        """Which of this PC's networks a request is for (by the network id it names)."""
+        with self._lock:
+            for kind in KINDS:
+                net = self.net(kind)
+                if net and network_id and net["id"] == network_id:
+                    return kind
+        return None
+
+    @property
+    def is_main(self) -> bool:
+        return bool(self.home) and self.home.get("main") == self.node_id
+
     def save(self) -> None:
         with self._lock:
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps({"node_id": self.node_id, "node_name": self.node_name, "mode": self.mode,
-                                       "network": self.network, "members": self.members},
+                                       "network": self.network, "members": self.members,
+                                       "home": self.home, "home_members": self.home_members},
                                       ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, self.path)
 
-    def active_members(self) -> dict[str, dict]:
+    def active_members(self, kind: str = "ext") -> dict[str, dict]:
         with self._lock:
-            return {nid: dict(m) for nid, m in self.members.items() if not m.get("left_at") and nid != self.node_id}
+            return {nid: dict(m) for nid, m in self.book(kind).items()
+                    if not m.get("left_at") and nid != self.node_id}
 
-    def merge(self, records: dict[str, dict]) -> bool:
+    def merge(self, records: dict[str, dict], kind: str = "ext") -> bool:
         """Fold another node's view of the membership into ours: the newest record of each node wins."""
         changed = False
         with self._lock:
+            book = self.book(kind)
             for nid, rec in records.items():
                 if nid == self.node_id or not isinstance(rec, dict):
                     continue
-                mine = self.members.get(nid)
+                mine = book.get(nid)
                 if mine is None or rec.get("updated_at", 0) > mine.get("updated_at", 0):
                     clean = {k: rec.get(k) for k in ("name", "address", "joined_at", "updated_at", "left_at")}
                     if mine != clean:
-                        self.members[nid] = clean
+                        book[nid] = clean
                         changed = True
         if changed:
             self.save()
         return changed
+
+    def merge_home_meta(self, meta: dict | None) -> bool:
+        """Which PC is the main one: the newest assignment wins."""
+        if not (self.home and isinstance(meta, dict) and meta.get("main")):
+            return False
+        with self._lock:
+            if float(meta.get("main_at") or 0) <= float(self.home.get("main_at") or 0):
+                return False
+            self.home.update(main=meta["main"], main_at=float(meta["main_at"]))
+            self.save()
+        return True
 
 
 def member_record(name: str, address: str | None, joined_at: float, left_at: float | None = None) -> dict:
@@ -99,8 +148,10 @@ def member_record(name: str, address: str | None, joined_at: float, left_at: flo
 
 
 # ---------------------------------------------------------------- invites
-def make_invite(network: dict, address: str, by: str) -> str:
-    payload = {"v": PROTOCOL, "n": network["id"], "name": network["name"], "k": network["key"], "a": address, "by": by}
+def make_invite(network: dict, address: str, by: str, kind: str = "ext") -> str:
+    """kind "home": a code for another PC of the same owner ("Мои ПК"); "ext": for the network with other people."""
+    payload = {"v": PROTOCOL, "n": network["id"], "name": network["name"], "k": network["key"], "a": address, "by": by,
+               "t": kind}
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return "rmq1-" + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
@@ -116,6 +167,7 @@ def parse_invite(code: str) -> dict:
         base64.urlsafe_b64decode(data["k"])
     except Exception:
         raise NetError("код приглашения повреждён: скопируйте его целиком") from None
+    data["t"] = "home" if data.get("t") == "home" else "ext"
     return data
 
 

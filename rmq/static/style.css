@@ -308,6 +308,15 @@ ul.files li .btn { margin-left: auto; font-size: 12px; padding: 2px 8px; }
 .net-note { font-size: 12px; color: var(--ink-2); white-space: normal; max-width: 360px; margin-top: 4px; }
 .net-note::before { content: "▲ "; color: var(--serious); }
 .net-actions .net-help { grid-column: 1 / -1; }
+.net-head .rename-row { gap: 8px; align-items: center; }
+.net-head .rename-row input { padding: 4px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--page); color: var(--ink); width: 220px; }
+#t-home select { padding: 3px 6px; border: 1px solid var(--border); border-radius: 7px; background: var(--page); color: var(--ink); }
+#t-home td.actions { white-space: nowrap; }
+#t-home .role, #t-nodes .role { display: inline-block; margin-left: 6px; font-size: 11px; padding: 1px 6px; border-radius: 6px;
+  background: var(--surface-2); color: var(--ink-2); }
+.settings-target { display: grid; gap: 6px; margin-bottom: 4px; }
+.settings-target .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.settings-target select { padding: 4px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--page); color: var(--ink); }
 .net-help ol, .net-help ul { margin: 0; padding-left: 22px; display: grid; gap: 6px; max-width: 980px; }
 .net-help h4 { margin: 6px 0 0; }
 .net-help summary { cursor: pointer; }

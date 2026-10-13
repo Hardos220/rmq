@@ -377,7 +377,7 @@ def cmd_nodes(args) -> int:
         print("сеть выключена владельцем (офлайн): задачи выполняются только здесь")
     for n in r["nodes"]:
         hw, free, busy = n.get("hw") or {}, n.get("free") or {}, n.get("busy") or {}
-        head = f"{n['name']}{' (этот ПК)' if n['self'] else ''}"
+        head = f"{n['name']}{' (этот ПК)' if n['self'] else ' (мой ПК)' if n.get('own') else ''}"
         if not n["online"]:
             print(f"{head}: не в сети")
             continue
@@ -408,6 +408,18 @@ def cmd_net(args) -> int:
         r = c.call("POST", "/api/network/leave", {}, timeout=60)
     elif args.action == "mode":
         r = c.call("POST", "/api/network/mode", {"mode": args.value or ""})
+    elif args.action == "home-create":
+        r = c.call("POST", "/api/network/home/create", {"name": args.value or ""})
+    elif args.action == "home-invite":
+        print(c.call("POST", "/api/network/home/invite", {})["code"])
+        return 0
+    elif args.action == "home-leave":
+        r = c.call("POST", "/api/network/home/leave", {}, timeout=60)
+    elif args.action == "home-main":
+        r = c.call("POST", "/api/network/home/main", {"node": args.value or ""})
+    elif args.action == "home-ext":  # rmq net home-ext "ПК=open|use|hidden"
+        node, _, state = (args.value or "").rpartition("=")
+        r = c.call("POST", "/api/network/home/external", {"node": node, "state": state}, timeout=90)
     else:
         r = c.call("POST", "/api/network/rename", {"name": args.value or ""})
     print(json.dumps(r, ensure_ascii=False, indent=2))
@@ -724,7 +736,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--open", action="store_true")
     sp.set_defaults(fn=cmd_serve)
     sp = sub.add_parser("net")
-    sp.add_argument("action", choices=["status", "create", "invite", "join", "leave", "mode", "rename"])
+    sp.add_argument("action", choices=["status", "create", "invite", "join", "leave", "mode", "rename",
+                                       "home-create", "home-invite", "home-leave", "home-main", "home-ext"])
     sp.add_argument("value", nargs="?")
     sp.set_defaults(fn=cmd_net)
     hidden = {"launch", "dashboard", "install-shortcut", "install-agents", "uninstall-agents", "stop", "serve", "net"}

@@ -1083,13 +1083,16 @@
     $('#awake-chip').hidden = !(s.power && s.power.keep_awake);
     const net = s.network;
     const nc = $('#net-chip');
-    nc.hidden = !net || !net.network;
-    if (net && net.network) {
-      const cls = net.mode === 'offline' ? 'net-off' : net.online >= net.members ? 'net-on' : 'net-part';
-      nc.className = `chip ${cls}`;
-      setText($('.txt', nc), net.mode === 'offline' ? 'Сеть: офлайн'
-        : `Сеть: на связи ${net.online} из ${net.members}${net.mode === 'one_way' ? ' · ПК только ваш' : ''}`);
-      nc.title = `«${net.network}». Задач здесь из сети: ${net.hosted}, ваших задач на других ПК: ${net.remote}`;
+    const anyNet = !!(net && (net.network || net.home));
+    nc.hidden = !anyNet;
+    if (anyNet) {
+      const parts = [];
+      if (net.home) parts.push(`мои ПК ${net.home_online} из ${net.home_members}`);
+      if (net.network) parts.push(`друзья ${net.online} из ${net.members}${net.mode === 'one_way' ? ' (ПК только ваш)' : ''}`);
+      const allOn = (!net.home || net.home_online >= net.home_members) && (!net.network || net.online >= net.members);
+      nc.className = `chip ${net.mode === 'offline' ? 'net-off' : allOn ? 'net-on' : 'net-part'}`;
+      setText($('.txt', nc), net.mode === 'offline' ? 'Сеть: офлайн' : `На связи: ${parts.join(' · ')}`);
+      nc.title = `${net.home ? `«${net.home}»${net.is_main ? ' (этот ПК основной)' : ''}. ` : ''}${net.network ? `Сеть с друзьями «${net.network}». ` : ''}Задач здесь из сети: ${net.hosted}, ваших задач на других ПК: ${net.remote}`;
     }
     const hc = $('#heat-chip');
     const heat = s.thermal && s.thermal.enabled ? s.thermal.state : 'normal';
@@ -1633,7 +1636,7 @@
           if (pr.active === p.id) return;
           if (own && !confirm(`Ваши собственные значения резерва, целей температуры и порога GPU заменятся значениями режима «${p.title}». Остальные настройки не изменятся. Продолжить?`)) return;
           try {
-            SETTINGS = await api('POST', '/api/settings/preset', { preset: p.id });
+            SETTINGS = await api('POST', settingsPath('preset'), { preset: p.id });
             renderRules(SETTINGS); renderSettingsForm(SETTINGS);
             const msg = $('#settings-msg'); msg.className = 'msg ok'; setText(msg, `Режим «${p.title}» включён`);
           } catch (e) { alert(e.message); }
@@ -1679,9 +1682,36 @@
       li('Вы управляете всем:', 'режимы «Авто» / «Игровой» / «Пауза всех», пауза, отмена и приоритет любой задачи, выключение менеджера.')));
   }
 
+  // the main PC edits the settings of another of my PCs: null means this PC
+  let SETTINGS_NODE = null;
+  function settingsPath(sub) {
+    if (SETTINGS_NODE) return `/api/home/${SETTINGS_NODE}/${sub || 'settings'}`;
+    return sub ? `/api/settings/${sub}` : '/api/settings';
+  }
+  function renderSettingsTarget() {
+    const box = $('#settings-target');
+    const H = NETVIEW && NETVIEW.home;
+    const others = H && H.is_main ? H.members.filter((m) => !m.self && !m.left) : [];
+    if (!others.length) { SETTINGS_NODE = null; box.replaceChildren(); return; }
+    if (SETTINGS_NODE && !others.some((m) => m.node_id === SETTINGS_NODE)) SETTINGS_NODE = null;
+    const sel = h('select', { 'aria-label': 'Чьи настройки показывать' }, h('option', { value: '' }, `Этот ПК — ${NETVIEW.node_name}`),
+      others.map((m) => h('option', { value: m.node_id }, `${m.name}${m.online ? '' : ' (не в сети)'}`)));
+    sel.value = SETTINGS_NODE || '';
+    sel.addEventListener('change', () => { SETTINGS_NODE = sel.value || null; loadSettings(); });
+    const who = SETTINGS_NODE ? others.find((m) => m.node_id === SETTINGS_NODE) : null;
+    box.replaceChildren(h('div', { class: 'card settings-target' },
+      h('div', { class: 'row' }, h('b', null, 'Настройки ПК'), sel),
+      h('p', { class: 'small ink2' }, who
+        ? `Вы меняете настройки ПК «${who.name}»: режим, основные и все остальные настройки ниже сохраняются на нём самом.`
+        : 'Этот ПК основной: здесь можно выбрать и другой ваш ПК и поменять его настройки.')));
+  }
+
   async function loadSettings() {
     try {
-      SETTINGS = await api('GET', '/api/settings');
+      if (!NETVIEW) { try { NETVIEW = await api('GET', '/api/network'); } catch { /* no network view */ } }
+      renderSettingsTarget();
+      SETTINGS = await api('GET', settingsPath());
+      setText($('#settings-msg'), '');
       renderRules(SETTINGS);
       renderSettingsForm(SETTINGS);
     } catch (e) { setText($('#settings-msg'), e.message); }
@@ -1703,7 +1733,7 @@
     const msg = $('#settings-msg');
     if (!Object.keys(patch).length) { msg.className = 'msg'; setText(msg, 'Изменений нет'); return; }
     try {
-      SETTINGS = await api('PATCH', '/api/settings', patch);
+      SETTINGS = await api('PATCH', settingsPath(), patch);
       renderRules(SETTINGS);
       renderSettingsForm(SETTINGS);
       msg.className = 'msg ok'; setText(msg, 'Сохранено');
@@ -1711,7 +1741,7 @@
   });
   $('#settings-reset').addEventListener('click', async () => {
     if (!confirm('Вернуть все настройки к значениям по умолчанию?')) return;
-    try { SETTINGS = await api('POST', '/api/settings/reset'); renderRules(SETTINGS); renderSettingsForm(SETTINGS); } catch (e) { alert(e.message); }
+    try { SETTINGS = await api('POST', settingsPath('reset'), {}); renderRules(SETTINGS); renderSettingsForm(SETTINGS); } catch (e) { alert(e.message); }
   });
 
   // ================================================================ events
@@ -2761,9 +2791,9 @@
   let inviteCode = '';
   let netHelpOpen = false;
   const MODE_INFO = {
-    two_way: ['Двусторонний', 'Ваши агенты могут считать на других ПК, а участники — на вашем (с низким приоритетом).'],
-    one_way: ['Только для себя', 'Ваши агенты по-прежнему могут считать на других ПК, а ваш ПК — только ваш: задачи участников здесь стоят.'],
-    offline: ['Офлайн', 'Никаких соединений: менеджер работает сам по себе, как раньше.'],
+    two_way: ['Открыт для друзей', 'Ваши агенты могут считать на ПК друзей, а друзья — на этом (с низким приоритетом).'],
+    one_way: ['Только для себя', 'Ваши агенты по-прежнему могут считать на ПК друзей, а задачи друзей здесь стоят. Ваших ПК из «Моих ПК» это не касается.'],
+    offline: ['Офлайн', 'Никаких соединений: ни «Моих ПК», ни сети с друзьями. Менеджер работает сам по себе.'],
   };
   const STATUS_TEXT = {
     listening: 'на связи', offline: 'сеть выключена', no_network: 'не в сети',
@@ -2780,50 +2810,57 @@
     } catch (e) { alert(e.message); return false; }
   }
 
+  const EXT_TEXT = { open: 'Открыт для друзей', use: 'Только пользуется', hidden: 'Скрыт от друзей' };
+  const extState = (ext) => (!ext || !ext.in ? 'hidden' : ext.mode === 'two_way' ? 'open' : 'use');
+  let homeCode = '';
+
   function renderNetHead(v) {
     const ts = v.tailscale;
-    const status = v.network ? STATUS_TEXT[v.status] || v.status : 'этот ПК не в сети';
+    const inAny = !!(v.network || v.home);
+    const status = inAny ? STATUS_TEXT[v.status] || v.status : 'этот ПК не в сети';
+    const rename = h('input', { id: 'net-rename', value: v.node_name, 'aria-label': 'Имя этого ПК в сети' });
     fill($('#net-head'),
       h('div', { class: 'row' },
-        h('span', { class: 'title' }, v.network ? `Сеть «${v.network.name}»` : 'Вычислительная сеть'),
+        h('span', { class: 'title' }, 'Сеть'),
         h('span', { class: `net-status ${v.status === 'listening' ? 'on' : ''}` }, h('i'), status),
-        h('span', { class: 'small ink2' }, `Этот ПК: ${v.node_name}`),
         h('span', { class: 'small ink2' }, ts ? `Tailscale: ${ts}` : 'Tailscale не найден: установите его и войдите (как — в инструкции ниже)')),
       v.error ? h('div', { class: 'msg err' }, v.error) : null,
-      h('div', { class: 'modes', role: 'group', 'aria-label': 'Режим сети' }, Object.entries(MODE_INFO).map(([k, [title, text]]) => {
+      h('div', { class: 'row rename-row' }, h('span', { class: 'small ink2' }, 'Имя этого ПК в сети'), rename,
+        h('button', { class: 'btn', type: 'button', onclick: () => netCall('/api/network/rename', { name: rename.value }) }, 'Сохранить')),
+      h('div', { class: 'modes', role: 'group', 'aria-label': 'Режим этого ПК' }, Object.entries(MODE_INFO).map(([k, [title, text]]) => {
         const b = h('button', { type: 'button', 'aria-pressed': String(v.mode === k) }, h('b', null, title), h('span', null, text));
         b.addEventListener('click', () => { if (v.mode !== k) netCall('/api/network/mode', { mode: k }); });
         return b;
       })));
   }
 
-  function netHelp(inNetwork) {
+  function netHelp(compact) {
     const repo = (STATE && STATE.update && STATE.update.repo) || '';
     const where = repo ? `github.com/${repo}/releases/latest` : 'страницы релизов менеджера на GitHub';
     const steps = [
-      ['Tailscale на обоих ПК.', 'Установите его с tailscale.com/download и войдите (подойдёт аккаунт Google, Microsoft или GitHub). Значок Tailscale в трее должен показывать «Connected».'],
-      ['ПК видят друг друга в Tailscale.', 'Проще всего пригласить друга в свою сеть Tailscale: login.tailscale.com/admin/users → Invite users. Если в вашей сети Tailscale есть и другие ваши устройства, безопаснее обменяться только ПК: Machines → «⋯» у ПК → Share. Делиться нужно в обе стороны, иначе задачи пойдут только в одну.'],
-      ['Менеджер у друга.', `Архив rmq-….zip с ${where}: распаковать в постоянную папку (например, C:\\RMQ) и запустить install.cmd. Нужен Python 3.10+ с python.org.`],
-      ['Код приглашения.', 'Один ПК создаёт сеть и нажимает «Получить код приглашения», второй вставляет код в «Присоединиться по коду». Код — как пароль от сети: пересылайте его только тому, кого приглашаете.'],
-      ['Брандмауэр Windows.', 'Когда Windows спросит, разрешить ли Python доступ к сети, нажмите «Разрешить доступ» — на обоих ПК. Иначе другой ПК не сможет до вас достучаться.'],
-      ['Понятное имя.', 'Переименуйте ПК в карточке «Этот ПК в сети» (например, «Иван»): по этому имени агенты отправляют туда задачи (rmq submit --where Иван …).'],
+      ['Tailscale на каждом ПК.', 'Установите его с tailscale.com/download и войдите. Свои ПК — в один и тот же аккаунт: тогда они видят друг друга сразу. Друг входит своим аккаунтом, а вы приглашаете его в свою сеть Tailscale (login.tailscale.com/admin/users → Invite users) или обмениваетесь с ним ПК (Machines → «⋯» у ПК → Share, в обе стороны).'],
+      ['Менеджер на каждом ПК.', `Архив rmq-….zip с ${where}: распаковать в постоянную папку (например, C:\\RMQ) и запустить install.cmd. Нужен Python 3.10+ с python.org.`],
+      ['Мои ПК.', 'На главном ПК: «Мои ПК» → «Создать» — он станет основным. Там же «Добавить мой ПК» даёт код; на другом своём ПК: «Присоединить этот ПК к моим ПК» → вставить код.'],
+      ['Друзья.', 'На основном ПК: «Сеть с друзьями» → «Создать сеть с друзьями» → «Получить код приглашения» и переслать код другу; он вставляет его в «Присоединиться по коду друга». Какие ещё ваши ПК видны друзьям — выбирает основной ПК в столбце «Для друзей».'],
+      ['Брандмауэр Windows.', 'Когда Windows спросит, разрешить ли Python доступ к сети, нажмите «Разрешить доступ» — на каждом ПК. Иначе другие ПК не смогут до него достучаться.'],
+      ['Понятные имена.', 'Дайте каждому ПК имя в поле «Имя этого ПК в сети» (например, «Стационар»): по нему агенты отправляют туда задачи (rmq submit --where Стационар …).'],
     ];
     const trouble = [
-      'ПК «не в сети» — на нём выключен сам ПК, менеджер или Tailscale. В Tailscale (Machines) оба ПК должны быть видны и подключены.',
-      'В таблице ниже написано, что ПК не может связаться с другим, — на том ПК брандмауэр не пускает Python или ПК не поделился в Tailscale.',
+      'ПК «не в сети» — на нём выключен сам ПК, менеджер или Tailscale. В Tailscale (Machines) нужные ПК должны быть видны и подключены.',
+      'В таблице написано, что ПК не может связаться с другим, — на том ПК брандмауэр не пускает Python или ПК не поделился в Tailscale.',
       'Если Python в брандмауэре случайно запретили: Панель управления → Брандмауэр Защитника Windows → Разрешение взаимодействия с приложением → «Изменить параметры» → у Python (pythonw.exe) отметить «Частная».',
       'Включённый VPN может мешать Tailscale. Если связь пропадает только с VPN, исключите Tailscale из VPN или выключите VPN.',
       '«Часы расходятся больше чем на 5 минут» — включите в Windows «Установить время автоматически» (Параметры → Время и язык).',
     ];
     const body = [
-      h('p', { class: 'small ink2' }, 'Обоим ПК нужны этот менеджер и Tailscale — бесплатная зашифрованная частная сеть, которая работает через любой роутер.'),
+      h('p', { class: 'small ink2' }, 'Каждому ПК нужны этот менеджер и Tailscale — бесплатная зашифрованная частная сеть, которая работает через любой роутер.'),
       h('ol', null, steps.map(([b, t]) => h('li', null, h('b', null, b), ' ', t))),
       h('h4', null, 'Если связи нет'),
       h('ul', null, trouble.map((t) => h('li', null, t))),
     ];
-    if (!inNetwork) return h('div', { class: 'card net-help' }, h('h3', null, 'Как подключить ПК друга'), body);
+    if (!compact) return h('div', { class: 'card net-help' }, h('h3', null, 'Как подключить свои ПК и ПК друзей'), body);
     return h('details', { class: 'card net-help', open: netHelpOpen, ontoggle: (e) => { netHelpOpen = e.currentTarget.open; } },
-      h('summary', null, h('b', null, 'Как подключить ещё один ПК и что делать, если нет связи')), body);
+      h('summary', null, h('b', null, 'Как подключить ещё ПК и что делать, если нет связи')), body);
   }
 
   function netNotes(m) {
@@ -2835,77 +2872,166 @@
     return out.map(([t, why]) => h('div', { class: 'net-note', title: why }, t));
   }
 
+  function linkCell(m) {
+    if (m.self) return h('span', { class: 'net-status self' }, h('i'), 'этот ПК');
+    if (m.left) return h('span', { class: 'net-status' }, h('i'), `вышел из сети ${ago(m.left_at)}`);
+    if (m.online) return h('span', { class: 'net-status on' }, h('i'), `на связи${m.rtt_ms != null ? ` · ${m.rtt_ms} мс` : ''}`);
+    return h('span', { class: 'net-status' }, h('i'), `не в сети${m.seen ? ` · был ${ago(m.seen)}` : ''}`);
+  }
+
+  function inviteCard(title, text, code, onGet, setCode) {
+    const codeBox = h('div', { class: 'invite-code', hidden: !code }, code);
+    const copy = h('button', { class: 'btn', type: 'button', hidden: !code }, 'Скопировать');
+    copy.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(code); setText(copy, 'Скопировано'); } catch { /* the code is selectable */ }
+    });
+    return h('div', { class: 'card' }, h('h3', null, title), h('p', { class: 'small ink2' }, text),
+      h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', type: 'button', onclick: async () => {
+        try { setCode((await api('POST', onGet, {})).code); renderNetwork(); } catch (e) { alert(e.message); }
+      } }, 'Получить код'), copy), codeBox);
+  }
+
+  function renderHomeActions(v) {
+    const cards = [];
+    if (!v.home) {
+      const name = h('input', { id: 'home-new-name', placeholder: 'Например: Мои ПК', 'aria-label': 'Название' });
+      cards.push(h('div', { class: 'card' }, h('h3', null, 'Объединить мои ПК'),
+        h('p', { class: 'small ink2' }, 'Этот ПК станет основным: с него вы добавляете другие свои ПК, меняете их настройки и решаете, какие из них видны друзьям.'),
+        name, h('div', null, h('button', { class: 'btn primary', type: 'button', onclick: () => netCall('/api/network/home/create', { name: name.value }) }, 'Создать'))));
+      const code = h('textarea', { id: 'home-join-code', placeholder: 'rmq1-…', 'aria-label': 'Код с основного ПК' });
+      cards.push(h('div', { class: 'card' }, h('h3', null, 'Присоединить этот ПК к моим ПК'),
+        h('p', { class: 'small ink2' }, 'Вставьте код с вашего основного ПК («Добавить мой ПК»). Оба ПК должны быть в одном аккаунте Tailscale.'),
+        code, h('div', null, h('button', { class: 'btn primary', type: 'button', onclick: () => netCall('/api/network/join', { code: code.value }) }, 'Присоединить'))));
+    } else {
+      const H = v.home;
+      const leave = h('button', { class: 'btn danger', type: 'button', onclick: () => {
+        if (confirm(`Выйти из «${H.name}»? Задачи между этим ПК и вашими другими ПК будут отменены. Вернуться можно по новому коду с основного ПК.`)) {
+          homeCode = '';
+          netCall('/api/network/home/leave');
+        }
+      } }, 'Выйти из «Моих ПК»');
+      if (H.is_main) {
+        cards.push(inviteCard('Добавить мой ПК', 'Код для другого вашего ПК: на нём «Мои ПК» → «Присоединить этот ПК к моим ПК». Не пересылайте его другим людям — он даёт управление вашими ПК.',
+          homeCode, '/api/network/home/invite', (c) => { homeCode = c; }));
+        cards.push(h('div', { class: 'card' }, h('h3', null, 'Этот ПК — основной'),
+          h('p', { class: 'small ink2' }, 'С него можно менять настройки всех ваших ПК (кнопка «Настройки» в таблице) и решать, какие из них видны друзьям (столбец «Для друзей»).'),
+          h('div', { class: 'form-actions' }, leave)));
+      } else {
+        cards.push(h('div', { class: 'card' }, h('h3', null, `Основной ПК: ${H.main_name || '—'}`),
+          H.main_left ? h('div', { class: 'msg err' }, 'Основной ПК вышел из «Моих ПК». Сделайте основным этот ПК, чтобы снова управлять остальными.') : null,
+          h('p', { class: 'small ink2' }, 'Настройками этого ПК и тем, виден ли он друзьям, управляет основной ПК. Здесь их тоже можно менять.'),
+          h('div', { class: 'form-actions' },
+            h('button', { class: 'btn', type: 'button', onclick: () => {
+              if (confirm('Сделать основным этот ПК? Прежний основной ПК станет обычным.')) netCall('/api/network/home/main', { node: v.node_id });
+            } }, 'Сделать этот ПК основным'), leave)));
+      }
+    }
+    $('#home-actions').replaceChildren(...cards);
+  }
+
+  function hwCells(m, known) {
+    const info = m.info || {};
+    const hw = info.hw || {};
+    const free = info.free || {};
+    const tasks = info.tasks || {};
+    const num = (x) => h('td', { class: 'num' }, x);
+    return [
+      h('td', null, hw.cpu ? `${hw.cpu}, ${hw.threads} потоков` : '–'),
+      num(hw.ram_gb ? `${n1(hw.ram_gb)} ГБ` : '–'),
+      h('td', null, hw.gpu ? `${hw.gpu}, ${n1(hw.vram_gb)} ГБ` : hw.cpu ? 'нет' : '–'),
+      num(known && info.free ? `CPU ${n1(free.cpu)} · ОЗУ ${n1(free.ram)} ГБ · VRAM ${n1(free.vram)} ГБ` : '–'),
+      num(known && info.tasks ? `▶ ${tasks.running || 0} ◷ ${tasks.queued || 0}${info.hosted ? ` · из сети ${info.hosted}` : ''}` : '–'),
+      num(info.version || '–'),
+    ];
+  }
+
+  function renderHomeTable(v) {
+    $('#home-table').hidden = !v.home;
+    if (!v.home) return;
+    const main = v.home.is_main;
+    const list = v.home.members.filter((m) => !m.left || m.left_at > Date.now() / 1000 - 7 * 86400);
+    $('#t-home tbody').replaceChildren(...list.map((m) => {
+      const info = m.info || {};
+      const ext = (info.home || {}).external;
+      const known = m.online || m.self;
+      let extCell = ext && known ? EXT_TEXT[extState(ext)] : '–';
+      if (main && ext && known && !m.left) {
+        const sel = h('select', { 'aria-label': `Виден ли ПК ${m.name} друзьям` },
+          Object.entries(EXT_TEXT).map(([k, t]) => h('option', { value: k }, t)));
+        sel.value = extState(ext);
+        if (!v.network && !m.self) { sel.disabled = true; sel.title = 'Сначала создайте сеть с друзьями или присоединитесь к ней на этом ПК'; }
+        sel.addEventListener('change', () => netCall('/api/network/home/external', { node: m.node_id, state: sel.value }));
+        extCell = sel;
+      }
+      const acts = [];
+      if (main && !m.left) {
+        acts.push(h('button', { class: 'btn', type: 'button', disabled: !known, title: known ? 'Открыть настройки этого ПК' : 'ПК не в сети', onclick: () => {
+          SETTINGS_NODE = m.self ? null : m.node_id;
+          tab('rules');
+        } }, 'Настройки'));
+        if (!m.self) acts.push(h('button', { class: 'btn', type: 'button', onclick: () => {
+          if (confirm(`Сделать основным ПК «${m.name}»? Этот ПК станет обычным и больше не сможет управлять остальными.`)) netCall('/api/network/home/main', { node: m.node_id });
+        } }, 'Сделать основным'));
+      }
+      return h('tr', { class: m.left ? 'off' : null },
+        h('td', null, h('div', { class: 'name' }, m.name, m.main ? h('span', { class: 'role' }, 'основной') : null),
+          h('div', { class: 'cmd' }, (info.hw || {}).os || '')),
+        h('td', null, linkCell(m), netNotes(m)),
+        h('td', null, extCell),
+        ...hwCells(m, known),
+        h('td', { class: 'actions' }, acts));
+    }));
+  }
+
   function renderNetActions(v) {
-    const box = $('#net-actions');
     const cards = [];
     if (!v.network) {
+      if (v.home && !v.home.is_main) {
+        cards.push(h('div', { class: 'card' }, h('h3', null, 'Сеть с друзьями'),
+          h('p', { class: 'small ink2' }, `В сеть с друзьями этот ПК пускает основной ПК «${v.home.main_name || '—'}» (столбец «Для друзей» на нём). Можно и присоединиться по коду друга.`)));
+      }
       const name = h('input', { id: 'net-new-name', placeholder: 'Например: Друзья', 'aria-label': 'Название сети' });
-      cards.push(h('div', { class: 'card' }, h('h3', null, 'Создать сеть'),
-        h('p', { class: 'small ink2' }, 'Этот ПК станет первым в сети. Потом пригласите другие ПК кодом.'),
+      cards.push(h('div', { class: 'card' }, h('h3', null, 'Создать сеть с друзьями'),
+        h('p', { class: 'small ink2' }, 'Этот ПК станет первым в сети. Потом пригласите друзей кодом.'),
         name, h('div', null, h('button', { class: 'btn primary', type: 'button', onclick: () => netCall('/api/network/create', { name: name.value }) }, 'Создать'))));
       const code = h('textarea', { id: 'net-join-code', placeholder: 'rmq1-…', 'aria-label': 'Код приглашения' });
-      cards.push(h('div', { class: 'card' }, h('h3', null, 'Присоединиться по коду'),
-        h('p', { class: 'small ink2' }, 'Вставьте код приглашения, который прислал участник сети. Нужен запущенный Tailscale, в котором ПК видят друг друга (см. инструкцию).'),
+      cards.push(h('div', { class: 'card' }, h('h3', null, 'Присоединиться по коду друга'),
+        h('p', { class: 'small ink2' }, 'Вставьте код приглашения, который прислал друг. Нужен Tailscale, в котором ваши ПК видят друг друга.'),
         code, h('div', null, h('button', { class: 'btn primary', type: 'button', onclick: () => netCall('/api/network/join', { code: code.value }) }, 'Присоединиться'))));
-      cards.push(netHelp(false));
     } else {
-      const codeBox = h('div', { class: 'invite-code', hidden: !inviteCode }, inviteCode);
-      const copy = h('button', { class: 'btn', type: 'button', hidden: !inviteCode }, 'Скопировать');
-      copy.addEventListener('click', async () => {
-        try { await navigator.clipboard.writeText(inviteCode); setText(copy, 'Скопировано'); } catch { /* the code is selectable */ }
-      });
-      cards.push(h('div', { class: 'card' }, h('h3', null, 'Пригласить ПК'),
-        h('p', { class: 'small ink2' }, 'Код — как пароль от сети: отправьте его только тому, кому доверяете (в мессенджере). Второму ПК нужны этот менеджер и Tailscale, в котором он видит ваш ПК.'),
-        h('div', { class: 'form-actions' }, h('button', { class: 'btn primary', type: 'button', onclick: async () => {
-          try { inviteCode = (await api('POST', '/api/network/invite', {})).code; renderNetActions(NETVIEW); } catch (e) { alert(e.message); }
-        } }, 'Получить код приглашения'), copy), codeBox));
-      const rename = h('input', { id: 'net-rename', value: v.node_name, 'aria-label': 'Имя этого ПК в сети' });
-      cards.push(h('div', { class: 'card' }, h('h3', null, 'Этот ПК в сети'),
-        h('label', { class: 'f' }, 'Имя, которое видят участники', rename),
-        h('div', { class: 'form-actions' },
-          h('button', { class: 'btn', type: 'button', onclick: () => netCall('/api/network/rename', { name: rename.value }) }, 'Сохранить имя'),
-          h('button', { class: 'btn danger', type: 'button', onclick: () => {
-            if (confirm(`Выйти из сети «${v.network.name}»? Ваши задачи на других ПК и задачи участников здесь будут отменены. Вернуться можно по новому приглашению.`)) {
-              inviteCode = '';
-              netCall('/api/network/leave');
-            }
-          } }, 'Выйти из сети'))));
-      cards.push(netHelp(true));
+      cards.push(inviteCard('Пригласить друга', 'Код — как пароль от сети: отправьте его только тому, кому доверяете (в мессенджере). Второму ПК нужны этот менеджер и Tailscale, в котором он видит ваш ПК.',
+        inviteCode, '/api/network/invite', (c) => { inviteCode = c; }));
+      cards.push(h('div', { class: 'card' }, h('h3', null, `Сеть «${v.network.name}»`),
+        h('p', { class: 'small ink2' }, 'Задачи друзей у вас — с низким приоритетом и без права менять ваши файлы. Закрыть этот ПК для друзей — режим «Только для себя» вверху.'),
+        h('div', { class: 'form-actions' }, h('button', { class: 'btn danger', type: 'button', onclick: () => {
+          if (confirm(`Выйти из сети «${v.network.name}»? Ваши задачи на ПК друзей и их задачи здесь будут отменены. «Мои ПК» это не затронет.`)) {
+            inviteCode = '';
+            netCall('/api/network/leave');
+          }
+        } }, 'Выйти из сети с друзьями'))));
     }
-    box.replaceChildren(...cards);
+    $('#net-actions').replaceChildren(...cards);
+    $('#net-help').replaceChildren(netHelp(!!(v.network || v.home)));
   }
 
   function renderNodes(v) {
     const tbody = $('#t-nodes tbody');
     const rowsN = v.members.filter((m) => !m.left || m.left_at > Date.now() / 1000 - 7 * 86400);
     if (!v.network || !rowsN.length) {
-      tbody.replaceChildren(h('tr', { class: 'empty' }, h('td', { colspan: 9 }, 'Этот ПК не в сети: создайте сеть или присоединитесь по коду')));
+      tbody.replaceChildren(h('tr', { class: 'empty' }, h('td', { colspan: 9 }, 'Этот ПК не в сети с друзьями')));
       return;
     }
-    const num = (x) => h('td', { class: 'num' }, x);
     tbody.replaceChildren(...rowsN.map((m) => {
       const info = m.info || {};
-      const hw = info.hw || {};
-      const free = info.free || {};
       const busy = info.busy || {};
-      const tasks = info.tasks || {};
       const flags = [busy.game ? 'игра' : null, busy.paused ? 'пауза' : null, busy.heat === 'hot' ? 'перегрев' : null, busy.disk_low ? 'мало места' : null].filter(Boolean);
-      let link;
-      if (m.self) link = h('span', { class: 'net-status self' }, h('i'), 'этот ПК');
-      else if (m.left) link = h('span', { class: 'net-status' }, h('i'), `вышел из сети ${ago(m.left_at)}`);
-      else if (m.online) link = h('span', { class: 'net-status on' }, h('i'), `на связи${m.rtt_ms != null ? ` · ${m.rtt_ms} мс` : ''}`);
-      else link = h('span', { class: 'net-status' }, h('i'), `не в сети${m.seen ? ` · был ${ago(m.seen)}` : ''}`);
       const known = m.online || m.self;
       return h('tr', { class: m.left ? 'off' : null },
-        h('td', null, h('div', { class: 'name' }, m.name), h('div', { class: 'cmd' }, hw.os || '')),
-        h('td', null, link, netNotes(m)),
+        h('td', null, h('div', { class: 'name' }, m.name, m.own && !m.self ? h('span', { class: 'role' }, 'мой ПК') : null),
+          h('div', { class: 'cmd' }, (info.hw || {}).os || '')),
+        h('td', null, linkCell(m), netNotes(m)),
         h('td', null, known ? `${(MODE_INFO[info.mode] || ['?'])[0]}${flags.length ? ` · ${flags.join(', ')}` : ''}` : '–'),
-        h('td', null, hw.cpu ? `${hw.cpu}, ${hw.threads} потоков` : '–'),
-        num(hw.ram_gb ? `${n1(hw.ram_gb)} ГБ` : '–'),
-        h('td', null, hw.gpu ? `${hw.gpu}, ${n1(hw.vram_gb)} ГБ` : hw.cpu ? 'нет' : '–'),
-        num(known && info.free ? `CPU ${n1(free.cpu)} · ОЗУ ${n1(free.ram)} ГБ · VRAM ${n1(free.vram)} ГБ` : '–'),
-        num(known && info.tasks ? `▶ ${tasks.running || 0} ◷ ${tasks.queued || 0}${info.hosted ? ` · из сети ${info.hosted}` : ''}` : '–'),
-        num(info.version || '–'));
+        ...hwCells(m, known));
     }));
   }
 
@@ -2946,12 +3072,16 @@
 
   function renderNetwork() {
     if (!NETVIEW) return;
-    renderNetHead(NETVIEW);
-    if (document.activeElement && ['net-new-name', 'net-join-code', 'net-rename'].includes(document.activeElement.id)) {
-      renderNodes(NETVIEW);
-      return;  // do not redraw the inputs under the owner's fingers
+    const el = document.activeElement;
+    // do not redraw the inputs (or an open list) under the owner's fingers
+    const busy = el && (['net-new-name', 'net-join-code', 'net-rename', 'home-new-name', 'home-join-code'].includes(el.id)
+      || (el.tagName === 'SELECT' && el.closest('#t-home')));
+    if (!busy) {
+      renderNetHead(NETVIEW);
+      renderHomeActions(NETVIEW);
+      renderNetActions(NETVIEW);
+      renderHomeTable(NETVIEW);
     }
-    renderNetActions(NETVIEW);
     renderNodes(NETVIEW);
   }
 

@@ -213,7 +213,8 @@ class Manager:
         # the compute network: tasks other PCs run here live under LocalLow (they may write nowhere else)
         self.netstore = NetStore(home / "network.json")
         self.net_root = Path(winapi.local_low()) / "RMQ" / self.instance
-        self.hosted: set[int] = {r["id"] for r in self.db.tasks_hosted()}
+        # tasks other PCs run here -> the network they came over ("home": one's own PC, "ext": other people)
+        self.hosted: dict[int, str] = {r["id"]: (r["origin_net"] or "ext") for r in self.db.tasks_hosted()}
         self.net = NetService(self)
         self._hw: dict | None = None
         self._net_disk = (0.0, 0.0)  # (when, GB used by members' files)
@@ -496,7 +497,8 @@ class Manager:
                 pools=planner.Pools(pool_cpu, pool_ram, pool_vram), tasks=list(views.values()), agents=agents,
                 policy=pol, mode=self.mode, game_active=game_active, gpu_user_busy=gpu_busy,
                 thermal_freeze=heat == "hot", disk_hold=disk_hold,
-                net_hold={tid for tid in rows if tid in self.hosted} if self.netstore.mode != "two_way" else set(),
+                net_hold={tid for tid in rows if self.hosted.get(tid) == "ext"}  # one's own PCs' tasks never wait
+                if self.netstore.mode != "two_way" else set(),
                 hung={tid for tid, a in self._activity.items() if a["hung"] and tid in rows
                       and rows[tid]["state"] == "running"},
                 ram_deficit=max(0.0, reserve_now - ram_avail), ram_critical=ram_avail < reserve_now * 0.5,
@@ -863,28 +865,35 @@ class Manager:
                         "python": platform.python_version()}
         return self._hw
 
-    def hosted_active(self) -> list[int]:
-        return [r["id"] for r in self.db.tasks_active() if r["id"] in self.hosted]
+    def hosted_active(self, kind: str | None = None) -> list[int]:
+        return [r["id"] for r in self.db.tasks_active()
+                if r["id"] in self.hosted and (kind is None or self.hosted[r["id"]] == kind)]
 
     def net_summary(self) -> dict:
         st = self.netstore
-        members = st.active_members()
+        members = st.active_members("ext") if st.network else {}
+        own = st.active_members("home") if st.home else {}
         return {"mode": st.mode, "status": self.net.status, "network": st.network["name"] if st.network else None,
                 "members": len(members), "online": sum(1 for nid in members if self.net.online(nid)),
+                "home": st.home["name"] if st.home else None, "home_members": len(own),
+                "home_online": sum(1 for nid in own if self.net.online(nid)), "is_main": st.is_main,
                 "hosted": len(self.hosted_active()), "remote": len(self.db.tasks_remote())}
 
     def nodes(self) -> list[dict]:
-        """The network's PCs as agents see them (rmq nodes)."""
+        """The PCs agents may send tasks to (rmq nodes): one's own PCs first, then other people's."""
         view = self.net.view()
-        out = []
-        for mbr in view["members"]:
-            if mbr["left"]:
-                continue
-            info = mbr.get("info") or {}
-            out.append({"name": mbr["name"], "self": mbr["self"], "online": mbr["online"],
-                        "mode": info.get("mode"), "accepting": bool(info.get("accepting")) and mbr["online"],
-                        "hw": info.get("hw"), "free": info.get("free"), "busy": info.get("busy"),
-                        "tasks": info.get("tasks"), "version": info.get("version"), "seen": mbr.get("seen")})
+        out, seen = [], set()
+        for group, own in (((view["home"] or {}).get("members") or [], True), (view["members"], False)):
+            for mbr in group:
+                if mbr["left"] or mbr["node_id"] in seen:
+                    continue
+                seen.add(mbr["node_id"])
+                info = mbr.get("info") or {}
+                out.append({"name": mbr["name"], "self": mbr["self"], "own": own or bool(mbr.get("own")),
+                            "main": bool(mbr.get("main")), "online": mbr["online"],
+                            "mode": info.get("mode"), "accepting": bool(info.get("accepting")) and mbr["online"],
+                            "hw": info.get("hw"), "free": info.get("free"), "busy": info.get("busy"),
+                            "tasks": info.get("tasks"), "version": info.get("version"), "seen": mbr.get("seen")})
         return out
 
     def _fits_here(self, need: dict) -> bool:
@@ -900,7 +909,8 @@ class Manager:
 
     def _node_by_name(self, where: str) -> str | None:
         key = where.strip().lower()
-        for nid, rec in self.netstore.active_members().items():
+        for nid, _kind in self.net.candidates():
+            rec = self.netstore.home_members.get(nid) or self.netstore.members.get(nid) or {}
             if nid.lower() == key or str(rec.get("name") or "").lower() == key:
                 return nid
         return None
@@ -911,7 +921,7 @@ class Manager:
         if where.lower() in ("", "local", "here"):
             return None
         st = self.netstore
-        if st.mode == "offline" or not st.network:
+        if st.mode == "offline" or not (st.network or st.home):
             if where.lower() == "auto":
                 return None
             raise ApiError(409, "сеть выключена или этот ПК не в сети: задачу можно поставить только сюда")
@@ -925,7 +935,7 @@ class Manager:
         name = self.net.node_name(nid)
         if not self.net.online(nid):
             raise ApiError(409, f"ПК {name} сейчас не в сети")
-        info = (self.net.live.get(nid) or {}).get("info") or {}
+        info = self.net.info_of(nid)
         if not info.get("accepting"):
             raise ApiError(409, f"ПК {name} сейчас не принимает задачи: его владелец закрыл его для сети")
         hw = info.get("hw") or {}
@@ -967,7 +977,7 @@ class Manager:
                 preempt=preempt, state="remote", state_reason="net:staging", submitted_at=now, queued_since=now,
                 remote_node=node, remote_status=json.dumps({"phase_text": "готовим отправку"}, ensure_ascii=False),
                 net_spec=json.dumps({"files": files, "results": results, "requirements": req, "env": extra,
-                                     "agent": agent["name"]}, ensure_ascii=False))
+                                     "agent": agent["name"], "net": self.net.channel(node)}, ensure_ascii=False))
             self.db.event("submit", f"Отправляется на ПК {where}: {name} ({len(listed)} файлов проекта)",
                           task_id=tid, agent_id=agent["id"])
         self.net.poke()
@@ -975,19 +985,23 @@ class Manager:
                         f"а созданные и изменённые задачей файлы вернутся в {cwd}")
         return {"id": tid, "state": "remote", "where": where, "warnings": warnings}
 
+    @staticmethod
+    def _remote_kind(row: dict) -> str:
+        return json.loads(row["net_spec"] or "{}").get("net") or "ext"
+
     def _cancel_remote(self, row: dict, why: str) -> None:
         if row["remote_id"]:
-            self.net.pool.submit(self._send_cancel, row["remote_node"], row["remote_id"])
+            self.net.pool.submit(self._send_cancel, row["remote_node"], row["remote_id"], self._remote_kind(row))
         self._finalize(row, "cancelled", None, why)
 
-    def _send_cancel(self, node: str, rid: int) -> None:
+    def _send_cancel(self, node: str, rid: int, kind: str = "ext") -> None:
         try:
-            self.net.call(node, "POST", f"/net/v1/tasks/{rid}/cancel", {}, timeout=10)
+            self.net.call(node, "POST", f"/net/v1/tasks/{rid}/cancel", {}, kind=kind, timeout=10)
         except PeerError as e:
             if e.status != 404:
                 pending = json.loads(self.db.kv_get("net_pending_cancels") or "[]")
-                if [node, rid] not in pending:
-                    pending.append([node, rid])
+                if [node, rid, kind] not in pending:
+                    pending.append([node, rid, kind])
                     self.db.kv_set("net_pending_cancels", json.dumps(pending))
 
     def net_retry_cancels(self) -> None:
@@ -995,17 +1009,18 @@ class Manager:
         if not pending:
             return
         left = []
-        for node, rid in pending:
-            if node not in self.netstore.active_members():
+        for item in pending:
+            node, rid, kind = (list(item) + ["ext"])[:3]
+            if not self.netstore.net(kind) or node not in self.netstore.active_members(kind):
                 continue
             if not self.net.online(node):
-                left.append([node, rid])
+                left.append([node, rid, kind])
                 continue
             try:
-                self.net.call(node, "POST", f"/net/v1/tasks/{rid}/cancel", {}, timeout=10)
+                self.net.call(node, "POST", f"/net/v1/tasks/{rid}/cancel", {}, kind=kind, timeout=10)
             except PeerError as e:
                 if e.status != 404:
-                    left.append([node, rid])
+                    left.append([node, rid, kind])
         self.db.kv_set("net_pending_cancels", json.dumps(left))
 
     def _remote_log(self, row: dict, offset: int, limit: int) -> dict:
@@ -1013,7 +1028,7 @@ class Manager:
             return {"data": "", "offset": 0, "size": 0, "rotated": False}
         try:
             return self.net.call(row["remote_node"], "GET", f"/net/v1/tasks/{row['remote_id']}/log?offset={offset}"
-                                 f"&limit={max(1, min(limit, 1 << 20))}", timeout=8)
+                                 f"&limit={max(1, min(limit, 1 << 20))}", kind=self._remote_kind(row), timeout=8)
         except PeerError as e:
             return {"data": f"[лог недоступен: {e.message}]\n" if offset <= 0 else "", "offset": max(0, offset),
                     "size": 0, "rotated": False}
@@ -1059,32 +1074,35 @@ class Manager:
                 note = f"{st['reason_text']}; {note}"
             self._finalize(row, state, st.get("exit_code"), note, when=time.time())
 
-    def net_cancel_all(self, why: str) -> None:
+    def net_cancel_all(self, why: str, kind: str = "ext") -> None:
+        """This PC leaves one of its networks: what it sent there and what it runs from there ends."""
         with self.lock:
             for row in self.db.tasks_remote():
-                self._cancel_remote(row, why)
+                if self._remote_kind(row) == kind:
+                    self._cancel_remote(row, why)
             for row in self.db.tasks_active():
-                if row["id"] in self.hosted:
+                if self.hosted.get(row["id"]) == kind:
                     self._drop_runtime(row["id"], kill=True)
                     self._finalize(row, "cancelled", None, why)
 
-    def net_member_left(self, node: str) -> None:
+    def net_member_left(self, node: str, kind: str = "ext") -> None:
         st = self.netstore
         with st._lock:
-            rec = st.members.get(node)
+            rec = st.book(kind).get(node)
             if rec and not rec.get("left_at"):
                 rec.update(left_at=time.time(), updated_at=time.time())
                 st.save()
         name = self.net.node_name(node)
+        where = "«Моих ПК»" if kind == "home" else "сети с друзьями"
         with self.lock:
             for row in self.db.tasks_active():
-                if row["id"] in self.hosted and row["origin_node"] == node:
+                if self.hosted.get(row["id"]) == kind and row["origin_node"] == node:
                     self._drop_runtime(row["id"], kill=True)
-                    self._finalize(row, "cancelled", None, f"ПК {name} вышел из сети")
+                    self._finalize(row, "cancelled", None, f"ПК {name} вышел из {where}")
             for row in self.db.tasks_remote():
-                if row["remote_node"] == node:
-                    self._finalize(row, "failed", None, f"ПК {name} вышел из сети")
-        self.db.event("net", f"ПК {name} вышел из сети")
+                if row["remote_node"] == node and self._remote_kind(row) == kind:
+                    self._finalize(row, "failed", None, f"ПК {name} вышел из {where}")
+        self.db.event("net", f"ПК {name} вышел из {where}")
 
     # ---------------------------------------------------------------- tasks other PCs run here (host side)
     def _net_disk_gb(self) -> float:
@@ -1101,16 +1119,19 @@ class Manager:
         self._net_disk = (time.time(), total / GB)
         return total / GB
 
-    def _net_agent(self, agent_name, node: str) -> dict:
+    def _net_agent(self, agent_name, node: str, kind: str = "ext") -> dict:
         cfg = self.settings.section("network")
         name = clean_agent_name(f"{agent_name or 'agent'} ({self.net.node_name(node)})")
         row = self.db.agent_by_name(name)
         if row is None:
             d = self.settings.section("agents")
+            own = kind == "home"  # one's own PC: as one of the local agents
             try:
-                row, _ = self.db.agent_create(name, weight=cfg["remote_weight"], max_priority=0,
+                row, _ = self.db.agent_create(name, weight=1.0 if own else cfg["remote_weight"],
+                                              max_priority=1 if own else 0,
                                               max_running=d["default_max_running"], max_queued=d["default_max_queued"],
-                                              note=f"задачи из сети с ПК {self.net.node_name(node)}")
+                                              note=f"задачи с моего ПК {self.net.node_name(node)}" if own
+                                              else f"задачи из сети с ПК {self.net.node_name(node)}")
                 self.agent_usage[row["id"]] = 0.0
                 self.db.event("agent", f"Новый агент из сети: {name}", agent_id=row["id"])
             except sqlite3.IntegrityError:
@@ -1119,12 +1140,13 @@ class Manager:
             raise NetError(f"владелец этого ПК отключил агента {name}", 403)
         return row
 
-    def net_accept_task(self, node: str, spec: dict) -> dict:
-        """A member wants to run a task here: check it, then wait for its archive."""
+    def net_accept_task(self, node: str, spec: dict, kind: str = "ext") -> dict:
+        """A member wants to run a task here: check it, then wait for its archive. One's own PCs are always let in;
+        other people only while this PC is open to them, and only so many at once."""
         cfg = self.settings.section("network")
-        if self.netstore.mode != "two_way":
+        if kind == "ext" and self.netstore.mode != "two_way":
             raise NetError("владелец этого ПК сейчас не принимает задачи из сети", 403)
-        if len(self.hosted_active()) >= cfg["max_hosted_tasks"]:
+        if kind == "ext" and len(self.hosted_active("ext")) >= cfg["max_hosted_tasks"]:
             raise NetError(f"на этом ПК уже {cfg['max_hosted_tasks']} задач из сети (его лимит): попробуйте позже", 409)
         bundle = spec.get("bundle") or {}
         size = int(bundle.get("size") or 0)
@@ -1148,7 +1170,7 @@ class Manager:
         upload_id = "u" + secrets.token_hex(8)
         with self.net._lock:
             self.net.uploads[upload_id] = {"node": node, "spec": spec, "size": size, "sha256": bundle["sha256"],
-                                           "expires": time.time() + 3600}
+                                           "kind": kind, "expires": time.time() + 3600}
         return {"upload_id": upload_id}
 
     def net_finish_upload(self, node: str, upload_id: str, slot: dict, zip_path: Path) -> int:
@@ -1164,7 +1186,8 @@ class Manager:
         if req and safe_name(req) not in manifest:
             shutil.rmtree(work, ignore_errors=True)
             raise NetError("файл зависимостей не найден в архиве")
-        agent = self._net_agent(spec.get("agent"), node)
+        kind = slot.get("kind", "ext")
+        agent = self._net_agent(spec.get("agent"), node, kind)
         tl = spec.get("time_limit_s")
         with self.lock:
             now = time.time()
@@ -1173,29 +1196,32 @@ class Manager:
                 argv=json.dumps(spec["argv"]) if spec.get("argv") else None, command=spec.get("command"),
                 cwd=str(work), env=json.dumps(spec.get("env") or {}), cpu=float(spec["cpu"]), ram_gb=float(spec["ram"]),
                 vram_gb=float(spec.get("vram") or 0), time_s=float(spec["time_s"]),
-                time_limit_s=float(tl) if tl else None, priority=0,
+                time_limit_s=float(tl) if tl else None, priority=1 if kind == "home" else 0,
                 preempt=spec.get("preempt") if spec.get("preempt") in ("suspend", "requeue") else "suspend",
-                state="queued", submitted_at=now, queued_since=now, origin_node=node,
+                state="queued", submitted_at=now, queued_since=now, origin_node=node, origin_net=kind,
                 origin_task=spec.get("origin_task"),
                 net_spec=json.dumps({"requirements": req, "results": spec.get("results"), "upload": upload_id},
                                     ensure_ascii=False))
-            self.hosted.add(tid)
+            self.hosted[tid] = kind
             self.task_dir(tid).mkdir(parents=True, exist_ok=True)
             (self.net_dir("manifests") / f"{tid}.json").write_text(json.dumps(manifest), encoding="utf-8")
-            self.db.event("submit", f"Задача из сети с ПК {self.net.node_name(node)}: {spec.get('name')}",
+            self.db.event("submit", (f"Задача с моего ПК {self.net.node_name(node)}" if kind == "home"
+                                     else f"Задача из сети с ПК {self.net.node_name(node)}") + f": {spec.get('name')}",
                           task_id=tid, agent_id=agent["id"])
         self.wake.set()
         return tid
 
-    def _hosted_row(self, node: str, tid: int) -> dict:
+    def _hosted_row(self, node: str, tid: int, kind: str = "ext") -> dict:
+        """A hosted task, asked about by the PC that sent it and over the same network (a member of the network
+        with other people can never reach a task one's own PC sent)."""
         row = self.db.task(tid)
-        if not row or row["origin_node"] != node:
+        if not row or row["origin_node"] != node or (row["origin_net"] or "ext") != kind:
             raise NetError("нет такой задачи", 404)
         return row
 
-    def net_hosted_status(self, node: str, tid: int) -> dict:
+    def net_hosted_status(self, node: str, tid: int, kind: str = "ext") -> dict:
         with self.lock:
-            row = self._hosted_row(node, tid)
+            row = self._hosted_row(node, tid, kind)
             agents = {a["id"]: a for a in self.db.agents()}
             d = self.task_json(row, agents)
         keep = ("id", "state", "state_text", "reason", "reason_text", "wait_text", "position", "run_s", "progress",
@@ -1204,13 +1230,13 @@ class Manager:
         out["final"] = row["state"] in FINAL_STATES
         return out
 
-    def net_hosted_log(self, node: str, tid: int, offset: int, limit: int) -> dict:
-        self._hosted_row(node, tid)
+    def net_hosted_log(self, node: str, tid: int, offset: int, limit: int, kind: str = "ext") -> dict:
+        self._hosted_row(node, tid, kind)
         ident = Identity(True, self.db.agent(self.user_agent_id))
         return self.read_log(ident, tid, offset, limit)
 
-    def net_hosted_log_all(self, node: str, tid: int) -> bytes:
-        self._hosted_row(node, tid)
+    def net_hosted_log_all(self, node: str, tid: int, kind: str = "ext") -> bytes:
+        self._hosted_row(node, tid, kind)
         path = self.task_dir(tid) / "output.log"
         try:
             with open(path, "rb") as f:
@@ -1220,18 +1246,18 @@ class Manager:
         except OSError:
             return b""
 
-    def net_hosted_cancel(self, node: str, tid: int) -> dict:
+    def net_hosted_cancel(self, node: str, tid: int, kind: str = "ext") -> dict:
         with self.lock:
-            row = self._hosted_row(node, tid)
+            row = self._hosted_row(node, tid, kind)
             if row["state"] in ("queued", "running", "suspended"):
                 self._drop_runtime(tid, kill=True)
                 self._finalize(row, "cancelled", None, "отменена отправителем")
         self.wake.set()
         return {"id": tid, "state": "cancelled"}
 
-    def net_hosted_results(self, node: str, tid: int) -> Path:
+    def net_hosted_results(self, node: str, tid: int, kind: str = "ext") -> Path:
         """The files the task created or changed, as one archive (built once)."""
-        row = self._hosted_row(node, tid)
+        row = self._hosted_row(node, tid, kind)
         if row["state"] not in FINAL_STATES:
             raise NetError("задача ещё не закончилась", 409)
         out = self.net_dir("out") / f"results-{tid}.zip"
@@ -1252,8 +1278,8 @@ class Manager:
         make_zip(work, files, out)
         return out
 
-    def net_hosted_delete(self, node: str, tid: int) -> dict:
-        row = self._hosted_row(node, tid)
+    def net_hosted_delete(self, node: str, tid: int, kind: str = "ext") -> dict:
+        row = self._hosted_row(node, tid, kind)
         if row["state"] not in FINAL_STATES:
             raise NetError("задача ещё не закончилась", 409)
         self._drop_hosted_files(row)
@@ -1453,7 +1479,7 @@ class Manager:
             rt = TaskRuntime.launch(tid, job_name, [python_for_tasks(), "-I", "-X", "utf8", str(WRAPPER), str(tdir)],
                                     cwd=row["cwd"], env=self._task_env(row, tdir, S), affinity=self.mask,
                                     job_memory=None, low_io=S["tasks"]["low_io_priority"],
-                                    low_integrity=hosted and S["network"]["protect_host"])
+                                    low_integrity=self.hosted.get(tid) == "ext" and S["network"]["protect_host"])
         except Exception as e:  # bad env, missing interpreter, access denied...
             log.exception("cannot launch task #%d", tid)
             self._finalize(row, "failed", None, f"Не удалось запустить: {e}")
@@ -1621,7 +1647,7 @@ class Manager:
         old = self.db.tasks_finished_before(now - S["tasks"]["keep_finished_days"] * 86400)
         for tid in old:
             shutil.rmtree(self.task_dir(tid), ignore_errors=True)
-            self.hosted.discard(tid)
+            self.hosted.pop(tid, None)
         if old:
             self.db.tasks_delete(old)
         self.db.events_prune(now - 30 * 86400)

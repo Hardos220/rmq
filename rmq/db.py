@@ -87,14 +87,16 @@ TASK_FIELDS = {
     "priority", "preempt", "state", "state_reason", "exit_code", "submitted_at", "queued_since", "started_at",
     "last_start_at", "finished_at", "run_s", "restarts", "job_name", "pid", "pid_ctime", "suspended_pids",
     "resume_ram_gb", "peak_ram_gb", "peak_vram_gb", "cpu_s", "uses_gpu", "stop_requested_at",
-    "origin_node", "origin_task", "remote_node", "remote_id", "remote_status", "net_spec",
+    "origin_node", "origin_task", "remote_node", "remote_id", "remote_status", "net_spec", "origin_net",
 }
 # columns added after the first release: (table, column, declaration)
 ADDED_COLUMNS = [("tasks", "stop_requested_at", "REAL"),
                  # a task from another PC of the network (hosted here) and a task sent to another PC ("remote")
                  ("tasks", "origin_node", "TEXT"), ("tasks", "origin_task", "INTEGER"),
                  ("tasks", "remote_node", "TEXT"), ("tasks", "remote_id", "INTEGER"),
-                 ("tasks", "remote_status", "TEXT"), ("tasks", "net_spec", "TEXT")]
+                 ("tasks", "remote_status", "TEXT"), ("tasks", "net_spec", "TEXT"),
+                 # which network a hosted task came over: "home" (one's own PC) or "ext" (other people)
+                 ("tasks", "origin_net", "TEXT")]
 AGENT_FIELDS = {"name", "weight", "max_priority", "max_running", "max_queued", "usage", "enabled", "note"}
 
 

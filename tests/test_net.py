@@ -165,3 +165,25 @@ def test_members_tasks_stand_still_while_the_pc_is_closed():
     assert p.waiting[2].reason == "net_closed"
     frozen = task(1, state="suspended", suspend_reason="net_closed", started_before=True)
     assert acts(run([frozen])) == [("resume", 1, "")]
+
+
+# ---------------------------------------------------------------- "Мои ПК" and the network with other people
+def test_codes_say_which_network_they_lead_to():
+    assert parse_invite(make_invite(NET, "100.1.1.1:8778", "A", kind="home"))["t"] == "home"
+    assert parse_invite(make_invite(NET, "100.1.1.1:8778", "A"))["t"] == "ext"
+
+
+def test_own_pcs_and_the_shared_network_are_kept_apart(tmp_path):
+    st = NetStore(tmp_path / "network.json")
+    st.network = dict(NET)
+    st.home = {"id": "home-1", "name": "Мои ПК", "key": base64.urlsafe_b64encode(b"h" * 32).decode(),
+               "main": st.node_id, "main_at": 10.0}
+    st.merge({"n-b": {"name": "B", "address": "1:1", "updated_at": 1}}, "home")
+    st.merge({"n-c": {"name": "C", "address": "2:2", "updated_at": 1}}, "ext")
+    assert set(st.active_members("home")) == {"n-b"} and set(st.active_members("ext")) == {"n-c"}
+    assert st.kind_of("home-1") == "home" and st.kind_of("net-1") == "ext" and st.kind_of("net-x") is None
+    assert st.key_of("home") == b"h" * 32 and st.key_of("ext") == KEY and st.is_main
+    assert not st.merge_home_meta({"main": "n-b", "main_at": 5.0})        # an older assignment loses
+    assert st.merge_home_meta({"main": "n-b", "main_at": 20.0}) and not st.is_main
+    again = NetStore(tmp_path / "network.json")                             # both networks are saved
+    assert again.home["main"] == "n-b" and "n-b" in again.home_members and "n-c" in again.members

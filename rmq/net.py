@@ -1,22 +1,33 @@
-"""The compute network: several PCs running RMQ lend each other their spare capacity.
+"""The compute network: PCs running RMQ lend each other their spare capacity.
+
+A PC can belong to two networks at once:
+
+  "Мои ПК" (home)          the owner's own PCs, with their own key that only these PCs know. One of them is the
+                           main PC: it adds the others, manages their settings, and decides which of them other
+                           people may see. Tasks between one's own PCs run like local ones: normal priority, full
+                           weight, no guest restrictions.
+  "Сеть с друзьями" (ext)  PCs of several people, with a key they share. Only the PCs their owners let in are
+                           there; a PC left out is not visible to other people at all.
 
 Transport: plain HTTP between managers over Tailscale (a free encrypted private network that works through
-any router). The network listener binds to this PC's Tailscale address only, so nothing listens on the
-internet or on the local network. Every request is signed with the network's shared key (HMAC-SHA256 over
-the method, path, time, a one-time nonce and the body hash); unsigned or replayed requests are refused.
+any router). The listener binds to this PC's Tailscale address only, so nothing listens on the internet or on
+the local network. Every request is signed with the key of the network it is for (HMAC-SHA256 over the method,
+path, time, a one-time nonce and the body hash); unsigned or replayed requests are refused. So a member of the
+network with other people can never reach the routes only the owner's own PCs may use (settings, management).
 
-Modes of this PC:
-  two_way  - my agents may use other PCs, and members' tasks may run here (low priority, write-protected)
-  one_way  - my agents may use other PCs; this PC is mine alone: members' tasks here are frozen
+Modes of this PC (for the network with other people; "offline" switches every connection off):
+  two_way  - my agents may use other people's PCs, and their tasks may run here (low priority, write-protected)
+  one_way  - my agents may use other people's PCs; their tasks here are frozen
   offline  - no network at all; the manager works on its own, as before
 
-Membership: the creator makes the network and hands out invite codes (its address + the key). A joiner
-registers with the inviter and gets the member list; then every node says hello to every other one every
-30 s, exchanging its live state (free resources, mode, version) and the member list (newest record wins).
+Membership: a PC creates a network and hands out invite codes (its address + the key + which network). A joiner
+registers with the inviter and gets the member list; then every node says hello to every other one every 30 s,
+exchanging its live state (free resources, mode, version) and the member list (newest record wins); in "Мои
+ПК" also which PC is the main one.
 
-Tasks for another PC ("proxy" tasks here, "hosted" tasks there): the origin packs the project folder,
-sends the task and the archive, follows its state, and when it ends brings back the files the task created
-or changed, then tells the host to delete its copy.
+Tasks for another PC ("proxy" tasks here, "hosted" tasks there): the origin packs the project folder, sends the
+task and the archive over the network the host shares with it (one's own PCs first), follows its state, and
+when it ends brings back the files the task created or changed, then tells the host to delete its copy.
 """
 from __future__ import annotations
 
@@ -37,7 +48,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
-from .netbase import (MODES, PROTOCOL, NetError, NetStore, NonceCache, body_hash, collect_files, file_sha256,
+from .netbase import (KINDS, MODES, PROTOCOL, NetError, NetStore, NonceCache, body_hash, collect_files, file_sha256,
                       make_invite, make_zip, member_record, parse_invite, safe_extract, sign_headers,
                       tailscale_address, verify)
 
@@ -51,6 +62,8 @@ SYNC_EVERY_S = 3
 ONLINE_S = 95          # a member is "in the network" if it answered within this time
 REACH_S = 150          # "this PC gets through to that one" if one of its own requests got there within this time
 MAX_JSON = 1 << 20
+# how the main PC lets one of its PCs into the network with other people ("hidden": not there at all)
+EXT_STATES = {"open": "two_way", "use": "one_way"}
 
 
 class PeerError(Exception):
@@ -61,13 +74,13 @@ class PeerError(Exception):
 
 
 class NetService:
-    """Membership, heartbeats, the listener, and the life of tasks sent to other PCs."""
+    """Membership, heartbeats, the listener, the main PC's management, and the life of tasks sent to other PCs."""
 
     def __init__(self, manager):
         self.m = manager
         self.store: NetStore = manager.netstore
         self.nonces = NonceCache()
-        self.live: dict[str, dict] = {}       # node id -> {"seen", "info", "rtt_ms", "error"}
+        self.live: dict[str, dict] = {}       # node id -> {"seen", "info", "info_by": {kind: info}, "rtt_ms", ...}
         self.uploads: dict[str, dict] = {}    # upload id -> accepted task spec waiting for its archive
         self.server: ThreadingHTTPServer | None = None
         self.address: str | None = None       # "100.x.y.z:8778" while listening
@@ -110,18 +123,21 @@ class NetService:
 
     def _tick(self) -> None:
         cfg = self.m.settings.section("network")
-        want = self.store.mode != "offline" and self.store.network is not None
+        st = self.store
+        want = st.mode != "offline" and (st.network is not None or st.home is not None)
         if not want:
             self._stop_server()
-            self.status = "offline" if self.store.mode == "offline" else "no_network"
+            self.status = "offline" if st.mode == "offline" else "no_network"
             return
         self._ensure_server(cfg)
         now = time.time()
         if self.server and now - self._last_hello >= HELLO_EVERY_S:
             self._last_hello = now
-            for nid, rec in self.store.active_members().items():
-                if rec.get("address"):
-                    self.pool.submit(self._hello, nid, rec)
+            for kind in KINDS:
+                if st.net(kind):
+                    for nid, rec in st.active_members(kind).items():
+                        if rec.get("address"):
+                            self.pool.submit(self._hello, nid, rec, kind)
         if now - self._last_sync >= SYNC_EVERY_S:
             self._last_sync = now
             self._sync_proxies()
@@ -166,15 +182,35 @@ class NetService:
     def _update_self_record(self, address: str | None) -> None:
         st = self.store
         with st._lock:
-            me = st.members.get(st.node_id)
-            if me is None or me.get("address") != address or me.get("name") != st.node_name or me.get("left_at"):
-                joined = me.get("joined_at") if me else time.time()
-                st.members[st.node_id] = member_record(st.node_name, address, joined)
+            changed = False
+            for kind in KINDS:
+                if not st.net(kind):
+                    continue
+                book = st.book(kind)
+                me = book.get(st.node_id)
+                if me is None or me.get("address") != address or me.get("name") != st.node_name or me.get("left_at"):
+                    joined = me.get("joined_at") if me else time.time()
+                    book[st.node_id] = member_record(st.node_name, address, joined)
+                    changed = True
+            if changed:
                 st.save()
 
+    def _my_address(self) -> str:
+        cfg = self.m.settings.section("network")
+        ip = self.bind_ip(cfg)
+        if not ip:
+            raise NetError("не найден адрес Tailscale: установите Tailscale, войдите в него и повторите")
+        return f"{ip}:{int(cfg['port'])}"
+
     # ------------------------------------------------------------ what this node tells the others
-    def self_info(self) -> dict:
+    def channel(self, nid: str) -> str:
+        """The network to reach a PC over: one's own PCs through "Мои ПК", everyone else through the shared one."""
+        st = self.store
+        return "home" if st.home and nid in st.active_members("home") else "ext"
+
+    def self_info(self, kind: str = "ext") -> dict:
         st = self.m.state or {}
+        store = self.store
         sysd = st.get("system") or {}
         cpu, ram, vram = sysd.get("cpu") or {}, sysd.get("ram") or {}, sysd.get("vram") or {}
         free = {"cpu": max(0.0, cpu.get("pool_cores", 0) - cpu.get("held", 0)),
@@ -182,23 +218,38 @@ class NetService:
                 "vram": max(0.0, vram.get("pool", 0) - vram.get("held", 0)) if vram else 0.0}
         counts = dict(st.get("_counts") or {})
         th = st.get("thermal") or {}
-        return {
-            "node_id": self.store.node_id, "name": self.store.node_name, "address": self.address,
-            "version": __version__, "protocol": PROTOCOL, "mode": self.store.mode,
-            "accepting": self.store.mode == "two_way" and self.server is not None,
+        info = {
+            "node_id": store.node_id, "name": store.node_name, "address": self.address,
+            "version": __version__, "protocol": PROTOCOL, "mode": store.mode,
+            # one's own PCs always take each other's tasks; other people's only in two_way
+            "accepting": self.server is not None and (kind == "home" or (store.mode == "two_way"
+                                                                         and store.network is not None)),
             "hw": self.m.hardware(), "free": {k: round(v, 2) for k, v in free.items()},
             "busy": {"game": bool((st.get("game") or {}).get("active")), "paused": st.get("mode") == "paused",
                      "heat": th.get("state", "normal"),
                      "disk_low": any(d.get("low") for d in (st.get("disk") or {}).get("drives", []))},
             "tasks": counts, "hosted": len(self.m.hosted_active()),
         }
+        if kind == "home":  # what the main PC shows and manages; never told to other people
+            from .settings import PRESETS, active_preset
+            preset = active_preset(self.m.settings.snapshot())
+            info["home"] = {"main": store.is_main, "preset": PRESETS[preset][0] if preset else None,
+                            "external": {"in": store.network is not None, "mode": store.mode,
+                                         "network": store.network["name"] if store.network else None}}
+        return info
+
+    def _home_meta(self) -> dict | None:
+        h = self.store.home
+        return {"main": h.get("main"), "main_at": h.get("main_at"), "name": h.get("name")} if h else None
 
     # ------------------------------------------------------------ talking to a peer
-    def _request(self, address: str, method: str, path: str, *, body: bytes | None = None, data_file: Path | None = None,
-                 bhash: str | None = None, timeout: float = 15, out_file: Path | None = None) -> bytes | dict:
+    def _request(self, address: str, method: str, path: str, *, kind: str = "ext", body: bytes | None = None,
+                 data_file: Path | None = None, bhash: str | None = None, timeout: float = 15,
+                 out_file: Path | None = None) -> bytes | dict:
         st = self.store
-        if not st.network:
-            raise PeerError("этот ПК не в сети")
+        net = st.net(kind)
+        if not net:
+            raise PeerError("этот ПК не в этой сети")
         if data_file is not None:
             size = data_file.stat().st_size
             payload = open(data_file, "rb")
@@ -206,11 +257,11 @@ class NetService:
             payload = body or b""
             size = len(payload)
             bhash = body_hash(payload)
-        headers = sign_headers(st.key, st.network["id"], st.node_id, method, path, bhash)
+        headers = sign_headers(st.key_of(kind), net["id"], st.node_id, method, path, bhash)
         headers["Content-Length"] = str(size)
         if body is not None or data_file is not None:
             headers["Content-Type"] = "application/octet-stream" if data_file is not None else "application/json"
-        req = urllib.request.Request(f"http://{address}{path}", data=payload if size or method in ("POST", "PUT") else None,
+        req = urllib.request.Request(f"http://{address}{path}", data=payload if size or method in ("POST", "PUT", "PATCH") else None,
                                      method=method, headers=headers)
         try:
             with DIRECT.open(req, timeout=timeout) as r:
@@ -236,41 +287,54 @@ class NetService:
             return json.loads(raw.decode("utf-8"))
         return raw
 
-    def call(self, node_id: str, method: str, path: str, payload: dict | None = None, **kw):
-        rec = self.store.members.get(node_id)
+    def call(self, node_id: str, method: str, path: str, payload: dict | None = None, kind: str | None = None, **kw):
+        kind = kind or self.channel(node_id)
+        rec = self.store.book(kind).get(node_id)
         if not rec or not rec.get("address"):
             raise PeerError("адрес этого ПК неизвестен")
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-        return self._request(rec["address"], method, path, body=body, **kw)
+        return self._request(rec["address"], method, path, kind=kind, body=body, **kw)
 
-    def _hello(self, nid: str, rec: dict) -> None:
+    def _hello(self, nid: str, rec: dict, kind: str) -> None:
+        st = self.store
         t0 = time.monotonic()
         with self._lock:
             self.live.setdefault(nid, {})["out_try"] = time.time()
+        body = {"info": self.self_info(kind), "members": st.book(kind)}
+        if kind == "home":
+            body["home"] = self._home_meta()
         try:
-            r = self._request(rec["address"], "POST", "/net/v1/hello",
-                              body=json.dumps({"info": self.self_info(), "members": self.store.members},
-                                              ensure_ascii=False).encode("utf-8"), timeout=10)
+            r = self._request(rec["address"], "POST", "/net/v1/hello", kind=kind,
+                              body=json.dumps(body, ensure_ascii=False).encode("utf-8"), timeout=10)
         except PeerError as e:
             with self._lock:
                 self.live.setdefault(nid, {})["error"] = e.message
             return
         rtt = (time.monotonic() - t0) * 1000
-        self._note_peer(r.get("info") or {}, rtt)
+        self._note_peer(r.get("info") or {}, rtt, kind)
         with self._lock:  # whether that PC gets through to this one (None: an older version that does not say)
             self.live.setdefault(nid, {})["they_reach"] = r.get("reached")
-        if self.store.merge(r.get("members") or {}):
+        changed = st.merge(r.get("members") or {}, kind)
+        if kind == "home":
+            changed = st.merge_home_meta(r.get("home")) or changed
+        if changed:
             self.poke()
 
-    def _note_peer(self, info: dict, rtt: float | None = None) -> None:
+    def _note_peer(self, info: dict, rtt: float | None = None, kind: str = "ext") -> None:
         nid = info.get("node_id")
         if not nid or nid == self.store.node_id:
             return
         with self._lock:
             cur = self.live.setdefault(nid, {})
             cur.update(seen=time.time(), info=info)
+            cur.setdefault("info_by", {})[kind] = info
             if rtt is not None:  # this PC's own request got through (its hellos to us say nothing about that)
                 cur.update(rtt_ms=round(rtt), error="", out_ok=time.time())
+
+    def info_of(self, nid: str, kind: str | None = None) -> dict:
+        with self._lock:
+            lv = self.live.get(nid) or {}
+            return dict((lv.get("info_by") or {}).get(kind or self.channel(nid)) or lv.get("info") or {})
 
     def online(self, nid: str) -> bool:
         with self._lock:
@@ -292,11 +356,11 @@ class NetService:
             return False
         return None
 
-    # ------------------------------------------------------------ owner actions
+    # ------------------------------------------------------------ the network with other people
     def create(self, name: str) -> dict:
         st = self.store
         if st.network:
-            raise NetError("этот ПК уже в сети: сначала выйдите из неё")
+            raise NetError("этот ПК уже в сети с друзьями: сначала выйдите из неё")
         name = (name or "").strip()[:60] or f"Сеть {st.node_name}"
         with st._lock:
             st.network = {"id": "net-" + secrets.token_hex(6), "name": name,
@@ -306,37 +370,39 @@ class NetService:
             if st.mode == "offline":
                 st.mode = "two_way"
             st.save()
-        self.m.db.event("net", f"Создана вычислительная сеть «{name}»")
+        self.m.db.event("net", f"Создана сеть с друзьями «{name}»")
         self.poke()
         return self.view()
 
     def invite(self) -> str:
         st = self.store
         if not st.network:
-            raise NetError("сначала создайте сеть или присоединитесь к ней")
+            raise NetError("сначала создайте сеть с друзьями или присоединитесь к ней")
         if not self.address:
             raise NetError("этот ПК сейчас не на связи: нужен запущенный Tailscale и режим не «офлайн»")
-        return make_invite(st.network, self.address, st.node_name)
+        return make_invite(st.network, self.address, st.node_name, kind="ext")
 
     def join(self, code: str) -> dict:
-        st = self.store
+        """A code from another PC: into "Мои ПК" or into the network with other people, as the code says."""
         inv = parse_invite(code)
+        return self._home_join(inv) if inv["t"] == "home" else self._ext_join(inv)
+
+    def _ext_join(self, inv: dict, mode: str | None = None) -> dict:
+        st = self.store
         if st.network and st.network["id"] != inv["n"]:
-            raise NetError("этот ПК уже в другой сети: сначала выйдите из неё")
-        cfg = self.m.settings.section("network")
-        ip = self.bind_ip(cfg)
-        if not ip:
-            raise NetError("не найден адрес Tailscale: установите Tailscale, войдите в него и повторите")
-        my_address = f"{ip}:{int(cfg['port'])}"
+            raise NetError("этот ПК уже в другой сети с друзьями: сначала выйдите из неё")
+        my_address = self._my_address()
         with st._lock:
             st.network = {"id": inv["n"], "name": inv.get("name") or "Сеть", "key": inv["k"],
                           "created_by": None, "created_at": time.time()}
-            if st.mode == "offline":
+            if mode:
+                st.mode = mode
+            elif st.mode == "offline":
                 st.mode = "two_way"
             st.members[st.node_id] = member_record(st.node_name, my_address, time.time())
         try:
-            r = self._request(inv["a"], "POST", "/net/v1/join",
-                              body=json.dumps({"info": self.self_info() | {"address": my_address},
+            r = self._request(inv["a"], "POST", "/net/v1/join", kind="ext",
+                              body=json.dumps({"info": self.self_info("ext") | {"address": my_address},
                                                "record": st.members[st.node_id]}, ensure_ascii=False).encode("utf-8"),
                               timeout=20)
         except PeerError as e:
@@ -347,31 +413,38 @@ class NetService:
         with st._lock:
             st.network["created_by"] = r.get("network", {}).get("created_by")
             st.save()
-        st.merge(r.get("members") or {})
-        self._note_peer(r.get("info") or {})
-        self.m.db.event("net", f"ПК присоединился к сети «{st.network['name']}» (пригласил {inv.get('by', '?')})")
+        st.merge(r.get("members") or {}, "ext")
+        self._note_peer(r.get("info") or {}, None, "ext")
+        self.m.db.event("net", f"ПК присоединился к сети с друзьями «{st.network['name']}» "
+                               f"(пригласил {inv.get('by', '?')})")
         self.poke()
         return self.view()
 
     def leave(self) -> dict:
+        """Leave the network with other people; "Мои ПК" stay as they are."""
         st = self.store
         if not st.network:
-            raise NetError("этот ПК не в сети")
+            raise NetError("этот ПК не в сети с друзьями")
         name = st.network["name"]
-        self.m.net_cancel_all("этот ПК вышел из сети")
-        for nid, rec in st.active_members().items():
+        self.m.net_cancel_all("этот ПК вышел из сети с друзьями", "ext")
+        for nid, rec in st.active_members("ext").items():
             if rec.get("address"):
                 try:
-                    self._request(rec["address"], "POST", "/net/v1/leave", body=b"{}", timeout=5)
+                    self._request(rec["address"], "POST", "/net/v1/leave", kind="ext", body=b"{}", timeout=5)
                 except PeerError:
                     pass
         with st._lock:
+            own = set(st.home_members) if st.home else set()
             st.network, st.members = None, {}
             st.save()
         with self._lock:
-            self.live.clear()
-        self._stop_server()
-        self.m.db.event("net", f"ПК вышел из сети «{name}»")
+            for nid in [n for n in self.live if n not in own]:
+                del self.live[nid]
+            for lv in self.live.values():
+                (lv.get("info_by") or {}).pop("ext", None)
+        if not st.home:
+            self._stop_server()
+        self.m.db.event("net", f"ПК вышел из сети с друзьями «{name}»")
         return self.view()
 
     def set_mode(self, mode: str) -> dict:
@@ -381,8 +454,8 @@ class NetService:
         with st._lock:
             st.mode = mode
             st.save()
-        self.m.db.event("net", {"two_way": "Сеть: двусторонний режим — ПК доступен участникам",
-                                "one_way": "Сеть: односторонний режим — ПК только ваш, задачи участников заморожены",
+        self.m.db.event("net", {"two_way": "Сеть: ПК открыт для друзей — их задачи могут выполняться здесь",
+                                "one_way": "Сеть: только для себя — задачи друзей здесь заморожены",
                                 "offline": "Сеть: офлайн — все соединения выключены"}[mode])
         self.poke()
         self.m.wake.set()
@@ -400,43 +473,235 @@ class NetService:
         self.poke()
         return self.view()
 
-    def view(self) -> dict:
-        """Everything the "Сеть" tab shows."""
+    # ------------------------------------------------------------ "Мои ПК": the owner's own PCs
+    def home_create(self, name: str) -> dict:
         st = self.store
-        me = self.self_info()
-        members = []
+        if st.home:
+            raise NetError("этот ПК уже в «Моих ПК»")
+        name = (name or "").strip()[:60] or "Мои ПК"
+        now = time.time()
+        with st._lock:
+            st.home = {"id": "home-" + secrets.token_hex(6), "name": name,
+                       "key": base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii"),
+                       "main": st.node_id, "main_at": now, "created_at": now}
+            st.home_members = {st.node_id: member_record(st.node_name, self.address, now)}
+            if st.mode == "offline":
+                st.mode = "two_way"
+            st.save()
+        self.m.db.event("net", f"Созданы «Мои ПК» «{name}»; этот ПК основной")
+        self.poke()
+        return self.view()
+
+    def home_invite(self) -> str:
+        st = self.store
+        if not st.home:
+            raise NetError("сначала создайте «Мои ПК» на основном ПК")
+        if not st.is_main:
+            raise NetError("добавлять ПК в «Мои ПК» можно только с основного ПК")
+        if not self.address:
+            raise NetError("этот ПК сейчас не на связи: нужен запущенный Tailscale и режим не «офлайн»")
+        return make_invite(st.home, self.address, st.node_name, kind="home")
+
+    def _home_join(self, inv: dict) -> dict:
+        st = self.store
+        if st.home and st.home["id"] != inv["n"]:
+            raise NetError("этот ПК уже в других «Моих ПК»: сначала выйдите из них")
+        my_address = self._my_address()
+        with st._lock:
+            st.home = {"id": inv["n"], "name": inv.get("name") or "Мои ПК", "key": inv["k"],
+                       "main": None, "main_at": 0.0, "created_at": time.time()}
+            st.home_members[st.node_id] = member_record(st.node_name, my_address, time.time())
+            if st.mode == "offline":
+                st.mode = "two_way"
+        try:
+            r = self._request(inv["a"], "POST", "/net/v1/join", kind="home",
+                              body=json.dumps({"info": self.self_info("home") | {"address": my_address},
+                                               "record": st.home_members[st.node_id]},
+                                              ensure_ascii=False).encode("utf-8"), timeout=20)
+        except PeerError as e:
+            with st._lock:
+                st.home, st.home_members = None, {}
+                st.save()
+            raise NetError(f"не удалось присоединиться: {e.message}") from None
+        st.merge(r.get("members") or {}, "home")
+        st.merge_home_meta(r.get("home"))
+        with st._lock:
+            st.save()
+        self._note_peer(r.get("info") or {}, None, "home")
+        self.m.db.event("net", f"ПК присоединился к «Моим ПК» «{st.home['name']}» (добавил {inv.get('by', '?')})")
+        self.poke()
+        return self.view()
+
+    def home_leave(self) -> dict:
+        st = self.store
+        if not st.home:
+            raise NetError("этот ПК не в «Моих ПК»")
+        name = st.home["name"]
+        self.m.net_cancel_all("этот ПК вышел из «Моих ПК»", "home")
+        for nid, rec in st.active_members("home").items():
+            if rec.get("address"):
+                try:
+                    self._request(rec["address"], "POST", "/net/v1/leave", kind="home", body=b"{}", timeout=5)
+                except PeerError:
+                    pass
+        with st._lock:
+            ext = set(st.members) if st.network else set()
+            st.home, st.home_members = None, {}
+            st.save()
+        with self._lock:
+            for nid in [n for n in self.live if n not in ext]:
+                del self.live[nid]
+            for lv in self.live.values():
+                (lv.get("info_by") or {}).pop("home", None)
+        if not st.network:
+            self._stop_server()
+        self.m.db.event("net", f"ПК вышел из «Моих ПК» «{name}»")
+        return self.view()
+
+    def find_home(self, who: str) -> str:
+        """A PC of "Мои ПК" by its id or name ("" or this PC's own name means this PC)."""
+        st = self.store
+        key = (who or "").strip().lower()
+        if not key or key in (st.node_id.lower(), st.node_name.lower()):
+            return st.node_id
+        for nid, rec in st.active_members("home").items():
+            if nid.lower() == key or str(rec.get("name") or "").lower() == key:
+                return nid
+        raise NetError(f"среди моих ПК нет «{who}»", 404)
+
+    def make_main(self, nid: str) -> dict:
+        """The main PC hands its role to another one; any own PC may take it itself (if the main one is gone)."""
+        st = self.store
+        if not st.home:
+            raise NetError("этот ПК не в «Моих ПК»")
+        if nid != st.node_id and not st.is_main:
+            raise NetError("назначить основным другой ПК можно только с основного ПК", 403)
+        with st._lock:
+            st.home.update(main=nid, main_at=time.time())
+            st.save()
+        self.m.db.event("net", f"Основной ПК в «Моих ПК»: {self.node_name(nid) if nid != st.node_id else st.node_name}")
+        self.poke()
+        return self.view()
+
+    def set_external(self, nid: str, state: str) -> dict:
+        """Which of my PCs other people see: "open" (their tasks run there), "use" (it only sends its own tasks
+        out), "hidden" (not in that network at all). The main PC decides for all of them."""
+        st = self.store
+        if state not in ("open", "use", "hidden"):
+            raise NetError("состояние: open, use или hidden")
+        if nid == st.node_id:
+            self.apply_external(state)
+            return self.view()
+        if not st.is_main:
+            raise NetError("это решает основной ПК", 403)
+        if nid not in st.active_members("home"):
+            raise NetError("нет такого ПК среди моих ПК", 404)
+        if state != "hidden" and not st.network:
+            raise NetError("основной ПК сам не в сети с друзьями: сначала создайте её или присоединитесь к ней")
+        payload: dict = {"state": state}
+        if state != "hidden":
+            payload.update(network={k: st.network.get(k) for k in ("id", "name", "key", "created_by")},
+                           via=self.address)
+        try:
+            self.call(nid, "POST", "/net/v1/home/external", payload, kind="home", timeout=40)
+        except PeerError as e:
+            raise NetError(f"ПК {self.node_name(nid)}: {e.message}", e.status or 502) from None
+        self.poke()
+        return self.view()
+
+    def apply_external(self, state: str, network: dict | None = None, via: str | None = None) -> None:
+        st = self.store
+        if state not in ("open", "use", "hidden"):
+            raise NetError("состояние: open, use или hidden")
+        if state == "hidden":
+            if st.network:
+                self.leave()
+            return
+        mode = EXT_STATES[state]
+        if st.network is None:
+            if not (isinstance(network, dict) and network.get("id") and network.get("key") and via):
+                raise NetError("этот ПК не в сети с друзьями, а основной ПК не передал её данные")
+            self._ext_join({"n": network["id"], "name": network.get("name"), "k": network["key"], "a": via,
+                            "by": "основной ПК"}, mode)
+        elif network and network.get("id") != st.network["id"]:
+            raise NetError("этот ПК уже в другой сети с друзьями")
+        elif st.mode != mode:
+            self.set_mode(mode)
+
+    def manage(self, nid: str, method: str, path: str, payload: dict | None = None):
+        """The main PC acts on one of its PCs: settings, presets, the name."""
+        st = self.store
+        if not st.is_main:
+            raise NetError("управлять другими ПК можно только с основного ПК", 403)
+        if nid not in st.active_members("home"):
+            raise NetError("нет такого ПК среди моих ПК", 404)
+        try:
+            return self.call(nid, method, f"/net/v1/home/{path}", payload, kind="home", timeout=30)
+        except PeerError as e:
+            raise NetError(e.message, e.status or 502) from None
+
+    # ------------------------------------------------------------ what the "Сеть" tab shows
+    def _member_views(self, kind: str, live: dict) -> list[dict]:
+        st = self.store
+        out = []
+        main = (st.home or {}).get("main") if kind == "home" else None
+        own = set(st.home_members) if st.home else set()
+        book = st.book(kind)
+        for nid, rec in sorted(book.items(), key=lambda kv: (kv[0] != st.node_id, kv[1].get("joined_at") or 0)):
+            if nid == st.node_id:
+                d = {"node_id": nid, "name": st.node_name, "self": True, "online": self.server is not None,
+                     "status": self.status, "info": self.self_info(kind), "address": self.address, "left": False,
+                     "joined_at": rec.get("joined_at")}
+            else:
+                lv = live.get(nid, {})
+                d = {"node_id": nid, "name": rec.get("name"), "self": False, "address": rec.get("address"),
+                     "left": bool(rec.get("left_at")), "left_at": rec.get("left_at"),
+                     "online": not rec.get("left_at") and time.time() - lv.get("seen", 0) <= ONLINE_S,
+                     "seen": lv.get("seen"), "rtt_ms": lv.get("rtt_ms"), "error": lv.get("error"),
+                     "reaches": self.reaches(nid), "they_reach": lv.get("they_reach"),
+                     "info": (lv.get("info_by") or {}).get(kind) or lv.get("info"), "joined_at": rec.get("joined_at")}
+            if kind == "home":
+                d["main"] = nid == main
+            else:
+                d["own"] = nid in own
+            out.append(d)
+        return out
+
+    def view(self) -> dict:
+        st = self.store
         with self._lock:
             live = {k: dict(v) for k, v in self.live.items()}
-        for nid, rec in sorted(st.members.items(), key=lambda kv: (kv[0] != st.node_id, kv[1].get("joined_at") or 0)):
-            if nid == st.node_id:
-                members.append({"node_id": nid, "name": st.node_name, "self": True, "online": self.server is not None,
-                                "status": self.status, "info": me, "address": self.address, "left": False,
-                                "joined_at": rec.get("joined_at")})
-                continue
-            lv = live.get(nid, {})
-            members.append({"node_id": nid, "name": rec.get("name"), "self": False, "address": rec.get("address"),
-                            "left": bool(rec.get("left_at")), "left_at": rec.get("left_at"),
-                            "online": not rec.get("left_at") and time.time() - lv.get("seen", 0) <= ONLINE_S,
-                            "seen": lv.get("seen"), "rtt_ms": lv.get("rtt_ms"), "error": lv.get("error"),
-                            "reaches": self.reaches(nid), "they_reach": lv.get("they_reach"),
-                            "info": lv.get("info"), "joined_at": rec.get("joined_at")})
-        net = st.network
+        net, home = st.network, st.home
+        main = (home or {}).get("main")
         return {"node_id": st.node_id, "node_name": st.node_name, "mode": st.mode, "status": self.status,
-                "error": self.error, "address": self.address,
-                "tailscale": tailscale_address(),
+                "error": self.error, "address": self.address, "tailscale": tailscale_address(),
+                "home": {"id": home["id"], "name": home["name"], "main": main, "is_main": st.is_main,
+                         "main_name": (st.node_name if main == st.node_id else self.node_name(main)) if main else None,
+                         "main_left": bool(main and main != st.node_id
+                                           and main not in st.active_members("home")),
+                         "members": self._member_views("home", live)} if home else None,
                 "network": {"id": net["id"], "name": net["name"], "created_by": net.get("created_by"),
                             "created_at": net.get("created_at")} if net else None,
-                "members": members}
+                "members": self._member_views("ext", live) if net else []}
 
     # ------------------------------------------------------------ tasks sent to other PCs (origin side)
+    def candidates(self) -> list[tuple[str, str]]:
+        """(node, network) of every PC a task may go to: one's own PCs first, then other people's."""
+        st = self.store
+        out = [(nid, "home") for nid in st.active_members("home")] if st.home else []
+        if st.network and st.mode != "offline":
+            mine = {nid for nid, _ in out}
+            out += [(nid, "ext") for nid in st.active_members("ext") if nid not in mine]
+        return out
+
     def best_node(self, need: dict) -> str | None:
-        """The online member that can start this task right now with the most CPU to spare."""
-        best, best_cpu = None, -1.0
+        """The online PC that can start this task right now: one's own PCs first, then the most CPU to spare."""
+        best, best_key = None, None
         with self._lock:
             live = {k: dict(v) for k, v in self.live.items()}
-        for nid in self.store.active_members():
+        for nid, kind in self.candidates():
             lv = live.get(nid, {})
-            info = lv.get("info") or {}
+            info = (lv.get("info_by") or {}).get(kind) or {}
             if time.time() - lv.get("seen", 0) > ONLINE_S or not info.get("accepting"):
                 continue
             busy = info.get("busy") or {}
@@ -448,14 +713,18 @@ class NetService:
             if need["vram"] > 0 and busy.get("game"):
                 continue
             cpu = free.get("cpu", 0)
-            if cpu >= min(need["cpu"], 1.0) and cpu > best_cpu:
-                best, best_cpu = nid, cpu
+            if cpu < min(need["cpu"], 1.0):
+                continue
+            key = (kind == "home", cpu)
+            if best_key is None or key > best_key:
+                best, best_key = nid, key
         return best
 
     def node_name(self, nid: str | None) -> str:
         if not nid:
             return "?"
-        rec = self.store.members.get(nid) or {}
+        st = self.store
+        rec = st.home_members.get(nid) or st.members.get(nid) or {}
         return rec.get("name") or nid
 
     def _sync_proxies(self) -> None:
@@ -487,6 +756,7 @@ class NetService:
     def _send(self, row: dict) -> None:
         m, tid, node = self.m, row["id"], row["remote_node"]
         spec = json.loads(row["net_spec"] or "{}")
+        kind = spec.get("net") or self.channel(node)
         cfg = m.settings.section("network")
         if not self.online(node):
             m.net_remote_update(tid, {"phase_text": f"ждёт связи с {self.node_name(node)}"})
@@ -505,10 +775,10 @@ class NetService:
                        "time_limit_s": row["time_limit_s"], "preempt": row["preempt"], "env": spec.get("env") or {},
                        "requirements": spec.get("requirements"), "results": spec.get("results"),
                        "bundle": {"size": size, "sha256": sha, "files": len(files)}}
-            r = self.call(node, "POST", "/net/v1/tasks", payload, timeout=30)
+            r = self.call(node, "POST", "/net/v1/tasks", payload, kind=kind, timeout=30)
             m.net_remote_update(tid, {"phase_text": f"отправляем {size / 2**20:.1f} МБ"})
-            up = self._request(self.store.members[node]["address"], "PUT", f"/net/v1/uploads/{r['upload_id']}",
-                               data_file=out, bhash=sha, timeout=max(60.0, size / 2**19))
+            up = self.call(node, "PUT", f"/net/v1/uploads/{r['upload_id']}", None, kind=kind,
+                           data_file=out, bhash=sha, timeout=max(60.0, size / 2**19))
         except NetError as e:
             m.net_proxy_failed(tid, e.message)
             return
@@ -524,11 +794,13 @@ class NetService:
 
     def _follow(self, row: dict) -> None:
         m, tid, node, rid = self.m, row["id"], row["remote_node"], row["remote_id"]
-        if node not in self.store.members or self.store.members[node].get("left_at"):
+        kind = json.loads(row["net_spec"] or "{}").get("net") or self.channel(node)
+        rec = self.store.book(kind).get(node)
+        if not rec or rec.get("left_at"):
             m.net_proxy_failed(tid, f"ПК {self.node_name(node)} вышел из сети")
             return
         try:
-            st = self.call(node, "GET", f"/net/v1/tasks/{rid}", timeout=10)
+            st = self.call(node, "GET", f"/net/v1/tasks/{rid}", kind=kind, timeout=10)
         except PeerError as e:
             if e.status == 404:
                 m.net_proxy_failed(tid, f"на {self.node_name(node)} этой задачи больше нет")
@@ -543,9 +815,9 @@ class NetService:
         tdir = m.task_dir(tid)
         tdir.mkdir(parents=True, exist_ok=True)
         try:
-            self.call(node, "GET", f"/net/v1/tasks/{rid}/log?all=1", timeout=60, out_file=tdir / "output.log")
+            self.call(node, "GET", f"/net/v1/tasks/{rid}/log?all=1", kind=kind, timeout=60, out_file=tdir / "output.log")
             res = m.net_dir("res") / f"results-{tid}.zip"
-            self.call(node, "GET", f"/net/v1/tasks/{rid}/results", timeout=600, out_file=res)
+            self.call(node, "GET", f"/net/v1/tasks/{rid}/results", kind=kind, timeout=600, out_file=res)
         except PeerError as e:
             m.net_remote_update(tid, {"phase_text": f"не удалось забрать результаты: {e.message}"})
             return
@@ -557,7 +829,7 @@ class NetService:
         finally:
             res.unlink(missing_ok=True)
         try:
-            self.call(node, "DELETE", f"/net/v1/tasks/{rid}", timeout=10)
+            self.call(node, "DELETE", f"/net/v1/tasks/{rid}", kind=kind, timeout=10)
         except PeerError:
             pass
         m.net_proxy_finished(tid, st, len(manifest), sum(v[0] for v in manifest.values()))
@@ -591,6 +863,9 @@ class NetHandler(BaseHTTPRequestHandler):
     def do_PUT(self):
         self._dispatch("PUT")
 
+    def do_PATCH(self):
+        self._dispatch("PATCH")
+
     def do_DELETE(self):
         self._dispatch("DELETE")
 
@@ -608,50 +883,56 @@ class NetHandler(BaseHTTPRequestHandler):
         svc: NetService = self.server.service
         st = svc.store
         try:
-            if not st.network:
-                raise NetError("этот ПК не в сети", 403)
-            node = verify(self.headers, st.key, st.network["id"], method, self.path, svc.nonces)
+            kind = st.kind_of(self.headers.get("X-RMQ-Net"))
+            if kind is None:
+                raise NetError("этот ПК не в этой сети", 403)
+            node = verify(self.headers, st.key_of(kind), st.net(kind)["id"], method, self.path, svc.nonces)
             url = urlparse(self.path)
             parts = [p for p in url.path.split("/") if p]
             q = {k: v[-1] for k, v in parse_qs(url.query).items()}
             if parts[:2] != ["net", "v1"]:
                 raise NetError("нет такого адреса", 404)
             parts = parts[2:]
-            rec = st.members.get(node)
+            rec = st.book(kind).get(node)
             if rec and rec.get("left_at") and parts != ["join"]:
                 raise NetError("этот ПК вышел из сети: присоединитесь заново по приглашению", 403)
             if method == "PUT" and len(parts) == 2 and parts[0] == "uploads":
-                return self._upload(svc, node, parts[1])
+                return self._upload(svc, node, parts[1], kind)
             body = self._read_json()
             if method == "POST" and parts == ["hello"]:
-                return self._hello(svc, node, body)
+                return self._hello(svc, node, body, kind)
             if method == "POST" and parts == ["join"]:
-                return self._join(svc, node, body)
+                return self._join(svc, node, body, kind)
             if method == "POST" and parts == ["leave"]:
-                svc.m.net_member_left(node)
+                svc.m.net_member_left(node, kind)
                 return self._json(200, {"ok": True})
             if method == "POST" and parts == ["tasks"]:
-                return self._json(201, svc.m.net_accept_task(node, body))
+                return self._json(201, svc.m.net_accept_task(node, body, kind))
             if len(parts) >= 2 and parts[0] == "tasks" and parts[1].isdigit():
                 tid = int(parts[1])
                 rest = parts[2:]
                 if method == "GET" and not rest:
-                    return self._json(200, svc.m.net_hosted_status(node, tid))
+                    return self._json(200, svc.m.net_hosted_status(node, tid, kind))
                 if method == "GET" and rest == ["log"]:
                     if q.get("all"):
-                        return self._send(200, svc.m.net_hosted_log_all(node, tid), "text/plain; charset=utf-8")
+                        return self._send(200, svc.m.net_hosted_log_all(node, tid, kind), "text/plain; charset=utf-8")
                     return self._json(200, svc.m.net_hosted_log(node, tid, int(q.get("offset", 0)),
-                                                                int(q.get("limit", 65536))))
+                                                                int(q.get("limit", 65536)), kind))
                 if method == "POST" and rest == ["cancel"]:
-                    return self._json(200, svc.m.net_hosted_cancel(node, tid))
+                    return self._json(200, svc.m.net_hosted_cancel(node, tid, kind))
                 if method == "GET" and rest == ["results"]:
-                    return self._file(svc.m.net_hosted_results(node, tid))
+                    return self._file(svc.m.net_hosted_results(node, tid, kind))
                 if method == "DELETE" and not rest:
-                    return self._json(200, svc.m.net_hosted_delete(node, tid))
+                    return self._json(200, svc.m.net_hosted_delete(node, tid, kind))
+            if parts and parts[0] == "home":
+                return self._home(svc, node, method, parts[1:], body, kind)
             raise NetError("нет такого адреса", 404)
         except NetError as e:
             self._json(e.status, {"error": e.message})
-        except Exception:
+        except Exception as e:
+            status, message = getattr(e, "status", None), getattr(e, "message", None)
+            if isinstance(status, int) and isinstance(message, str):  # the manager's own errors (bad settings and such)
+                return self._json(status, {"error": message})
             log.exception("network request %s %s", method, self.path)
             self._json(500, {"error": "внутренняя ошибка ПК-хозяина"})
 
@@ -672,38 +953,73 @@ class NetHandler(BaseHTTPRequestHandler):
             raise NetError("тело запроса должно быть объектом")
         return data
 
-    def _hello(self, svc: NetService, node: str, body: dict) -> None:
+    def _hello(self, svc: NetService, node: str, body: dict, kind: str) -> None:
         info = body.get("info") or {}
         if info.get("node_id") != node:
             raise NetError("узел представился чужим именем", 401)
-        svc.store.merge(body.get("members") or {})
-        if node not in svc.store.members and info.get("address"):  # joined through another member
-            svc.store.merge({node: {"name": info.get("name"), "address": info.get("address"),
-                                    "joined_at": time.time(), "updated_at": time.time(), "left_at": None}})
-        svc._note_peer(info)
-        self._json(200, {"info": svc.self_info(), "members": svc.store.members, "reached": svc.reaches(node)})
+        st = svc.store
+        st.merge(body.get("members") or {}, kind)
+        if kind == "home":
+            st.merge_home_meta(body.get("home"))
+        if node not in st.book(kind) and info.get("address"):  # joined through another member
+            st.merge({node: {"name": info.get("name"), "address": info.get("address"),
+                             "joined_at": time.time(), "updated_at": time.time(), "left_at": None}}, kind)
+        svc._note_peer(info, None, kind)
+        out = {"info": svc.self_info(kind), "members": st.book(kind), "reached": svc.reaches(node)}
+        if kind == "home":
+            out["home"] = svc._home_meta()
+        self._json(200, out)
 
-    def _join(self, svc: NetService, node: str, body: dict) -> None:
-        info, rec = body.get("info") or {}, body.get("record") or {}
+    def _join(self, svc: NetService, node: str, body: dict, kind: str) -> None:
+        info = body.get("info") or {}
         if info.get("node_id") != node or not info.get("address"):
             raise NetError("неполная заявка на вступление")
         st = svc.store
         with st._lock:
-            st.members[node] = {"name": str(info.get("name") or node)[:40], "address": info["address"],
-                                "joined_at": time.time(), "updated_at": time.time(), "left_at": None}
+            st.book(kind)[node] = {"name": str(info.get("name") or node)[:40], "address": info["address"],
+                                   "joined_at": time.time(), "updated_at": time.time(), "left_at": None}
             st.save()
-        svc._note_peer(info)
-        svc.m.db.event("net", f"К сети присоединился ПК {info.get('name') or node}")
+        svc._note_peer(info, None, kind)
+        who = info.get("name") or node
+        svc.m.db.event("net", f"К «Моим ПК» присоединился ПК {who}" if kind == "home"
+                       else f"К сети с друзьями присоединился ПК {who}")
         svc.poke()
-        self._json(200, {"network": {"id": st.network["id"], "name": st.network["name"],
-                                     "created_by": st.network.get("created_by")},
-                         "members": st.members, "info": svc.self_info()})
+        net = st.net(kind)
+        out = {"network": {"id": net["id"], "name": net["name"], "created_by": net.get("created_by")},
+               "members": st.book(kind), "info": svc.self_info(kind)}
+        if kind == "home":
+            out["home"] = svc._home_meta()
+        self._json(200, out)
 
-    def _upload(self, svc: NetService, node: str, upload_id: str) -> None:
+    def _home(self, svc: NetService, node: str, method: str, rest: list[str], body: dict, kind: str) -> None:
+        """The main PC manages this one. Only over "Мои ПК" (other people do not have that key)."""
+        st = svc.store
+        if kind != "home":
+            raise NetError("нет такого адреса", 404)
+        if node != (st.home or {}).get("main"):
+            raise NetError("управлять этим ПК может только основной ПК", 403)
+        m = svc.m
+        if rest == ["settings"] and method == "GET":
+            return self._json(200, m.settings_view())
+        if rest == ["settings"] and method == "PATCH":
+            return self._json(200, m.update_settings(body))
+        if rest == ["preset"] and method == "POST":
+            return self._json(200, m.apply_preset(str(body.get("preset") or "")))
+        if rest == ["reset"] and method == "POST":
+            return self._json(200, m.reset_settings())
+        if rest == ["rename"] and method == "POST":
+            svc.rename(str(body.get("name") or ""))
+            return self._json(200, {"ok": True})
+        if rest == ["external"] and method == "POST":
+            svc.apply_external(str(body.get("state") or ""), body.get("network"), body.get("via"))
+            return self._json(200, {"ok": True})
+        raise NetError("нет такого адреса", 404)
+
+    def _upload(self, svc: NetService, node: str, upload_id: str, kind: str) -> None:
         n = int(self.headers.get("Content-Length") or 0)
         with svc._lock:
             slot = svc.uploads.get(upload_id)
-        if not slot or slot["node"] != node:
+        if not slot or slot["node"] != node or slot.get("kind", "ext") != kind:
             raise NetError("нет такой отправки (она устарела): начните заново", 404)
         if n != slot["size"]:
             raise NetError("размер архива не совпадает с заявленным")

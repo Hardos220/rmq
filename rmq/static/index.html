@@ -127,23 +127,37 @@
 
     <section id="tab-network" hidden>
       <div class="card net-head" id="net-head"></div>
+      <h2>Мои ПК</h2>
+      <p class="small muted">Ваши собственные ПК: задачи между ними идут как свои, а основной ПК управляет настройками
+        остальных и решает, какие из них видны друзьям.</p>
+      <div class="net-actions" id="home-actions"></div>
+      <div class="tbl-wrap" id="home-table" hidden><table id="t-home">
+        <thead><tr>
+          <th>Компьютер</th><th>Связь</th><th>Для друзей</th><th>Процессор</th><th class="num">ОЗУ</th><th>Видеокарта</th>
+          <th class="num">Свободно сейчас</th><th class="num">Задачи</th><th class="num">Версия</th><th></th>
+        </tr></thead><tbody></tbody>
+      </table></div>
+      <h2>Сеть с друзьями</h2>
+      <p class="small muted">ПК других людей. Им видны только те ваши ПК, которые выпустил основной ПК; их задачи
+        у вас идут с низким приоритетом и не могут менять ваши файлы.</p>
       <div class="net-actions" id="net-actions"></div>
-      <h2>Компьютеры сети</h2>
       <div class="tbl-wrap"><table id="t-nodes">
         <thead><tr>
           <th>Компьютер</th><th>Связь</th><th>Режим</th><th>Процессор</th><th class="num">ОЗУ</th><th>Видеокарта</th>
           <th class="num">Свободно сейчас</th><th class="num">Задачи</th><th class="num">Версия</th>
         </tr></thead><tbody></tbody>
       </table></div>
+      <div class="net-actions" id="net-help"></div>
       <h2>Задачи через сеть</h2>
       <div class="tbl-wrap"><table id="t-net-tasks">
         <thead><tr><th>#</th><th>Задача</th><th>Агент</th><th>Где</th><th>Состояние</th><th class="num">Время</th><th>Выполнено</th></tr></thead>
         <tbody></tbody>
       </table></div>
       <p class="small muted">ПК связываются через Tailscale — бесплатную зашифрованную частную сеть; менеджер слушает
-        только адрес Tailscale, наружу ничего не открыто, каждый запрос подписан ключом сети. Задачи с других ПК встают
-        в общую очередь с низким приоритетом: ваши программы и ваши агенты всегда первые. Они работают с пониженным
-        уровнем доступа Windows: читать файлы этого ПК могут, менять и удалять — нет.</p>
+        только адрес Tailscale, наружу ничего не открыто. Каждый запрос подписан ключом своей сети: у «Моих ПК» он
+        свой, друзья его не знают и не могут управлять вашими ПК. Задачи с ваших ПК идут как свои; задачи друзей встают
+        в очередь с низким приоритетом (ваши программы и агенты всегда первые) и работают с пониженным уровнем
+        доступа Windows: читать файлы этого ПК могут, менять и удалять — нет.</p>
       <h2>Обновления</h2>
       <div class="card" id="update-card"></div>
     </section>
@@ -240,6 +254,7 @@
     </section>
 
     <section id="tab-rules" hidden>
+      <div id="settings-target"></div>
       <h2>Режим работы</h2>
       <div class="card presets" id="presets"></div>
       <h2>Основные настройки</h2>
