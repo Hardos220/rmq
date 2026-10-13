@@ -482,10 +482,32 @@
 
   // ================================================================ resources by task (overview)
   // Every running task as its own band, stacked over the owner's load: who takes how much at every moment.
-  // Eight colors: the tasks running now get them first, then the most recent ones; the older tasks of the
-  // window share one band ("Более ранние задачи"). A task keeps its color while it keeps one.
-  const TASK_COLORS = ['--t1', '--t2', '--t3', '--t4', '--t5', '--t6', '--t7', '--t8'];
+  // A hundred colors: hues a golden angle apart (neighbours in the stack never look alike) at three lightness
+  // steps, recomputed for the dark theme. The tasks running now get colors first, then the most recent ones;
+  // past a hundred the older tasks of the window share one band. A task keeps its color while it keeps one.
+  // Names are not listed in the legend: hovering a band shows its task, a click opens its card.
+  const TASK_N = 100;
   const taskSlot = new Map();
+  function hslHex(hue, sat, light) {
+    const f = (n) => {
+      const k = (n + hue / 30) % 12;
+      const a = sat * Math.min(light, 1 - light);
+      const v = light - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+      return Math.round(v * 255).toString(16).padStart(2, '0');
+    };
+    return `#${f(0)}${f(8)}${f(4)}`;
+  }
+  function isDark() {
+    const t = document.documentElement.dataset.theme;
+    return t === 'dark' || (t !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  function taskColor(slot) {
+    const hue = (215 + slot * 137.508) % 360;  // slot 0 starts at the dashboard's blue
+    const light = (isDark() ? [0.6, 0.5, 0.68] : [0.5, 0.4, 0.6])[slot % 3];
+    return hslHex(hue, 0.68, light);
+  }
+  const colorOf = (c) => (c.startsWith('--') ? cssVar(c) : c);
+  const colorCss = (c) => (c.startsWith('--') ? `var(${c})` : c);
   const TASK_NAMES = {};
   const TASK_VIEWS = {
     cpu: { label: 'Процессор', i: 0, user: 'cpu_user', max: () => 100, fmt: (v) => pct(v), tick: (v) => `${v}%`, unit: '% всего процессора' },
@@ -516,8 +538,10 @@
       this.root = h('section', { class: 'chart wide taskchart', 'aria-label': 'Ресурсы по задачам' },
         h('header', null, h('span', { class: 'title' }, 'Ресурсы по задачам'), this.sub, this.seg, tableToggle(this)),
         this.legend, this.plot, this.tableEl);
+      this.hit = null;  // the task whose band is under the cursor
       this.canvas.addEventListener('pointermove', (e) => this.onMove(e));
-      this.canvas.addEventListener('pointerleave', () => { this.hover = null; tooltip.hidden = true; this.draw(); });
+      this.canvas.addEventListener('pointerleave', () => { this.hover = null; this.hit = null; tooltip.hidden = true; this.draw(); });
+      this.canvas.addEventListener('click', () => { if (typeof this.hit === 'number') openTask(this.hit); });
       new ResizeObserver(() => this.draw()).observe(this.plot);
     }
 
@@ -540,8 +564,7 @@
     series() {
       const m = METRICS;
       const v = TASK_VIEWS[this.view];
-      // which tasks get one of the eight colors: those running now first, then the most recent ones;
-      // the older ones share one band. A task keeps its color while it keeps one.
+      // which tasks get a color: those running now first, then the most recent ones
       const lastSeen = new Map();
       const ids = new Set();
       if (m && m.tasks) {
@@ -555,12 +578,13 @@
       const running = new Set(Object.keys((m && m.tasks && m.tasks[m.tasks.length - 1]) || {}).map(Number));
       const ranked = [...lastSeen.keys()].sort((a, b) => (running.has(b) - running.has(a))
         || (lastSeen.get(b) - lastSeen.get(a)) || (b - a));
-      const keep = new Set(ranked.slice(0, TASK_COLORS.length));
+      const keep = new Set(ranked.slice(0, TASK_N));
       for (const id of [...taskSlot.keys()]) if (!keep.has(id)) taskSlot.delete(id);
       const used = new Set([...taskSlot.values()]);
       for (const id of ranked) {
         if (!keep.has(id) || taskSlot.has(id)) continue;
-        const free = TASK_COLORS.findIndex((_, i) => !used.has(i));
+        let free = 0;
+        while (used.has(free)) free += 1;
         taskSlot.set(id, free);
         used.add(free);
       }
@@ -571,7 +595,7 @@
         const get = this.smoothed((i) => { const r = m.tasks[i] && m.tasks[i][id]; return r ? r[v.i] : 0; });
         if (!taskSlot.has(id)) { other.push(get); otherRunning = otherRunning || running.has(id); continue; }
         const info = TASK_NAMES[id] || {};
-        out.push({ id, label: `#${id} ${info.name || ''}`.trim(), agent: info.agent, color: TASK_COLORS[taskSlot.get(id)], get });
+        out.push({ id, label: `#${id} ${info.name || ''}`.trim(), agent: info.agent, color: taskColor(taskSlot.get(id)), get });
       }
       if (other.length) {
         out.push({ id: 'other', label: `${otherRunning ? 'Остальные задачи' : 'Более ранние задачи'} (${other.length})`,
@@ -599,13 +623,16 @@
     renderLegend(ser) {
       const f = TASK_VIEWS[this.view].fmt;
       const last = this.lastIndex();
-      this.legend.replaceChildren(...ser.map((s) => {
-        const val = last >= 0 ? s.get(last) : null;
-        const el = h('span', { class: typeof s.id === 'number' ? 'task-key' : null, title: s.agent ? `${s.label} · ${s.agent} — открыть карточку` : null },
-          h('span', { class: 'key', style: `background: var(${s.color})` }), `${s.label} `, h('b', null, val == null ? '–' : f(val)));
-        if (typeof s.id === 'number') el.addEventListener('click', () => openTask(s.id));
-        return el;
-      }));
+      const user = ser[0];
+      const tasks = ser.filter((s) => s.id !== 'user');
+      const total = last >= 0 ? tasks.reduce((a, s) => a + (s.get(last) || 0), 0) : null;
+      const n = tasks.filter((s) => typeof s.id === 'number').length;
+      this.legend.replaceChildren(
+        h('span', null, h('span', { class: 'key', style: `background: ${colorCss(user.color)}` }), 'Вы и система ',
+          h('b', null, last >= 0 ? f(user.get(last)) : '–')),
+        h('span', null, h('span', { class: 'key task-keys' }), `Задачи агентов (${n}${tasks.some((s) => s.id === 'other') ? ' и более ранние' : ''}) `,
+          h('b', null, total == null ? '–' : f(total))),
+        h('span', { class: 'muted' }, 'наведите на полосу — увидите задачу, щелчок — её карточка'));
     }
 
     renderTable(ser) {
@@ -681,13 +708,14 @@
       for (const s of ser) {
         const top = new Float64Array(n);
         for (let i = 0; i < n; i += 1) top[i] = base[i] + (s.get(i) || 0);
-        const color = cssVar(s.color);
+        const color = colorOf(s.color);
+        const alpha = s.id === 'user' ? 0.55 : this.hit == null || this.hit === s.id ? 0.88 : 0.35;
         for (const [a, b] of segs) {
           c.beginPath();
           for (let i = a; i <= b; i += 1) c.lineTo(g.X(m.t[i]), g.Y(top[i]));
           for (let i = b; i >= a; i -= 1) c.lineTo(g.X(m.t[i]), g.Y(base[i]));
           c.closePath();
-          c.fillStyle = s.id === 'user' ? rgba(color, 0.55) : rgba(color, 0.85);
+          c.fillStyle = rgba(color, alpha);
           c.fill();
           // a thin gap in the surface color between neighbouring bands
           c.strokeStyle = col.surface; c.lineWidth = 1.5; c.lineJoin = 'round';
@@ -720,12 +748,26 @@
       const i = Math.abs(m.t[lo] - t) < Math.abs(m.t[hi] - t) ? lo : hi;
       this.hover = i;
       const ser = this.series();
+      const level = g.max * (1 - (e.clientY - rect.top - g.pad.t) / g.ph);
+      let acc = 0;
+      let hit = null;
+      for (const s of ser) {
+        const v = s.get(i) || 0;
+        if (v > 0 && level >= acc && level <= acc + v) { hit = s; break; }
+        acc += v;
+      }
+      this.hit = hit ? hit.id : null;
+      this.canvas.style.cursor = hit && typeof hit.id === 'number' ? 'pointer' : '';
       this.draw(ser);
       const f = TASK_VIEWS[this.view].fmt;
-      const rowsT = ser.slice().reverse().filter((s) => s.id === 'user' || s.get(i) > 0.005)
-        .map((s) => h('div', { class: 'r' }, h('span', { class: 'lk', style: `border-top-color: var(${s.color})` }),
-          h('b', null, f(s.get(i))), h('span', null, s.agent ? `${s.label} · ${s.agent}` : s.label)));
-      tooltip.replaceChildren(h('div', { class: 't' }, clock(m.t[i], true) + smoothNote()), ...rowsT);
+      const row = (s) => h('div', { class: 'r' }, h('span', { class: 'lk', style: `border-top-color: ${colorCss(s.color)}` }),
+        h('b', null, f(s.get(i))), h('span', null, s.agent ? `${s.label} · ${s.agent}` : s.label));
+      const others = ser.slice().reverse().filter((s) => s !== hit && (s.id === 'user' || s.get(i) > 0.005));
+      const shown = others.slice(0, 12);
+      tooltip.replaceChildren(h('div', { class: 't' }, clock(m.t[i], true) + smoothNote()),
+        hit ? h('div', { class: 'hit' }, row(hit)) : null,
+        ...shown.map(row),
+        others.length > shown.length ? h('div', { class: 'r muted' }, `… и ещё ${others.length - shown.length}`) : null);
       tooltip.hidden = false;
       const tw = tooltip.offsetWidth; const th = tooltip.offsetHeight;
       let left = e.clientX + 14; let top = e.clientY + 14;
