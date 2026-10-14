@@ -105,8 +105,9 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path.rstrip("/") or "/"
         if method == "GET" and not path.startswith("/api/"):
             return self._static(path)
+        api_path = unquote(path)  # a PC's name may come percent-encoded (rmq queue --pc Пароварка)
         for m, rx, name in ROUTES:
-            match = rx.match(path)
+            match = rx.match(api_path)
             if m == method and match:
                 break
         else:
@@ -237,6 +238,10 @@ class Handler(BaseHTTPRequestHandler):
     @route("POST", r"/api/tasks/(\d+)/resume")
     def resume(self, ident, body, q, tid):
         return self.manager.resume_task(ident, int(tid))
+
+    @route("POST", r"/api/tasks/(\d+)/time")
+    def retime(self, ident, body, q, tid):
+        return self.manager.retime(ident, int(tid), body.get("time"))
 
     @route("POST", r"/api/tasks/(\d+)/priority")
     def priority(self, ident, body, q, tid):
@@ -411,27 +416,23 @@ class Handler(BaseHTTPRequestHandler):
 
     # one's other PCs, read-only: their tasks, load and charts on the "Сеть" tab
     @route("GET", r"/api/home/([\w.-]+)/state")
-    def home_state(self, ident, body, q, node):
-        self._admin(ident)
+    def home_state(self, ident, body, q, node):  # agents read it too (rmq queue/top --pc)
         net = self.manager.net
         return net.peek(net.find_home(node), "state")
 
     @route("GET", r"/api/home/([\w.-]+)/metrics")
-    def home_metrics(self, ident, body, q, node):
-        self._admin(ident)
+    def home_metrics(self, ident, body, q, node):  # agents read it too (rmq history --pc)
         net = self.manager.net
         return net.peek(net.find_home(node), "metrics", {"range": q.get("range", 900), "since": q.get("since", 0)})
 
     # tasks on one's other PCs: their card and log from any of one's PCs, actions only from the main one
     @route("GET", r"/api/home/([\w.-]+)/tasks/(\d+)")
-    def home_task(self, ident, body, q, node, tid):
-        self._admin(ident)
+    def home_task(self, ident, body, q, node, tid):  # agents read it too (rmq status --pc)
         net = self.manager.net
         return net.peek(net.find_home(node), f"tasks/{int(tid)}")
 
     @route("GET", r"/api/home/([\w.-]+)/tasks/(\d+)/log")
-    def home_task_log(self, ident, body, q, node, tid):
-        self._admin(ident)
+    def home_task_log(self, ident, body, q, node, tid):  # agents read it too (rmq logs --pc)
         net = self.manager.net
         return net.peek(net.find_home(node), f"tasks/{int(tid)}/log",
                         {"offset": self._int(q, "offset", 0), "limit": self._int(q, "limit", 65536)})
@@ -461,8 +462,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.manager.chronicle_for(q.get("pc"), max(0.04, min(30.0, days)))
 
     @route("GET", r"/api/stats/files/([\w.-]+)")
-    def stats_file(self, ident, body, q, name):
-        self._admin(ident)
+    def stats_file(self, ident, body, q, name):  # read-only, agents too (rmq stats --file, rmq past)
         path = self.manager.stats.file_path(name)
         if path is None:
             raise ApiError(404, "нет такого файла статистики")

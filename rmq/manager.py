@@ -17,12 +17,13 @@ import shutil
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
 import psutil
 
-from . import __version__, chronicle, planner, progress, texts, thermal, winapi
+from . import __version__, chronicle, planner, progress, swing, texts, thermal, winapi
 from .db import DB, FINAL_STATES
 from .games import GameDetector
 from .jobs import GB, TaskRuntime, Usage
@@ -89,6 +90,51 @@ def remote_end_time(st: dict, submitted_at: float | None, now: float) -> float:
     if isinstance(end, (int, float)) and (submitted_at or 0) <= end <= now + 300:  # clocks may differ a little
         return min(float(end), now)
     return now
+
+
+def command_key(text: str) -> str:
+    """A command with its numbers taken out: the runs of one script over parts or seeds count as the same."""
+    return re.sub(r"\d+(\.\d+)?", "#", " ".join((text or "").split()))
+
+
+def subprocess_list2cmdline(argv: list[str]) -> str:
+    import subprocess
+    return subprocess.list2cmdline(argv)
+
+
+def gb_text(v: float) -> str:
+    return f"{v:.1f} ГБ" if v >= 1 else f"{v * 1024:.0f} МБ"
+
+
+def progress_pace(hist: deque, run_s: float, res: dict) -> dict:
+    """A second estimate of the time left, from how fast the progress grew over the last ten minutes of work; and
+    whether it disagrees with the one from the share done (a progress that is counted wrong, or a slower phase)."""
+    pct = res["pct"]
+    if not hist or hist[-1][1] != pct:
+        hist.append((run_s, pct))
+    out: dict = {}
+    if pct >= 100:
+        return out
+    if run_s - hist[-1][0] >= 600:  # not a step forward in ten minutes of work
+        out["stalled_s"] = round(run_s - hist[-1][0])
+        return out
+    base = next((p for p in reversed(hist) if p[0] <= run_s - 600), hist[0])
+    span = run_s - base[0]
+    if len(hist) < 2 or span < 120 or pct <= base[1]:
+        return out
+    pace_eta = (100.0 - pct) * span / (pct - base[1])
+    out["eta_pace_s"] = round(pace_eta)
+    eta = res.get("eta_s")
+    if eta and (pace_eta > eta * 1.6 or pace_eta < eta / 1.6) and abs(pace_eta - eta) > 300:
+        out["eta_conflict"] = True
+    return out
+
+
+def after_failed(after_id: int, prev: dict | None) -> str:
+    if prev is None:
+        return f"задачи #{after_id}, после которой она должна была идти, больше нет"
+    return (f"задача #{after_id}, после которой она должна была идти, завершилась без успеха "
+            f"({texts.STATE_NAMES.get(prev['state'], prev['state'])})")
 
 
 def command_text(row: dict) -> str:
@@ -197,6 +243,12 @@ class Manager:
         self.drives = thermal.Drives()
         self.lhm = thermal.LhmCpu()
         self._cpu_read = (0.0, None)          # (when, CPU die temperature from LibreHardwareMonitor)
+        self._holds: dict[int, tuple] = {}    # queued tasks waiting for their series or the task they go after
+        self._swings: dict[int, dict | None] = {}  # running tasks whose CPU use goes up and down
+        self._swing_at = 0.0
+        self._cond: dict[int, dict] = {}       # what each task ran under (RMQ_CONDITIONS_FILE)
+        self._cond_written = 0.0
+        self._phist: dict[int, deque] = {}     # (running time, progress %) when the progress changed
         self.guard = thermal.ThermalGuard()
         self.regulator = thermal.HeatRegulator()
         self._heat_state = "normal"           # normal | warm (the regulator holds tasks back) | hot (frozen)
@@ -218,6 +270,8 @@ class Manager:
         self._metrics_path = home / "metrics.json.gz"
         last = self.metrics.load(self._metrics_path, time.time())
         self.metrics.seed(self.stats.minutes_since(max(last, time.time() - 86400) + 59), time.time())
+        if self.metrics.long_missing(time.time()):  # the month's charts: what is not in the cache, from data/stats
+            self.metrics.seed_long(self.stats.minutes_since(time.time() - self.metrics.long_s), time.time())
         self._metrics_saved = time.time()
         # the compute network: tasks other PCs run here live under LocalLow (they may write nowhere else)
         self.netstore = NetStore(home / "network.json")
@@ -272,6 +326,7 @@ class Manager:
         return row["id"]
 
     def start(self) -> None:
+        self._backfill_task_log()  # before any task can end and start the file itself
         with self.lock:
             self._adopt()
         self._thread = threading.Thread(target=self._loop, name="rmq-scheduler", daemon=True)
@@ -499,6 +554,10 @@ class Manager:
             agents_rows = {a["id"]: a for a in self.db.agents()}
             agents = {aid: planner.AgentView(aid, a["name"], a["weight"], a["max_running"], bool(a["enabled"]),
                                              self.agent_usage.get(aid, 0.0)) for aid, a in agents_rows.items()}
+            self._holds, doomed = self._task_holds(rows)
+            for row, why in doomed:
+                self._finalize(row, "cancelled", None, why)
+                rows.pop(row["id"], None)
             views = {tid: self._view(row, usage.get(tid), task_vram.get(tid, 0.0), now) for tid, row in rows.items()}
             disk_hold = self._disk_guard(now, rows, S)
             plan = planner.plan(planner.PlanInput(
@@ -565,6 +624,37 @@ class Manager:
                     if planner.is_overtime(v, pol):
                         d *= S["scheduler"]["overtime_usage_mult"]
                     self.agent_usage[v.agent_id] = self.agent_usage.get(v.agent_id, 0.0) + d * dt
+                # time a task ran on less CPU than it asked for (the owner's game, the regulator, sharing, the soft
+                # start): it does not count as running longer than declared
+                for tid, cap in plan.cpu_caps.items():
+                    v, lv = views.get(tid), self.live.get(tid)
+                    if v is None or lv is None or v.state != "running" or v.cpu <= 0:
+                        continue
+                    short = 1.0 - min(1.0, cap / v.cpu)
+                    if short > 0.02:
+                        lv["held_s"] = (lv.get("held_s") or 0.0) + short * dt
+                # what each task runs under, for timings it makes itself (RMQ_CONDITIONS_FILE)
+                n_running = sum(1 for v in views.values() if v.state == "running")
+                for tid, v in views.items():
+                    if v.state not in ("running", "suspended") or tid not in rows:
+                        continue
+                    c = self._conds(rows[tid])
+                    if v.state == "suspended":
+                        c["paused_s"] += dt
+                        continue
+                    if use_game_cores:
+                        c["ecores_s"] += dt
+                    if game_active:
+                        c["game_s"] += dt
+                    if factor < 0.99:
+                        c["throttled_s"] += dt
+                    if n_running > 1:
+                        c["shared_s"] += dt
+                        c["max_neighbours"] = max(c["max_neighbours"], n_running - 1)
+                    c["owner_core_s"] += cpu_user * dt
+                if now - self._cond_written >= 10:
+                    self._cond_written = now
+                    self._write_conditions(views, rows, now)
             self._flush()
             if now - self._metrics_saved >= 600:
                 self._metrics_saved = now
@@ -598,6 +688,10 @@ class Manager:
                           for tid, u in usage.items()},
             }
             self.metrics.add(now, mvals)
+            if now - self._swing_at >= 30:
+                self._swing_at = now
+                m = self.metrics.series(600)
+                self._swings = {tid: swing.from_metrics(m, tid, N) for tid, r in rows.items() if r["state"] == "running"}
             lim = self.regulator.limiting
             self.state = {
                 "now": now, "version": __version__, "mode": self.mode,
@@ -957,7 +1051,7 @@ class Manager:
         return nid
 
     def _submit_remote(self, agent, body, node, argv, command, cwd, cpu, ram, vram, time_s, time_limit_s, prio,
-                       preempt, warnings) -> dict:
+                       preempt, warnings, series=None, after_id=None) -> dict:
         cfg = self.settings.section("network")
         files = body.get("files") or None
         results = body.get("results") or None
@@ -986,7 +1080,7 @@ class Manager:
                 agent_id=agent["id"], name=name, argv=json.dumps(argv) if argv else None, command=command, cwd=cwd,
                 env=None, cpu=cpu, ram_gb=ram, vram_gb=vram, time_s=time_s, time_limit_s=time_limit_s, priority=prio,
                 preempt=preempt, state="remote", state_reason="net:staging", submitted_at=now, queued_since=now,
-                remote_node=node, remote_status=json.dumps({"phase_text": "готовим отправку"}, ensure_ascii=False),
+                series=series, after_id=after_id, remote_node=node, remote_status=json.dumps({"phase_text": "готовим отправку"}, ensure_ascii=False),
                 net_spec=json.dumps({"files": files, "results": results, "requirements": req, "env": extra,
                                      "agent": agent["name"], "net": self.net.channel(node)}, ensure_ascii=False))
             self.db.event("submit", f"Отправляется на ПК {where}: {name} ({len(listed)} файлов проекта)",
@@ -1000,15 +1094,38 @@ class Manager:
     def _remote_kind(row: dict) -> str:
         return json.loads(row["net_spec"] or "{}").get("net") or "ext"
 
-    def _cancel_remote(self, row: dict, why: str) -> None:
-        if row["remote_id"]:
-            self.net.pool.submit(self._send_cancel, row["remote_node"], row["remote_id"], self._remote_kind(row))
+    def _cancel_remote(self, row: dict, why: str, fetch: bool = True) -> bool:
+        """Cancel a task sent to another PC. While that PC answers, the task ends there first and what it made so
+        far comes back with its log (a checkpoint may be among it); otherwise it ends here at once and its files
+        stay there. True: it is being cancelled there (still "remote" for now)."""
+        node, rid = row["remote_node"], row["remote_id"]
+        if rid and fetch and self.net.online(node):
+            self.db.task_update(row["id"], state_reason="net:cancelling")
+            self.net_remote_update(row["id"], {"phase_text": f"отменяется ({why}): заберём то, что она успела сделать",
+                                                "cancel_why": why, "cancel_at": time.time()})
+            self.net.pool.submit(self._send_cancel, node, rid, self._remote_kind(row), row["id"])
+            return True
+        if rid:
+            self.net.pool.submit(self._send_cancel, node, rid, self._remote_kind(row))
         self._finalize(row, "cancelled", None, why)
+        return False
 
-    def _send_cancel(self, node: str, rid: int, kind: str = "ext") -> None:
+    def net_cancel_gave_up(self, tid: int) -> None:
+        """The other PC did not confirm the cancel: the task ends here; its files stay there."""
+        with self.lock:
+            row = self.db.task(tid)
+            if not row or row["state"] != "remote":
+                return
+            rs = json.loads(row["remote_status"] or "{}")
+            self._finalize(row, "cancelled", None, f"{rs.get('cancel_why') or 'отменена'}; что она успела сделать, "
+                                                   f"осталось на ПК {self.net.node_name(row['remote_node'])}")
+
+    def _send_cancel(self, node: str, rid: int, kind: str = "ext", tid: int | None = None) -> None:
         try:
             self.net.call(node, "POST", f"/net/v1/tasks/{rid}/cancel", {}, kind=kind, timeout=10)
         except PeerError as e:
+            if tid is not None:  # nothing will come back: end it here
+                self.net_cancel_gave_up(tid)
             if e.status != 404:
                 pending = json.loads(self.db.kv_get("net_pending_cancels") or "[]")
                 if [node, rid, kind] not in pending:
@@ -1075,13 +1192,16 @@ class Manager:
             if not row or row["state"] != "remote":
                 return
             state = st.get("state") if st.get("state") in FINAL_STATES else "failed"
+            cancel_why = json.loads(row["remote_status"] or "{}").get("cancel_why")
             self.db.task_update(tid, run_s=float(st.get("run_s") or 0.0), peak_ram_gb=float(st.get("peak_ram") or 0.0),
                                 peak_vram_gb=float(st.get("peak_vram") or 0.0),
                                 remote_status=json.dumps({"remote": st}, ensure_ascii=False, default=str))
             row = self.db.task(tid)
             where = self.net.node_name(row["remote_node"])
             note = f"выполнена на ПК {where}; вернулось файлов: {nfiles} ({nbytes / 2**20:.1f} МБ) в {row['cwd']}"
-            if state != "done" and st.get("reason_text"):
+            if state == "cancelled" and cancel_why:
+                note = f"{cancel_why}; {note}"
+            elif state != "done" and st.get("reason_text"):
                 note = f"{st['reason_text']}; {note}"
             self._finalize(row, state, st.get("exit_code"), note,
                            when=remote_end_time(st, row["submitted_at"], time.time()))
@@ -1091,7 +1211,7 @@ class Manager:
         with self.lock:
             for row in self.db.tasks_remote():
                 if self._remote_kind(row) == kind:
-                    self._cancel_remote(row, why)
+                    self._cancel_remote(row, why, fetch=False)
             for row in self.db.tasks_active():
                 if self.hosted.get(row["id"]) == kind:
                     self._drop_runtime(row["id"], kill=True)
@@ -1238,7 +1358,7 @@ class Manager:
             d = self.task_json(row, agents)
         keep = ("id", "state", "state_text", "reason", "reason_text", "wait_text", "position", "run_s", "progress",
                 "used", "exit_code", "peak_ram", "peak_vram", "restarts", "cap_cores", "hung", "idle_s", "stopping",
-                "finished_at")
+                "finished_at", "started_at", "swing", "held_s", "conditions")
         out = {k: d.get(k) for k in keep}
         out["final"] = row["state"] in FINAL_STATES
         return out
@@ -1376,9 +1496,14 @@ class Manager:
             slept = (now - self._clock[0]) - (unbiased - self._clock[1])
             if slept > 5:
                 n = 0
+                span = (f"с {time.strftime('%d.%m %H:%M', time.localtime(now - slept))} "
+                        f"до {time.strftime('%H:%M', time.localtime(now))} ({texts.fmt_minutes(slept)})")
                 for row in self.db.tasks_active():
                     if row["state"] == "running" and row["last_start_at"]:
                         self.db.task_update(row["id"], last_start_at=row["last_start_at"] + slept)
+                        self.db.event("power", f"ПК спал {span}: это время в работу задачи не засчитано",
+                                      task_id=row["id"], agent_id=row["agent_id"])
+                        self._conds(row)["slept_s"] += slept
                         n += 1
                 self.db.event("power", f"ПК спал {texts.fmt_minutes(slept)}; это время не засчитано задачам ({n})")
         self._clock = (now, unbiased)
@@ -1411,7 +1536,67 @@ class Manager:
         lv = self.live.get(row["id"])
         if lv is None:
             lv = self.live[row["id"]] = {k: row[k] for k in ("peak_ram_gb", "peak_vram_gb", "uses_gpu")}
+            lv["held_s"] = row.get("held_s") or 0.0
+            lv["cond"] = row.get("cond")
         return lv
+
+    COND_KEYS = ("paused_s", "slept_s", "ecores_s", "game_s", "throttled_s", "shared_s", "owner_core_s")
+
+    def _conds(self, row: dict) -> dict:
+        c = self._cond.get(row["id"])
+        if c is None:
+            c = self._cond[row["id"]] = self._cond_of(row)
+        return c
+
+    def _cond_of(self, row: dict) -> dict:
+        try:
+            c = json.loads(row.get("cond") or "{}")
+        except ValueError:
+            c = {}
+        for k in self.COND_KEYS:
+            c[k] = float(c.get(k) or 0.0)
+        c["max_neighbours"] = int(c.get("max_neighbours") or 0)
+        return c
+
+    def conditions(self, row: dict, now: float | None = None) -> dict:
+        """What the task ran under since it first started: the time it was frozen, the PC slept, it got less CPU
+        than it asked for, ran on the E-cores only (the owner's game), was held back by the temperature
+        regulator, ran next to other tasks. All zero ("clean") means its own timings are not disturbed."""
+        now = now or time.time()
+        c = self._cond.get(row["id"]) or self._cond_of(row)
+        lv = self.live.get(row["id"]) or {}
+        run_s = self.run_time(row, now)
+        end = row["finished_at"] or now
+        out = {"task": row["id"], "updated": round(now, 1), "run_s": round(run_s, 1),
+               "wall_s": round(end - row["started_at"], 1) if row["started_at"] else 0.0,
+               "held_s": round(lv.get("held_s") or row.get("held_s") or 0.0, 1),
+               **{k: round(c[k], 1) for k in self.COND_KEYS if k != "owner_core_s"},
+               "max_neighbours": c["max_neighbours"],
+               "owner_cpu_avg": round(c["owner_core_s"] / run_s, 2) if run_s > 0 else 0.0,
+               "cpu_claim": row["cpu"]}
+        out["clean"] = all(out[k] < 1 for k in ("paused_s", "slept_s", "held_s", "ecores_s", "throttled_s", "shared_s"))
+        return out
+
+    def _write_conditions(self, views: dict, rows: dict, now: float) -> None:
+        """Into each running task's RMQ_CONDITIONS_FILE (and saved with the task), every 10 s."""
+        for tid, v in views.items():
+            c, lv, row = self._cond.get(tid), self.live.get(tid), rows.get(tid)
+            if c is None or row is None:
+                continue
+            if lv is not None:
+                lv["cond"] = json.dumps(c)
+            if v.state != "running":
+                continue
+            path = self.task_dir(tid) / "conditions.json"
+            try:
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(self.conditions(row, now), ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp, path)
+            except OSError:
+                pass
+        for tid in [t for t in self._cond if t not in rows]:  # ended: saved with it already
+            self._cond.pop(tid, None)
+            self._phist.pop(tid, None)
 
     @staticmethod
     def run_time(row: dict, now: float) -> float:
@@ -1434,7 +1619,54 @@ class Manager:
             commit=u.private / GB if u else 0.0, resume_ram=row["resume_ram_gb"],
             peak_ram=lv["peak_ram_gb"], peak_vram=lv["peak_vram_gb"], uses_gpu=bool(lv["uses_gpu"]),
             stopping=self._stopping(row), stop_reason=row["state_reason"][9:] if self._stopping(row) else "",
-            stop_requested_at=(row["stop_requested_at"] or 0.0) if self._stopping(row) else None)
+            stop_requested_at=(row["stop_requested_at"] or 0.0) if self._stopping(row) else None,
+            held_s=lv.get("held_s") or 0.0, hold=self._holds.get(row["id"]) if row["state"] == "queued" else None)
+
+    def _task_holds(self, rows: dict[int, dict]) -> tuple[dict[int, tuple], list[tuple[dict, str]]]:
+        """Queued tasks that wait for their series (one task of a series at a time, oldest first) or for the task
+        they go after; and those that can never start (that task ended without success)."""
+        holds: dict[int, tuple] = {}
+        doomed: list[tuple[dict, str]] = []
+        first: dict[tuple, dict] = {}
+        for r in sorted([r for r in list(rows.values()) + self.db.tasks_remote() if r.get("series")],
+                        key=lambda r: r["id"]):
+            first.setdefault((r["agent_id"], r["series"]), r)
+        for r in rows.values():
+            if r["state"] != "queued":
+                continue
+            if r.get("after_id"):
+                p = self.db.task(r["after_id"])
+                if p is None or (p["state"] in FINAL_STATES and p["state"] != "done"):
+                    doomed.append((r, after_failed(r["after_id"], p)))
+                    continue
+                if p["state"] != "done":
+                    holds[r["id"]] = ("after", {"for": p["id"]})
+                    continue
+            if r.get("series"):
+                head = first.get((r["agent_id"], r["series"]))
+                if head and head["id"] != r["id"]:
+                    holds[r["id"]] = ("series", {"series": r["series"], "for": head["id"]})
+        return holds, doomed
+
+    def net_hold(self, row: dict) -> tuple[str, str] | None:
+        """For a task waiting to be sent to another PC: ("wait", why) while its series or the task it goes after
+        comes first, ("cancel", why) if it can never go; None to send it."""
+        if row.get("after_id"):
+            p = self.db.task(row["after_id"])
+            if p is None or (p["state"] in FINAL_STATES and p["state"] != "done"):
+                with self.lock:
+                    cur = self.db.task(row["id"])
+                    if cur and cur["state"] == "remote":
+                        self._finalize(cur, "cancelled", None, after_failed(row["after_id"], p))
+                return "cancel", ""
+            if p["state"] != "done":
+                return "wait", f"ждёт, пока успешно закончится задача #{p['id']}"
+        if row.get("series"):
+            older = [r["id"] for r in self.db.tasks_active() + self.db.tasks_remote()
+                     if r.get("series") == row["series"] and r["agent_id"] == row["agent_id"] and r["id"] < row["id"]]
+            if older:
+                return "wait", f"серия «{row['series']}»: ждёт, пока закончится задача #{min(older)}"
+        return None
 
     @staticmethod
     def _stopping(row: dict) -> bool:
@@ -1504,6 +1736,7 @@ class Manager:
         env.update({
             "RMQ_TASK_ID": str(row["id"]), "RMQ_TASK_DIR": str(tdir), "RMQ_RESTART_COUNT": str(row["restarts"]),
             "RMQ_PROGRESS_FILE": str(tdir / "progress.txt"), "RMQ_STOP_FILE": str(tdir / "stop"),
+            "RMQ_CONDITIONS_FILE": str(tdir / "conditions.json"),
             "RMQ_CPU": f"{row['cpu']:g}", "RMQ_RAM_GB": f"{row['ram_gb']:g}", "RMQ_VRAM_GB": f"{row['vram_gb']:g}",
             "RMQ_URL": f"http://{S['server']['host']}:{S['server']['port']}",
         })
@@ -1654,9 +1887,11 @@ class Manager:
         end = when or time.time()
         fields = dict(state=state, state_reason=note, exit_code=code, finished_at=end, suspended_pids=None,
                       run_s=self.run_time(row, end), stop_requested_at=None)
-        for k in ("peak_ram_gb", "peak_vram_gb", "uses_gpu"):
+        for k in ("peak_ram_gb", "peak_vram_gb", "uses_gpu", "held_s"):
             if k in lv:
                 fields[k] = lv[k]
+        if tid in self._cond:  # what it ran under, up to the last tick
+            fields["cond"] = json.dumps(self._cond[tid])
         self.db.task_update(tid, **fields)
         msg = {"done": "Завершена успешно", "failed": f"Завершилась с ошибкой (код {code})",
                "cancelled": "Отменена", "timeout": "Остановлена: превышен лимит времени",
@@ -1668,8 +1903,50 @@ class Manager:
             msg += f" · работала {texts.fmt_minutes(fields['run_s'])}" + (f", пик ОЗУ {peak:.1f} ГБ" if peak else "")
         self.db.event(state, msg, task_id=tid, agent_id=row["agent_id"])
         (self.task_dir(tid) / "stop").unlink(missing_ok=True)
-        kind = {"done": "tasks_done", "cancelled": "tasks_cancelled"}.get(state, "tasks_failed")
-        self.stats.count(kind, self._agent_name(row["agent_id"]))
+        if not (row["remote_node"] and self._remote_kind(row) == "home"):  # one's own PC counts it where it ran
+            kind = {"done": "tasks_done", "cancelled": "tasks_cancelled"}.get(state, "tasks_failed")
+            self.stats.count(kind, self._agent_name(row["agent_id"]))
+        final = self.db.task(tid)
+        if final:
+            self.stats.task_finished([self._task_record(final)])
+
+    def _task_record(self, r: dict) -> dict:
+        """The line of tasks.csv for a finished task."""
+        stamp = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) if t else ""
+        c = self._cond.get(r["id"]) or self._cond_of(r)
+        run = r["run_s"] or 0.0
+        here = not r["remote_node"]
+        started = r["started_at"]
+        if not here:
+            try:
+                started = (json.loads(r["remote_status"] or "{}").get("remote") or {}).get("started_at") or started
+            except ValueError:
+                pass
+        return {
+            "finished": stamp(r["finished_at"]), "id": r["id"], "agent": self._agent_name(r["agent_id"]),
+            "name": r["name"], "state": r["state"], "exit_code": r["exit_code"],
+            "pc": self.net.store.node_name if here else self.net.node_name(r["remote_node"]),
+            "from_pc": self.net.node_name(r["origin_node"]) if r["origin_node"] else "",
+            "submitted": stamp(r["submitted_at"]), "started": stamp(started),
+            "wait_min": (started - r["submitted_at"]) / 60 if started and r["submitted_at"] else None,
+            "run_min": run / 60, "cpu_claim": r["cpu"], "ram_claim_gb": r["ram_gb"], "vram_claim_gb": r["vram_gb"],
+            "time_claim_min": r["time_s"] / 60,
+            "cpu_avg_cores": r["cpu_s"] / run if here and run > 0 and r["cpu_s"] else None,
+            "peak_ram_gb": r["peak_ram_gb"], "peak_vram_gb": r["peak_vram_gb"], "restarts": r["restarts"],
+            "held_min": (r.get("held_s") or 0.0) / 60, "paused_min": c["paused_s"] / 60, "slept_min": c["slept_s"] / 60,
+            "ecores_min": c["ecores_s"] / 60, "throttled_min": c["throttled_s"] / 60, "shared_min": c["shared_s"] / 60,
+            "series": r.get("series") or "", "command": command_text(r),
+        }
+
+    def _backfill_task_log(self) -> None:
+        """tasks.csv started with this version: the tasks still in the manager go in first."""
+        if self.stats.tasks_path.exists():
+            return
+        rows = list(reversed(self.db.tasks_recent(1_000_000)))
+        try:
+            self.stats.task_finished([self._task_record(r) for r in rows])
+        except Exception:
+            log.exception("cannot fill tasks.csv")
 
     def _read_exit(self, tid: int) -> dict | None:
         path = self.task_dir(tid) / "exit.json"
@@ -1718,7 +1995,7 @@ class Manager:
             self.hosted.pop(tid, None)
         if old:
             self.db.tasks_delete(old)
-        self.db.events_prune(now - 30 * 86400)
+        self.db.events_prune(now - S["tasks"]["keep_finished_days"] * 86400)  # the journal: as long as the tasks
         keep = S["network"]["keep_results_h"] * 3600
         for row in self.db.tasks_hosted():  # results nobody came for
             if row["state"] in FINAL_STATES and (row["finished_at"] or now) < now - keep:
@@ -1820,10 +2097,27 @@ class Manager:
         if prio > agent["max_priority"]:
             warnings.append(f"приоритет понижен до {PRIORITY_NAMES[agent['max_priority']]} (лимит агента)")
             prio = agent["max_priority"]
+        warnings += self._claim_hints(agent, argv, command, cpu, ram, time_s)
+        series = str(body.get("series") or "").strip()[:60] or None
+        after_id = body.get("after")
+        if after_id in (None, "", 0):
+            after_id = None
+        else:
+            try:
+                after_id = int(after_id)
+            except (TypeError, ValueError):
+                raise ApiError(400, "after: номер задачи") from None
+            prev = self.db.task(after_id)
+            if prev is None:
+                raise ApiError(400, f"after: задачи #{after_id} нет")
+            if prev["state"] in FINAL_STATES and prev["state"] != "done":
+                raise ApiError(400, f"after: задача #{after_id} уже завершилась без успеха "
+                                    f"({texts.STATE_NAMES.get(prev['state'], prev['state'])})")
+        order = (f" · серия «{series}»" if series else "") + (f" · после #{after_id}" if after_id else "")
         node = self._place(body.get("where"), {"cpu": cpu, "ram": ram, "vram": vram})
         if node:
             return self._submit_remote(agent, body, node, argv, command, cwd, cpu, ram, vram, time_s, time_limit_s,
-                                       prio, preempt, warnings)
+                                       prio, preempt, warnings, series, after_id)
         with self.lock:
             if self.db.count_queued(agent["id"]) >= agent["max_queued"]:
                 raise ApiError(429, f"у агента уже {agent['max_queued']} задач в очереди (лимит)")
@@ -1836,8 +2130,8 @@ class Manager:
                 agent_id=agent["id"], name=name, argv=json.dumps(argv) if argv else None, command=command,
                 cwd=cwd, env=json.dumps(env) if env is not None else None, cpu=cpu, ram_gb=ram, vram_gb=vram,
                 time_s=time_s, time_limit_s=time_limit_s, priority=prio, preempt=preempt, state="queued",
-                submitted_at=now, queued_since=now)
-            self.db.event("submit", f"Поставлена в очередь: {_request_text(dict(cpu=cpu, ram_gb=ram, vram_gb=vram, time_s=time_s))}",
+                submitted_at=now, queued_since=now, series=series, after_id=after_id)
+            self.db.event("submit", f"Поставлена в очередь: {_request_text(dict(cpu=cpu, ram_gb=ram, vram_gb=vram, time_s=time_s))}{order}",
                           task_id=tid, agent_id=agent["id"])
         self.wake.set()
         return {"id": tid, "state": "queued", "warnings": warnings}
@@ -1846,7 +2140,9 @@ class Manager:
         with self.lock:
             row = self._task_for(ident, tid, write=True)
             if row["state"] == "remote":
-                self._cancel_remote(row, "отменена агентом" if not ident.admin else "отменена вручную")
+                if self._cancel_remote(row, "отменена агентом" if not ident.admin else "отменена вручную"):
+                    return {"id": tid, "state": "remote", "note": f"отменяется на ПК {self.net.node_name(row['remote_node'])}; "
+                                                                  "файлы, которые она успела создать, и её лог вернутся сюда"}
                 return {"id": tid, "state": "cancelled"}
             if row["state"] not in ("queued", "running", "suspended"):
                 raise ApiError(409, f"задача уже завершена ({texts.STATE_NAMES.get(row['state'])})")
@@ -1902,6 +2198,59 @@ class Manager:
             self.db.task_update(tid, priority=prio)
         self.wake.set()
         return {"id": tid, "priority": PRIORITY_NAMES[prio]}
+
+    def retime(self, ident: Identity, tid: int, value) -> dict:
+        """The expected duration corrected while the task waits or runs (it learns its real length only then).
+        Written to the journal, so the owner sees it."""
+        try:
+            time_s = parse_duration(value)
+        except (TypeError, ValueError) as e:
+            raise ApiError(400, str(e)) from e
+        if time_s <= 0:
+            raise ApiError(400, "time должно быть больше нуля")
+        with self.lock:
+            row = self._task_for(ident, tid, write=True)
+            if row["state"] not in ("queued", "running", "suspended"):
+                raise ApiError(409, "заявку времени можно поправить у задачи в очереди, на паузе или в работе на этом ПК")
+            old = row["time_s"]
+            self.db.task_update(tid, time_s=time_s)
+            self.db.event("retime", f"Заявка времени изменена: ~{texts.fmt_minutes(old)} → ~{texts.fmt_minutes(time_s)} "
+                                    f"({'вручную' if ident.admin else 'агентом'})", task_id=tid, agent_id=row["agent_id"])
+        self.wake.set()
+        return {"id": tid, "time_s": time_s, "old_time_s": old, "run_s": self.run_time(row, time.time())}
+
+    def _claim_hints(self, agent: dict, argv, command, cpu: float, ram: float, time_s: float) -> list[str]:
+        """What this agent's earlier runs of the same command (numbers aside) say about the request."""
+        key = command_key(subprocess_list2cmdline(argv) if argv else command)
+        past = [r for r in self.db.tasks_finished_by(agent["id"]) if command_key(command_text(r)) == key][:5]
+        if not past:
+            return []
+        n = len(past)
+        out = []
+        peak = max(r["peak_ram_gb"] or 0.0 for r in past)
+        if peak > 0.01:
+            if ram > max(peak * 3, peak + 0.5):
+                out.append(f"в прошлых запусках этой команды ({n}) пик ОЗУ был до {gb_text(peak)}, а заявлено "
+                           f"{ram:g} ГБ: с завышенной заявкой задача дольше ждёт память (хватит ~{max(0.1, peak * 1.2):.1f} ГБ)")
+            elif ram < peak * 0.85:
+                out.append(f"в прошлых запусках этой команды ({n}) пик ОЗУ был {gb_text(peak)} — больше заявки {ram:g} ГБ: "
+                           f"при нехватке памяти такую задачу заморозят первой")
+        done = [r for r in past if r["state"] == "done" and (r["run_s"] or 0) > 0]
+        if done:
+            runs = sorted(r["run_s"] for r in done)
+            med = runs[len(runs) // 2]
+            if time_s < med * 0.8:
+                out.append(f"в прошлых запусках она работала ~{texts.fmt_minutes(med)}, а заявлено ~{texts.fmt_minutes(time_s)}: "
+                           f"может стать сверхурочной (поправить на ходу: rmq retime)")
+            elif time_s > max(med * 3, med + 600):
+                out.append(f"в прошлых запусках она работала ~{texts.fmt_minutes(med)}, а заявлено ~{texts.fmt_minutes(time_s)}: "
+                           f"длинная заявка — меньше очков в очереди")
+            here = [r for r in done if not r["remote_node"] and (r["run_s"] or 0) > 60 and r["cpu_s"]]
+            if here:
+                avg = sum(r["cpu_s"] / r["run_s"] for r in here) / len(here)
+                if cpu > max(avg * 2, avg + 2):
+                    out.append(f"в прошлых запусках она занимала в среднем ~{avg:.1f} ядра из заявленных {cpu:g}")
+        return out
 
     def set_mode(self, mode: str) -> dict:
         if mode not in MODES:
@@ -2036,6 +2385,7 @@ class Manager:
         u = self.state.get("_usage", {}).get(tid)
         wait = plan.waiting.get(tid) if plan and row["state"] in ("queued", "suspended") else None
         run_s = self.run_time(row, time.time())
+        held_s = lv.get("held_s") or row.get("held_s") or 0.0
         d = {
             "id": tid, "agent": agents.get(row["agent_id"], {}).get("name", "?"), "agent_id": row["agent_id"],
             "name": row["name"], "command": command_text(row), "cwd": row["cwd"], "state": row["state"],
@@ -2049,8 +2399,13 @@ class Manager:
             "run_s": run_s, "restarts": row["restarts"], "exit_code": row["exit_code"],
             "peak_ram": max(row["peak_ram_gb"], lv.get("peak_ram_gb", 0.0)),
             "peak_vram": max(row["peak_vram_gb"], lv.get("peak_vram_gb", 0.0)),
-            "overtime": row["state"] in ("running", "suspended") and run_s > row["time_s"] * (
+            "held_s": held_s,
+            "overtime": row["state"] in ("running", "suspended") and run_s - held_s > row["time_s"] * (
                 1 + self.settings.section("scheduler")["overtime_grace_pct"] / 100),
+            "series": row.get("series"), "after_id": row.get("after_id"),
+            "swing": self._swings.get(tid) if row["state"] == "running" else None,
+            "cpu_s": row["cpu_s"],
+            "conditions": self.conditions(row) if row["started_at"] and not row["remote_node"] else None,
             "score": plan.scores.get(tid) if plan else None,
             "standing": plan.standing.get(tid) if plan and row["state"] == "running" else None,
             "position": wait.position if wait and wait.position else None,
@@ -2060,13 +2415,20 @@ class Manager:
             "progress": self._progress(tid, run_s) if row["state"] in ("running", "suspended") else None,
             "used": None,
         }
+        if wait and wait.reason == "no_fit" and "cpu" in (wait.detail or {}).get("lacking", []) \
+                and ((self.state.get("system") or {}).get("cpu") or {}).get("on_ecores"):
+            d["wait_text"] += (". Идёт игра владельца: задачам доступны только E-ядра, а их уже занимают работающие "
+                               "задачи — новая стартует, когда какая-то закончится или игра кончится")
         if row["state"] == "remote" or row["remote_node"]:
             rs = json.loads(row["remote_status"] or "{}")
             remote = rs.get("remote") or {}
             where = self.net.node_name(row["remote_node"])
             d["where"] = where
             d["remote"] = {k: remote.get(k) for k in ("state", "state_text", "reason_text", "wait_text", "position",
-                                                       "run_s", "progress", "used", "exit_code", "cap_cores", "hung")}
+                                                       "run_s", "progress", "used", "exit_code", "cap_cores", "hung",
+                                                       "started_at", "swing", "conditions")}
+            if remote.get("started_at"):  # when it really started there, not when it was sent
+                d["started_at"] = remote["started_at"]
             if row["state"] == "remote":
                 inner = remote.get("state_text") or "отправляется"
                 phase = rs.get("phase_text") or ""
@@ -2136,6 +2498,8 @@ class Manager:
             self._progress_cache[tid] = (key, res)
         if res and res["pct"] >= 1 and run_s >= 30:
             res = dict(res, eta_s=run_s * (100.0 - res["pct"]) / res["pct"])
+        if res:
+            res = dict(res, **progress_pace(self._phist.setdefault(tid, deque(maxlen=500)), run_s, res))
         return res
 
     def _log_size(self, tid: int) -> int:
@@ -2188,7 +2552,7 @@ class Manager:
 
     def metrics_view(self, rng: float, since: float) -> dict:
         """The chart series of the last `rng` seconds (newer than `since`) and the names of the tasks in them."""
-        res = self.metrics.series(max(10.0, min(86400.0, rng)), since)
+        res = self.metrics.series(max(10.0, min(30 * 86400.0, rng)), since)
         ids = {int(k) for row in res.get("tasks", []) for k in (row or {})}
         res["task_names"] = self.db.task_labels(ids)
         return res

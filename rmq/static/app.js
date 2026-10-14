@@ -153,15 +153,20 @@
     for (let v = 0; v <= max + 1e-9; v += step) out.push(+v.toFixed(6));
     return out;
   }
-  const TIME_STEPS = [15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600];
+  const TIME_STEPS = [15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 345600, 604800];
+  const dayLabel = (t) => new Date(t * 1000).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
   function xTicks(t0, t1, width) {
     const maxLabels = Math.max(2, Math.floor(width / 72));
-    const step = TIME_STEPS.find((s) => (t1 - t0) / s <= maxLabels) || 21600;
+    const step = TIME_STEPS.find((s) => (t1 - t0) / s <= maxLabels) || 604800;
     const off = -new Date().getTimezoneOffset() * 60;
     const out = [];
     for (let t = Math.ceil((t0 + off) / step) * step - off; t <= t1; t += step) out.push(t);
-    return { ticks: out, step };
+    // longer than a day: dates (and the hour, while the ticks are closer than a day)
+    const fmt = step >= 86400 ? dayLabel : t1 - t0 > 86400 ? (t) => `${dayLabel(t)} ${clock(t)}` : (t) => clock(t);
+    return { ticks: out, step, fmt };
   }
+  // the time of a point in tooltips and tables: with the date once the period is longer than a day
+  const tipTime = (t) => (RANGE > 86400 ? stamp(t) : clock(t, true));
   function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
   function rgba(hex, a) {
     const v = hex.replace('#', '');
@@ -363,7 +368,7 @@
       const f = this.def.fmt;
       this.tableEl.replaceChildren(h('table', null,
         h('thead', null, h('tr', null, h('th', null, `Время${smoothNote()}`), cols.map((c) => h('th', { class: 'num' }, c.label)))),
-        h('tbody', null, rows.map((i) => h('tr', null, h('td', { class: 'num' }, clock(m.t[i], true)),
+        h('tbody', null, rows.map((i) => h('tr', null, h('td', { class: 'num' }, tipTime(m.t[i])),
           cols.map((c) => h('td', { class: 'num' }, f(m[c.key][i]))))))));
     }
 
@@ -434,11 +439,12 @@
       // x labels
       c.textAlign = 'center';
       c.textBaseline = 'top';
-      for (const t of xTicks(g.t0, g.t1, g.pw).ticks) {
+      const xt = xTicks(g.t0, g.t1, g.pw);
+      for (const t of xt.ticks) {
         const x = g.X(t);
         if (x < g.pad.l + 14 || x > g.w - g.pad.r - 14) continue;
         c.fillStyle = col.muted;
-        c.fillText(clock(t), x, g.pad.t + g.ph + 6);
+        c.fillText(xt.fmt(t), x, g.pad.t + g.ph + 6);
       }
       if (!has) {
         c.fillStyle = col.muted;
@@ -514,7 +520,7 @@
         h('span', { class: `lk${dash ? ' dash' : ''}`, style: `border-top-color: var(${color})` }),
         h('b', null, val), h('span', null, label));
       tooltip.replaceChildren(
-        h('div', { class: 't' }, clock(m.t[i], true) + (m.game[i] > 0.5 ? ' · игровой режим' : '') + smoothNote()),
+        h('div', { class: 't' }, tipTime(m.t[i]) + (m.game[i] > 0.5 ? ' · игровой режим' : '') + smoothNote()),
         ...this.series().map((s) => row(f(m[s.key][i]), s.label, s.color, s.kind === 'dash')));
       placeTooltip(e);
     }
@@ -726,7 +732,7 @@
       const f = TASK_VIEWS[this.view].fmt;
       this.tableEl.replaceChildren(h('table', null,
         h('thead', null, h('tr', null, h('th', null, 'Время'), ser.map((s) => h('th', { class: 'num' }, s.label)))),
-        h('tbody', null, rowsI.map((i) => h('tr', null, h('td', { class: 'num' }, clock(m.t[i], true)),
+        h('tbody', null, rowsI.map((i) => h('tr', null, h('td', { class: 'num' }, tipTime(m.t[i])),
           ser.map((s) => h('td', { class: 'num' }, f(s.get(i)))))))));
     }
 
@@ -774,11 +780,12 @@
       }
       c.textAlign = 'center';
       c.textBaseline = 'top';
-      for (const t of xTicks(g.t0, g.t1, g.pw).ticks) {
+      const xt = xTicks(g.t0, g.t1, g.pw);
+      for (const t of xt.ticks) {
         const x = g.X(t);
         if (x < g.pad.l + 14 || x > g.w - g.pad.r - 14) continue;
         c.fillStyle = col.muted;
-        c.fillText(clock(t), x, g.pad.t + g.ph + 6);
+        c.fillText(xt.fmt(t), x, g.pad.t + g.ph + 6);
       }
       const m = this.src.metrics;
       this._pix = null;
@@ -889,7 +896,7 @@
         h('b', null, f(s.get(i))), h('span', null, s.agent ? `${s.label} · ${s.agent}` : s.label));
       const others = ser.slice().reverse().filter((s) => s !== hit && (s.id === 'user' || s.get(i) > 0.005));
       const shown = others.slice(0, 12);
-      tooltip.replaceChildren(h('div', { class: 't' }, clock(m.t[i], true) + smoothNote()),
+      tooltip.replaceChildren(h('div', { class: 't' }, tipTime(m.t[i]) + smoothNote()),
         hit ? h('div', { class: 'hit' }, row(hit)) : null,
         ...shown.map(row),
         others.length > shown.length ? h('div', { class: 'r muted' }, `… и ещё ${others.length - shown.length}`) : null);
@@ -962,7 +969,7 @@
       for (let i = n - 1; i >= 0; i -= stride) rows.push(i);
       this.tableEl.replaceChildren(h('table', null,
         h('thead', null, h('tr', null, h('th', null, `Время${smoothNote()}`), h('th', { class: 'num' }, this.o.series), h('th', null, 'Режим'))),
-        h('tbody', null, rows.map((i) => h('tr', null, h('td', { class: 'num' }, clock(m.t[i], true)),
+        h('tbody', null, rows.map((i) => h('tr', null, h('td', { class: 'num' }, tipTime(m.t[i])),
           h('td', { class: 'num' }, v[i] == null ? '–' : this.o.fmt(v[i])),
           h('td', null, HEAT_NAMES[Math.round(m.heat[i] || 0)] || ''))))));
     }
@@ -1032,11 +1039,12 @@
       }
       c.textAlign = 'center';
       c.textBaseline = 'top';
-      for (const t of xTicks(g.t0, g.t1, g.pw).ticks) {
+      const xt = xTicks(g.t0, g.t1, g.pw);
+      for (const t of xt.ticks) {
         const x = g.X(t);
         if (x < g.pad.l + 14 || x > g.w - g.pad.r - 14) continue;
         c.fillStyle = col.muted;
-        c.fillText(clock(t), x, g.pad.t + g.ph + 6);
+        c.fillText(xt.fmt(t), x, g.pad.t + g.ph + 6);
       }
       for (const r of this.o.refs()) {
         const y = Math.round(g.Y(r.v)) + 0.5;
@@ -1086,7 +1094,7 @@
       this.drawHover();
       const v = this._v;
       tooltip.replaceChildren(
-        h('div', { class: 't' }, clock(m.t[i], true) + smoothNote()),
+        h('div', { class: 't' }, tipTime(m.t[i]) + smoothNote()),
         h('div', { class: 'r' }, h('span', { class: 'lk', style: `border-top-color: var(${this.o.color})` }),
           h('b', null, v[i] == null ? '–' : this.o.fmt(v[i])), h('span', null, this.o.series)),
         h('div', { class: 'r' }, h('span', null, `режим: ${HEAT_NAMES[Math.round(m.heat[i] || 0)] || '–'}`)));
@@ -1463,6 +1471,7 @@
     const tags = [];
     if (t.used && t.used.ram > t.ram * 1.1 + 0.2) tags.push('сверх заявки ОЗУ');
     if (t.overtime) tags.push('дольше заявленного');
+    if (t.swing) tags.push(swingText(t.swing));
     if (t.stopping) tags.push('сохраняется перед остановкой');
     let why = t.state === 'suspended' ? t.reason_text + (t.wait_text && t.wait === 'no_fit' ? `. ${t.wait_text}` : '') : '';
     if (t.stopping) why = `${t.reason_text}. Остановится принудительно через ${dur(Math.ceil(t.stopping.left_s / 5) * 5)}, если не завершится сама`;
@@ -1472,14 +1481,33 @@
     fill(td, stateBadge(t), tags.map((x) => h('span', { class: 'tag warn' }, x)), why ? h('div', { class: 'why' }, why) : null);
   };
 
+  // what a task ran under, for timings it makes itself (the same as its RMQ_CONDITIONS_FILE)
+  function conditionsText(c) {
+    if (c.clean) return 'чистые: без пауз, сна, урезания процессора и соседних задач';
+    const parts = [[c.paused_s, 'на паузе'], [c.slept_s, 'ПК спал'], [c.held_s, 'урезанный процессор'],
+      [c.ecores_s, 'только E-ядра (игра)'], [c.throttled_s, 'регулятор температуры'],
+      [c.shared_s, `рядом другие задачи (до ${c.max_neighbours})`]];
+    const out = parts.filter(([v]) => (v || 0) >= 1).map(([v, label]) => `${label} ${dur(v)}`);
+    if ((c.owner_cpu_avg || 0) >= 0.5) out.push(`владелец занимал в среднем ${n1(c.owner_cpu_avg)} яд.`);
+    return out.join('; ') || 'чистые';
+  }
+
+  // a task whose CPU use goes up and down in waves (phases of waiting: checks, locks, disk or network)
+  function swingText(s) {
+    if (!s) return '';
+    const per = !s.period_s ? '' : s.period_s < 90 ? `, период ~${Math.round(s.period_s)} с` : `, период ~${n1(s.period_s / 60)} мин`;
+    return `колеблется ${n1(s.lo)}–${n1(s.hi)} яд.${per}`;
+  }
+
   function progressText(p) {
     const count = p.total ? `${nf2.format(p.done)}/${nf2.format(p.total)} · ` : '';
-    const eta = p.eta_s != null ? ` · ≈${dur(p.eta_s)}` : '';
+    const eta = p.eta_conflict ? ` · ≈${dur(p.eta_s)} по доле, ≈${dur(p.eta_pace_s)} по скорости`
+      : p.stalled_s ? ` · не меняется ${dur(p.stalled_s)}` : p.eta_s != null ? ` · ≈${dur(p.eta_s)}` : '';
     return `${count}${n1(p.pct)}%${eta}`;
   }
   const progressCell = (td, t) => {
     const p = t.progress;
-    const sig = p ? `${p.pct}|${p.done}|${p.eta_s != null ? Math.round(p.eta_s / 10) : ''}|${p.note}` : '';
+    const sig = p ? `${p.pct}|${p.done}|${p.eta_s != null ? Math.round(p.eta_s / 10) : ''}|${p.note}|${p.eta_conflict ? Math.round(p.eta_pace_s / 10) : ''}|${p.stalled_s ? Math.round(p.stalled_s / 60) : ''}` : '';
     if (td._sig === sig) return;
     td._sig = sig;
     if (!p) { fill(td, h('span', { class: 'muted small', title: 'Задача не сообщает прогресс (tqdm или RMQ_PROGRESS_FILE)' }, '—')); return; }
@@ -1810,6 +1838,7 @@
     }],
     scheduler: ['Очередь и честное деление', {
       tick_s: 'Шаг планировщика, сек', cpu_squeeze_pct: 'На сколько % можно ужать процессор работающих задач, чтобы запустить новую', settle_s: 'Пауза после вытеснения, сек',
+      ramp_s: 'Плавный старт: за сколько секунд процессор новой задачи растёт до заявки (0 — сразу)', ramp_start_pct: 'Плавный старт: с какой доли заявки, %',
       short_task_max_min: 'Короткая задача — до, мин', preempt_after_short_min: 'Короткая задача может вытеснить «захватчика» через, мин',
       preempt_after_min: 'Обычная задача может вытеснить через, мин', min_slice_min: 'Защита после запуска/возобновления, мин',
       reservation_after_min: 'Резервировать ресурсы для первой в очереди через, мин',
@@ -1824,7 +1853,7 @@
       default_cpu: 'CPU, ядер', default_ram_gb: 'ОЗУ, ГБ', default_vram_gb: 'VRAM, ГБ', default_time: 'Ожидаемое время',
       default_priority: 'Приоритет', default_preempt: 'Вытеснение (suspend/requeue)', set_thread_env: 'Ставить OMP_NUM_THREADS и т.п. = заявленным ядрам',
       low_io_priority: 'Самый низкий приоритет диска для задач (ваши программы читают и пишут первыми)',
-      log_max_mb: 'Размер лога, МБ', keep_finished_days: 'Хранить завершённые, дней', orphan_grace_s: 'Добивать оставшиеся процессы через, сек',
+      log_max_mb: 'Размер лога, МБ', keep_finished_days: 'Хранить завершённые задачи с логами и журнал событий, дней', orphan_grace_s: 'Добивать оставшиеся процессы через, сек',
       stop_grace_s: 'Мягкая остановка: сколько секунд задача с --preempt requeue может сохранять чекпоинт (0 — останавливать сразу)',
       hung_after_min: 'Замораживать задачу как «зависшую» через, мин без признаков работы (0 — не замораживать)',
     }],
@@ -1913,6 +1942,7 @@
       li('Заявка.', 'Каждая задача заявляет ядра, ОЗУ, VRAM и ожидаемое время. Старт — только если заявка помещается в свободную часть пула. CPU жёстко ограничен её долей пула; задаче без заявки VRAM видеокарта не видна. Перерасход ОЗУ виден в дашборде: такие задачи при нехватке останавливаются первыми, а при перезапуске ждут свой реальный пик.'),
       li('Порядок очереди — по очкам:', `очки = ${sc.w_priority} × приоритет (низкий 0, обычный 0,5, высокий 1) + ${sc.w_fairshare} × честная доля агента (1 — не пользовался ПК, меньше — пользовался много; половина «веса» уходит за ~${sc.usage_half_life_h} ч) + ${sc.w_age} × ожидание (линейно до 1 за ${sc.age_full_h} ч) + ${sc.w_short} × короткость (1 для ≤5 мин, 0 для ≥24 ч, логарифмически) + ${sc.w_started} уже начатым − ${sc.w_priority / 2} сверхурочным. Агентам доступны приоритеты низкий и обычный; высокий — только вам.`),
       li('Честное деление.', `Каждому агенту с задачами положена доля пула по весу (поровну по умолчанию, допуск ${sc.share_tolerance_pct} процентных пунктов). Доля считается по самому занятому ресурсу. Пока другой агент ждёт, агент сверх своей доли не может занимать ресурсы, нужные ждущему.`),
+      sc.ramp_s > 0 ? li('Плавный старт.', `Только что запущенная или возобновлённая задача получает сначала ${sc.ramp_start_pct}% заявленного процессора, и за ${sc.ramp_s} с доля плавно растёт до заявки: охлаждение успевает, температура не скачет. Время с урезанным процессором (плавный старт, игра, регулятор, деление между агентами) не считается работой «дольше заявленного».`) : null,
       li('Никто не держит всё сутками.', `Если задача ждёт дольше ${sc.preempt_after_short_min} мин (короткая, до ${sc.short_task_max_min} мин) или ${sc.preempt_after_min} мин (остальные), а место занято агентом сверх его доли или задачей, работающей дольше заявленного, такая задача замораживается (не убивается) и продолжит позже. Первые ${sc.min_slice_min} мин после запуска/возобновления задачу не трогают. Высокий приоритет защищает только задачу, которая укладывается в заявленное время.`),
       li('Большие задачи не голодают.', `Если первая в очереди задача ждёт дольше ${sc.reservation_after_min} мин, вперёд неё пускаются только задачи, которые по заявке успеют закончиться раньше, чем для неё освободится место. Если задача ждёт дольше ${sc.starvation_after_min} мин, она может вытеснять «захватчиков», даже если её агент при этом займёт больше своей доли.`),
       li('Время', `считается только тогда, когда задача реально работает (пауза не в счёт). Задача, работающая дольше заявленного (+${sc.overtime_grace_pct}%), — «сверхурочная»: у неё меньше очков, её проще вытеснить, а занятые ресурсы считаются агенту ×${sc.overtime_usage_mult}. Жёсткий --time-limit убивает задачу. Замороженные задачи возобновляются в порядке очков; прогресс и время работы сохраняются.`),
@@ -2079,7 +2109,10 @@
         t.idle_s != null ? ['Активность', t.hung
           ? `${dur(t.idle_s)} не грузит процессор, не пишет в лог и на диск, прогресс не меняется — возможно, зависла`
           : t.idle_s < 30 ? 'работает' : `последний признак работы ${dur(t.idle_s)} назад`] : null,
-        ['Время работы', `${dur(t.run_s)}${t.overtime ? ' — дольше заявленного' : ''}`],
+        ['Время работы', `${dur(t.run_s)}${t.overtime ? ' — дольше заявленного' : ''}${(t.held_s || 0) >= 60 ? `; из них ${dur(t.held_s)} с урезанным процессором — в сверхурочные не идёт` : ''}`],
+        t.series || t.after_id ? ['Порядок', [t.series ? `серия «${t.series}» — задачи серии идут по одной, по порядку` : '', t.after_id ? `после успешного окончания #${t.after_id}` : ''].filter(Boolean).join('; ')] : null,
+        t.conditions && t.state !== 'queued' ? ['Условия счёта', conditionsText(t.conditions)] : null,
+        t.swing ? ['Нагрузка', `${swingText(t.swing)} — похоже на фазы ожидания (проверка, синхронизация, диск или сеть): задача идёт дольше, чем могла бы`] : null,
         ['Поставлена', stamp(t.submitted_at)],
         t.started_at ? ['Запущена', stamp(t.started_at)] : null,
         t.finished_at ? ['Завершена', stamp(t.finished_at)] : null,
@@ -2118,6 +2151,7 @@
   const FILE_NOTES = {
     'hourly.csv': 'по часам: нагрузка, температуры, заморозки, диск, задачи',
     'agents_hourly.csv': 'по агентам и часам',
+    'tasks.csv': 'по каждой завершённой задаче: ожидание, время, заявка, сколько реально заняла, условия счёта',
     'README.txt': 'что означает каждая колонка',
   };
   const mins = (m) => {
@@ -3066,7 +3100,7 @@
     if (!CHRON) return;
     renderChronFacts(CHRON.tasks);
     chronCharts.forEach((c) => c.update());
-    setText($('#chron-note'), 'Собрано из журнала событий (он хранится 30 дней); обновляется раз в 30 секунд.');
+    setText($('#chron-note'), 'Собрано из журнала событий (он хранится 12 месяцев); обновляется раз в 30 секунд.');
   }
 
   async function loadChronicle() {
@@ -3401,7 +3435,7 @@
       this.thermal = h('div', { class: 'tiles' });
       const th = (t, cls) => h('th', { class: cls || null }, t);
       const table = (id, heads) => h('div', { class: 'tbl-wrap' }, h('table', { id }, h('thead', null, h('tr', null, heads)), h('tbody')));
-      const ranges = [[300, '5 мин'], [900, '15 мин'], [3600, '1 ч'], [21600, '6 ч'], [86400, '24 ч']];
+      const ranges = [[300, '5 мин'], [900, '15 мин'], [3600, '1 ч'], [21600, '6 ч'], [86400, '24 ч'], [604800, '7 дн'], [2592000, '30 дн']];
       this.body = h('div', { class: 'pc-body', hidden: true },
         h('div', { class: 'filters' }, h('span', { class: 'label' }, 'Период графиков'),
           h('div', { class: 'seg range-seg', role: 'group', 'aria-label': 'Период графиков' },

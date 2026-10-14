@@ -5,6 +5,8 @@ hourly.csv            one row per hour: how long tasks computed and what they us
                       task counts
 agents_hourly.csv     one row per agent and hour: what its tasks used
 minutes-YYYY-MM.csv   one row per minute: the dashboard's numbers, averaged (kept for a year)
+tasks.csv             one row per finished task: how long it waited and ran, its request, what it really used and
+                      what it ran under (kept for good; the task itself leaves the manager a year after it ends)
 current.json          the hour in progress, so a restart or a crash loses at most a minute of it
 README.txt            what the columns mean
 
@@ -52,6 +54,10 @@ _MINUTE_AVG = {"cpu_user_pct": "cpu_user", "cpu_tasks_pct": "cpu_tasks", "cpu_li
                "cpu_share_pct": "cpu_factor", "temp_cpu": "temp_cpu", "temp_board": "temp_board",
                "temp_gpu": "temp_gpu", "temp_ssd": "temp_ssd"}
 KEEP_MINUTES_MONTHS = 12
+TASKS = ["finished", "id", "agent", "name", "state", "exit_code", "pc", "from_pc", "submitted", "started", "wait_min",
+         "run_min", "cpu_claim", "ram_claim_gb", "vram_claim_gb", "time_claim_min", "cpu_avg_cores", "peak_ram_gb",
+         "peak_vram_gb", "restarts", "held_min", "paused_min", "slept_min", "ecores_min", "throttled_min", "shared_min",
+         "series", "command"]
 
 # summing, weighted-average, max and min columns, for combining hours into days and periods
 _SUM = {"observed_min", "compute_min", "tasks_cpu_core_h", "tasks_gpu_h", "gpu_busy_min", "disk_read_gb",
@@ -103,6 +109,14 @@ hourly.csv — по одной строке на час:
 
 agents_hourly.csv — по строке на агента и час: task_h (часы работы его задач, сумма по задачам), cpu_core_h, gpu_h,
   ram_gb_h (ГБ-часы памяти), disk_read_gb, disk_write_gb, started, done, failed, cancelled, requeued.
+
+tasks.csv — по строке на каждую завершённую задачу (хранится всегда; сама задача с логом уходит из менеджера через
+  12 месяцев после окончания): finished, id, agent, name, state (done/failed/cancelled/timeout/lost), exit_code,
+  pc (где выполнялась), from_pc (с какого ПК пришла), submitted, started, wait_min (ждала до старта), run_min,
+  заявка (cpu_claim, ram_claim_gb, vram_claim_gb, time_claim_min), cpu_avg_cores (сколько ядер занимала в среднем),
+  peak_ram_gb, peak_vram_gb, restarts, условия счёта в минутах: held_min (меньше заявленного процессора),
+  paused_min, slept_min (ПК спал), ecores_min (только E-ядра, игра), throttled_min (регулятор), shared_min (рядом
+  другие задачи); series, command.
 
 minutes-ГГГГ-ММ.csv — поминутно (хранятся 12 месяцев): средние значения графиков дашборда за минуту — нагрузка
   процессора (%), память и видеопамять (ГБ), видеокарта (%), число задач, доля игрового режима, доля процессора
@@ -238,6 +252,7 @@ class StatsBook:
         self.folder.mkdir(parents=True, exist_ok=True)
         self.hourly_path = folder / "hourly.csv"
         self.agents_path = folder / "agents_hourly.csv"
+        self.tasks_path = folder / "tasks.csv"
         self._lock = threading.Lock()
         self.hours: list[dict] = self._load(self.hourly_path)
         self.agent_hours: list[dict] = self._load(self.agents_path)
@@ -336,6 +351,16 @@ class StatsBook:
             log.warning("statistics not saved: %s", e)
 
     # ------------------------------------------------------------ input
+    def task_finished(self, rows: list[dict]) -> None:
+        """Lines of tasks.csv (the dates as text, the rest as numbers)."""
+        with self._lock:
+            try:
+                self._append(self.tasks_path, TASKS, rows, {"wait_min": 2, "run_min": 2, "time_claim_min": 1,
+                                                             "held_min": 1, "paused_min": 1, "slept_min": 1,
+                                                             "ecores_min": 1, "throttled_min": 1, "shared_min": 1})
+            except OSError as e:
+                self._io_failed(e)
+
     def count(self, kind: str, agent: str | None = None, n: int = 1) -> None:
         with self._lock:
             self.acc[kind] = self.acc.get(kind, 0) + n
@@ -543,7 +568,7 @@ class StatsBook:
 
     def file_path(self, name: str) -> Path | None:
         """A statistics file by its plain name (never a path outside the folder)."""
-        if not re.fullmatch(r"(hourly|agents_hourly|minutes-\d{4}-\d{2})\.csv|README\.txt", name):
+        if not re.fullmatch(r"(hourly|agents_hourly|tasks|minutes-\d{4}-\d{2})\.csv|README\.txt", name):
             return None
         p = self.folder / name
         return p if p.is_file() else None

@@ -73,10 +73,11 @@ def _prepare_venv(v, note, out):
 
 
 def _resolve(argv):
-    """Find argv[0] on the task's PATH (Windows would otherwise look next to this python.exe first)."""
+    """Find argv[0] on the task's PATH (Windows would otherwise look next to this python.exe first). A path with
+    folders counts from the task's folder: Windows does not even take ".venv/Scripts/python.exe" for a path."""
     exe = argv[0]
     if os.path.dirname(exe):
-        return argv
+        return [os.path.abspath(exe)] + argv[1:]
     found = shutil.which(exe, path=os.environ.get("PATH", ""))
     return [found] + argv[1:] if found else argv
 

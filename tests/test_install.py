@@ -120,3 +120,9 @@ def test_a_pythonw_that_got_a_console_leaves_it(tmp_path):
                        creationflags=subprocess.CREATE_NEW_CONSOLE, timeout=60)
     assert r.returncode == 0
     assert json.loads(out.read_text()) == [True, False, True]  # had a window, has none, streams as under pythonw
+
+
+def test_a_relative_program_path_counts_from_the_task_folder(tmp_path, monkeypatch):
+    from rmq.wrapper import _resolve
+    monkeypatch.chdir(tmp_path)  # the wrapper runs in the task's folder
+    assert _resolve([".venv/Scripts/python.exe", "sim.py"]) == [str(tmp_path / ".venv" / "Scripts" / "python.exe"), "sim.py"]

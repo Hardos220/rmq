@@ -79,4 +79,8 @@ def describe(code: str | None, detail: dict | None = None) -> str:
                 f"{detail.get('fair', 0):.0%}; сначала задача #{detail.get('for', '?')}")
     if code == "reserved":
         return f"Ресурсы копятся для давно ждущей задачи #{detail.get('for', '?')}"
+    if code == "series":
+        return f"Серия «{detail.get('series', '')}»: ждёт, пока закончится задача #{detail.get('for', '?')}"
+    if code == "after":
+        return f"Ждёт, пока успешно закончится задача #{detail.get('for', '?')}"
     return _REASONS.get(code, code)

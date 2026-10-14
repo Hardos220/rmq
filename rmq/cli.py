@@ -31,6 +31,10 @@ EPILOG = """\
   rmq logs 12 --tail 50
   rmq top                          (сколько ресурсов сейчас доступно задачам)
   rmq stats --period 24h           (статистика менеджера: нагрузка, задачи, температуры)
+  rmq history --task 12 --range 6h (сколько брала задача по времени и колебалась ли нагрузка)
+  rmq submit --series sweep ...    (задачи серии идут по одной, по порядку; --after 12 — после задачи 12)
+  rmq past --name sweep            (прошлые запуски: время, пик ОЗУ, ядра — чтобы точнее заявить следующий)
+  rmq retime 12 --time 5h          (поправить заявку времени задачи на ходу)
   rmq guide                        (полное руководство для ИИ-агентов)
 
 ключи не нужны: rmq сам определяет агента (rmq whoami).
@@ -218,6 +222,11 @@ def leave_stray_console() -> None:
             setattr(sys, name, None)  # as under a real pythonw.exe
 
 
+def swing_text(s: dict | None) -> str:
+    from .swing import describe
+    return describe(s)
+
+
 def err(text: str) -> None:
     print(f"[rmq] {text}", file=sys.stderr, flush=True)
 
@@ -254,7 +263,7 @@ def task_body(args) -> dict:
     if args.where:  # another PC of the network gets only what was asked for explicitly, never this environment
         body.update(where=args.where, env_extra=extra, files=args.files or None, results=args.results or None,
                     requirements=args.requirements)
-    for field in ("name", "cpu", "ram", "vram", "time", "time_limit", "priority", "preempt"):
+    for field in ("name", "cpu", "ram", "vram", "time", "time_limit", "priority", "preempt", "series", "after"):
         v = getattr(args, field)
         if v is not None:
             body[field] = v
@@ -290,16 +299,43 @@ def exit_code_of(t: dict) -> int:
     return 1
 
 
+def call_waiting(c: Client, path: str, deadline: float | None, told: list) -> dict:
+    """c.call GET, but while the manager does not answer (the PC slept, it is being restarted or updated) keep
+    trying until `deadline`; then the "not answering" error goes on."""
+    while True:
+        try:
+            return c.call("GET", path)
+        except CliError as e:
+            if e.code != EXIT_DOWN or (deadline is not None and time.monotonic() >= deadline):
+                raise
+            if not told:
+                err("менеджер ресурсов не отвечает (ПК спал или менеджер перезапускается) — жду дальше")
+                told.append(True)
+            time.sleep(5.0)
+
+
 def follow(c: Client, tid: int, *, stream_log: bool, timeout: float | None, quiet: bool = False) -> int:
-    """Wait for the task, optionally streaming its log; returns its exit code (124 on timeout)."""
+    """Wait for the task, optionally streaming its log; returns its exit code (124 on timeout). A manager that
+    stops answering for a while (sleep, restart) is waited for, too."""
     offset = 0
     last_status = None
     started = time.monotonic()
+    deadline = started + timeout if timeout is not None else None
+    told: list = []
+    seen = False
     while True:
-        t = c.call("GET", f"/api/tasks/{tid}")
+        try:
+            t = call_waiting(c, f"/api/tasks/{tid}", deadline, told)
+        except CliError as e:
+            if e.code != EXIT_DOWN or not seen:
+                raise
+            if not quiet:
+                err(f"#{tid}: менеджер так и не ответил; продолжить ожидание: rmq wait {tid}")
+            return EXIT_TIMEOUT
+        seen = True
         if stream_log:
             while True:
-                chunk = c.call("GET", f"/api/tasks/{tid}/log?offset={offset}&limit=262144")
+                chunk = call_waiting(c, f"/api/tasks/{tid}/log?offset={offset}&limit=262144", deadline, told)
                 if chunk["data"]:
                     sys.stdout.write(chunk["data"])
                     sys.stdout.flush()
@@ -361,29 +397,67 @@ def cmd_run(args) -> int:
 
 
 def cmd_wait(args) -> int:
-    return follow(Client(args.url), args.id, stream_log=args.log, timeout=args.timeout, quiet=args.quiet)
+    c = Client(args.url)
+    ids = list(dict.fromkeys(args.id))
+    if len(ids) == 1:
+        return follow(c, ids[0], stream_log=args.log, timeout=args.timeout, quiet=args.quiet)
+    return wait_all(c, ids, timeout=args.timeout, quiet=args.quiet)
+
+
+def wait_all(c: Client, ids: list[int], *, timeout: float | None, quiet: bool) -> int:
+    """Wait until every one of the tasks has ended: 0 if all succeeded, otherwise the code of the first one (in the
+    order given) that did not; 124 on timeout."""
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    left, codes, told, seen = list(ids), {}, [], False
+    while left:
+        for tid in list(left):
+            try:
+                t = call_waiting(c, f"/api/tasks/{tid}", deadline, told)
+            except CliError as e:
+                if e.code != EXIT_DOWN or not seen:
+                    raise
+                left_ids = " ".join(map(str, left))
+                if not quiet:
+                    err(f"менеджер так и не ответил; продолжить ожидание: rmq wait {left_ids}")
+                return EXIT_TIMEOUT
+            seen = True
+            if t["state"] in FINAL:
+                codes[tid] = exit_code_of(t)
+                left.remove(tid)
+                if not quiet:
+                    err(summary(t))
+        if not left:
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            if not quiet:
+                err(f"ещё не завершены: {', '.join(f'#{i}' for i in left)}; продолжить ожидание: "
+                    f"rmq wait {' '.join(map(str, left))}")
+            return EXIT_TIMEOUT
+        time.sleep(3.0)
+    return next((codes[i] for i in ids if codes[i]), 0)
 
 
 def cmd_logs(args) -> int:
     c = Client(args.url)
     tail_bytes = 1 << 20
+    task = pc_path(args, f"tasks/{args.id}")
     if args.follow:
-        t = c.call("GET", f"/api/tasks/{args.id}")
+        t = c.call("GET", task)
         offset = max(0, t.get("log_size", 0) - tail_bytes) if args.tail is not None else 0
         while True:
-            chunk = c.call("GET", f"/api/tasks/{args.id}/log?offset={offset}&limit=262144")
+            chunk = c.call("GET", f"{task}/log?offset={offset}&limit=262144")
             if chunk["data"]:
                 sys.stdout.write(chunk["data"])
                 sys.stdout.flush()
             offset = chunk["offset"]
             if not chunk["data"]:
-                t = c.call("GET", f"/api/tasks/{args.id}")
+                t = c.call("GET", task)
                 if t["state"] in FINAL:
                     err(summary(t))
                     return exit_code_of(t)
                 time.sleep(1.0)
     start = -tail_bytes if args.tail is not None else 0
-    chunk = c.call("GET", f"/api/tasks/{args.id}/log?offset={start}&limit=1048576")
+    chunk = c.call("GET", f"{task}/log?offset={start}&limit=1048576", timeout=60)
     text = chunk["data"]
     if args.tail is not None:
         text = "\n".join(text.splitlines()[-args.tail:]) + "\n"
@@ -454,7 +528,7 @@ def cmd_net(args) -> int:
 
 def cmd_cancel(args) -> int:
     r = Client(args.url).call("POST", f"/api/tasks/{args.id}/cancel")
-    err(f"задача #{r['id']} отменена")
+    err(f"задача #{r['id']}: {r['note']}" if r.get("note") else f"задача #{r['id']} отменена")
     return 0
 
 
@@ -468,7 +542,7 @@ def cmd_status(args) -> int:
     c = Client(args.url)
     if args.id is None:
         return cmd_queue(args)
-    t = c.call("GET", f"/api/tasks/{args.id}")
+    t = c.call("GET", pc_path(args, f"tasks/{args.id}"), timeout=60)
     if args.json:
         print(json.dumps(t, ensure_ascii=False, indent=2))
         return 0
@@ -488,17 +562,133 @@ def cmd_status(args) -> int:
         eta = f", осталось ~{fmt_dur(pr['eta_s'])}" if pr.get("eta_s") is not None else ""
         note = f" — {pr['note']}" if pr.get("note") else ""
         print(f"  прогресс: {count}{pr['pct']:g}%{eta}{note} (источник: {pr['source']})")
+        if pr.get("eta_conflict"):
+            print(f"  ВНИМАНИЕ: по скорости за последние 10 мин осталось ~{fmt_dur(pr['eta_pace_s'])}, а по доле "
+                  f"выполненного ~{fmt_dur(pr.get('eta_s'))} — оценки расходятся; проверь, как задача считает прогресс")
+        elif pr.get("stalled_s"):
+            print(f"  ВНИМАНИЕ: прогресс не менялся {fmt_dur(pr['stalled_s'])} работы")
+    order = [f"серия «{t['series']}»" if t.get("series") else "", f"после #{t['after_id']}" if t.get("after_id") else ""]
+    if any(order):
+        print("  порядок: " + ", ".join(x for x in order if x))
+    sw = t.get("swing") or (t.get("remote") or {}).get("swing")
+    if sw:
+        print(f"  нагрузка {swing_text(sw)} — так бывает, когда у задачи есть фазы ожидания (проверка, "
+              f"синхронизация, диск или сеть): она идёт дольше, чем могла бы на своих ядрах")
     if t.get("reason") == "hung" and t["state"] == "suspended":
         print(f"  что делать: посмотри rmq logs {t['id']}; продолжить — rmq resume {t['id']}, отменить — rmq cancel {t['id']}")
+    held = t.get("held_s") or 0
     print(f"  время работы: {fmt_dur(t['run_s'])}" + (" (дольше заявленного)" if t.get("overtime") else "")
+          + (f", из них {fmt_dur(held)} с урезанным процессором (в сверхурочные не идёт)" if held >= 60 else "")
           + (f", перезапусков: {t['restarts']}" if t.get("restarts") else ""))
+    cond = t.get("conditions") or (t.get("remote") or {}).get("conditions")
+    if cond:
+        print(f"  условия счёта: {conditions_text(cond)}")
+    if getattr(args, "events", False):
+        print("  события:")
+        for e in reversed(t.get("events") or []):
+            print(f"    {time.strftime('%d.%m %H:%M:%S', time.localtime(e['ts']))}  {e['message']}")
     if t["state"] in FINAL:
         print(f"  итог: {summary(t)}")
     return 0
 
 
+def conditions_text(c: dict) -> str:
+    """What the task ran under (for its own timings): "чистые" or what disturbed them."""
+    if c.get("clean"):
+        return "чистые: без пауз, сна, урезания процессора и соседних задач"
+    parts = [(c.get("paused_s"), "на паузе"), (c.get("slept_s"), "ПК спал"), (c.get("held_s"), "урезанный процессор"),
+             (c.get("ecores_s"), "только E-ядра (игра)"), (c.get("throttled_s"), "регулятор температуры"),
+             (c.get("shared_s"), f"рядом другие задачи (до {c.get('max_neighbours', 0)})")]
+    out = [f"{label} {fmt_dur(v)}" for v, label in parts if (v or 0) >= 1]
+    if (c.get("owner_cpu_avg") or 0) >= 0.5:
+        out.append(f"владелец занимал в среднем {c['owner_cpu_avg']:.1f} яд.")
+    return "; ".join(out) or "чистые"
+
+
+def cmd_retime(args) -> int:
+    r = Client(args.url).call("POST", f"/api/tasks/{args.id}/time", {"time": args.time})
+    err(f"задача #{r['id']}: заявка времени ~{fmt_dur(r['old_time_s'])} → ~{fmt_dur(r['time_s'])} "
+        f"(уже работает {fmt_dur(r['run_s'])})")
+    return 0
+
+
+def past_rows(c: Client, all_agents: bool) -> list[dict]:
+    """Finished tasks, newest first, from tasks.csv (kept for good); an older manager: from its 30-day list."""
+    import csv
+    import io
+    try:
+        text = c.call("GET", "/api/stats/files/tasks.csv", timeout=120, raw=True)
+    except CliError:
+        text = None
+    if text is None:
+        from urllib.parse import urlencode
+        r = c.call("GET", "/api/tasks?" + urlencode({"limit": 500, "mine": "0" if all_agents else "1"}), timeout=60)
+        return [t for t in r["tasks"] if t["state"] in FINAL]
+    me = None if all_agents else c.call("GET", "/api/whoami")["agent"]
+    num = lambda v: float(v) if v not in (None, "") else None
+    out = []
+    for row in csv.DictReader(io.StringIO(text.lstrip("\ufeff"))):
+        if me and row.get("agent") != me:
+            continue
+        run = (num(row.get("run_min")) or 0) * 60
+        out.append({"id": int(row["id"]), "name": row.get("name") or "", "command": row.get("command") or "",
+                    "state": row.get("state"), "state_text": STATE_TEXT.get(row.get("state"), row.get("state") or ""),
+                    "run_s": run, "time_s": (num(row.get("time_claim_min")) or 0) * 60,
+                    "peak_ram": num(row.get("peak_ram_gb")) or 0.0, "ram": num(row.get("ram_claim_gb")) or 0.0,
+                    "cpu": num(row.get("cpu_claim")) or 0.0, "cpu_avg": num(row.get("cpu_avg_cores")),
+                    "pc": row.get("pc"), "finished": row.get("finished"), "agent": row.get("agent"),
+                    "wait_s": (num(row.get("wait_min")) or 0) * 60})
+    return list(reversed(out))
+
+
+STATE_TEXT = {"done": "готово", "failed": "ошибка", "cancelled": "отменена", "timeout": "лимит времени",
+              "lost": "потеряна"}
+
+
+def cmd_past(args) -> int:
+    """Earlier runs - how long they took, their memory peak and cores - to size the next request."""
+    rows = past_rows(Client(args.url), args.all_agents)
+    if args.name:
+        rows = [t for t in rows if args.name.lower() in (t["name"] or "").lower()]
+    if args.command:
+        rows = [t for t in rows if args.command.lower() in (t["command"] or "").lower()]
+    rows = rows[:args.limit]
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("подходящих завершённых задач нет")
+        return 0
+    print(f"{'#':<6}{'задача':<28}{'итог':<12}{'работала':>10}{'заявка':>9}{'пик ОЗУ':>10}{'заявка':>8}"
+          f"{'ядер ср.':>10}{'заявка':>8}")
+    for t in rows:
+        run = t.get("run_s") or 0
+        cores = t.get("cpu_avg") if "cpu_avg" in t else (t.get("cpu_s") or 0) / run if run > 60 and t.get("cpu_s") else None
+        pr = t.get("peak_ram") or 0
+        peak = f"{pr:.1f} ГБ" if pr >= 1 else f"{pr * 1024:.0f} МБ"
+        print(f"#{t['id']:<5}{(t['name'] or '')[:27]:<28}{t['state_text'][:11]:<12}{fmt_dur(run):>10}{fmt_dur(t['time_s']):>9}"
+              f"{peak:>10}{t['ram']:>6g} ГБ{(f'{cores:.1f}' if cores is not None else '–'):>10}{t['cpu']:>8g}")
+    done = [t for t in rows if t["state"] == "done" and (t.get("run_s") or 0) > 0]
+    if done:
+        runs = sorted(t["run_s"] for t in done)
+        peak = max(t.get("peak_ram") or 0 for t in rows)
+        print(f"\nуспешных {len(done)} из {len(rows)}: работали ~{fmt_dur(runs[len(runs) // 2])} (медиана), "
+              f"пик ОЗУ до {peak:.2f} ГБ — заявляй ОЗУ с запасом ~20% к пику, время — с запасом ~30%")
+    return 0
+
+
+def pc_path(args, rest: str) -> str:
+    """An API path on this PC, or (--pc NAME) on another of the owner's PCs ("Мои ПК"), read-only."""
+    pc = getattr(args, "pc", None)
+    if not pc:
+        return f"/api/{rest}"
+    return f"/api/home/{quote(pc, safe='')}/{rest}"
+
+
 def cmd_queue(args) -> int:
-    st = Client(args.url).call("GET", "/api/state")
+    st = Client(args.url).call("GET", pc_path(args, "state"), timeout=60)
+    if getattr(args, "pc", None) and not getattr(args, "json", False):
+        print(f"ПК {args.pc}:")
     if getattr(args, "json", False):
         print(json.dumps({"tasks": st["tasks"]}, ensure_ascii=False, indent=2))
         return 0
@@ -510,18 +700,97 @@ def cmd_queue(args) -> int:
         extra = (f"CPU {used.get('cpu', 0):.1f}/{t['cpu']:g} ОЗУ {used.get('ram', 0):.1f}/{t['ram']:g}ГБ"
                  + (f" · {pr['pct']:g}%" if pr else "")
                  + (" · сохраняется перед остановкой" if t.get("stopping") else "")
+                 + (f" · {swing_text(t['swing'])}" if t.get("swing") else "")
                  if t["state"] == "running" else describe_wait(t))
         print(f"#{t['id']:<5} {t['state_text']:<12} {t['agent'][:24]:<24} {t['name'][:28]:<28} {extra}")
+    return 0
+
+
+def cmd_history(args) -> int:
+    """The load over time from the dashboard's charts: the whole PC, or one task (--task)."""
+    from .swing import from_metrics
+    from .util import parse_duration
+    try:
+        rng = max(60.0, min(30 * 86400.0, parse_duration(args.range)))
+    except ValueError as e:
+        raise CliError(f"--range: {e}") from None
+    c = Client(args.url)
+    m = c.call("GET", pc_path(args, f"metrics?range={rng:.0f}&since=0"), timeout=90)
+    if args.json:
+        print(json.dumps(m, ensure_ascii=False))
+        return 0
+    st = c.call("GET", pc_path(args, "state"), timeout=60)
+    n_cpu = st["system"]["cpu"]["n"]
+    ts = m.get("t") or []
+    if len(ts) < 2:
+        print("данных за этот срок пока нет")
+        return 0
+    key = str(args.task) if args.task else None
+    claim = None
+    if args.task:
+        try:
+            claim = c.call("GET", pc_path(args, f"tasks/{args.task}"))
+        except CliError:
+            claim = None
+    rows = max(2, min(96, args.rows))
+    span = (ts[-1] - ts[0]) / rows
+    where = f"ПК {args.pc}" if args.pc else "этот ПК"
+    head = f"задача #{args.task}" + (f" «{claim['name']}», заявка {claim['cpu']:g} яд." if claim else "") if key else "весь ПК"
+    print(f"{head}, {where}: последние {fmt_dur(ts[-1] - ts[0])}, отрезки по ~{fmt_dur(span)} (средние; °C — максимум)")
+    cols = "владелец CPU  задачи CPU  ОЗУ задач  CPU °C" + ("   задача: ядер сред/макс  ОЗУ, ГБ" if key else "")
+    print(f"{'время':<13}  {cols}  примечания")
+    avg = lambda xs: sum(xs) / len(xs) if xs else None
+    for k in range(rows):
+        lo, hi = ts[0] + k * span, ts[0] + (k + 1) * span
+        idx = [i for i, t in enumerate(ts) if lo <= t < hi or (k == rows - 1 and t == hi)]
+        if not idx:
+            continue
+        pick = lambda col: [m[col][i] for i in idx if m.get(col) and m[col][i] is not None]
+        user, tasks, ram = avg(pick("cpu_user")), avg(pick("cpu_tasks")), avg(pick("ram_tasks"))
+        temps = pick("temp_cpu")
+        notes = []
+        if (avg(pick("game")) or 0) > 0.5:
+            notes.append("игра")
+        heat = max(pick("heat") or [0])
+        if heat >= 2:
+            notes.append("перегрев — задачи стояли")
+        elif heat >= 1:
+            notes.append("регулятор урезал")
+        line = (f"{time.strftime('%H:%M', time.localtime(lo))}–{time.strftime('%H:%M', time.localtime(hi))}  "
+                f"{(user or 0):>11.0f}%  {(tasks or 0):>9.0f}%  {(ram or 0):>6.1f} ГБ  "
+                f"{(f'{max(temps):.0f}' if temps else '–'):>6}")
+        if key:
+            per = [(m["tasks"][i] or {}).get(key) for i in idx]
+            cores = [v[0] * n_cpu / 100 if v else 0.0 for v in per]
+            tram = [v[1] if v else 0.0 for v in per]
+            line += f"   {avg(cores):>11.1f} / {max(cores):<5.1f}  {max(tram):>7.1f}"
+        print(f"{line}  {', '.join(notes)}")
+    if key:
+        sw = from_metrics(m, args.task, n_cpu)
+        if sw:
+            print(f"\nза последние 10 мин нагрузка задачи {swing_text(sw)}: похоже на фазы ожидания "
+                  f"(проверка, синхронизация, диск или сеть)")
+        elif not any((r or {}).get(key) for r in m.get("tasks") or []):
+            print(f"\nзадача #{args.task} в этот срок не выполнялась" + (f" на {where}" if args.pc else ""))
     return 0
 
 
 def cmd_stats(args) -> int:
     """The manager's own statistics: what the tasks used, how they ended, temperatures, by day and by agent."""
     from urllib.parse import urlencode
+    c = Client(args.url)
+    if args.file:  # one of the CSV files as it is (this PC's)
+        sys.stdout.write(c.call("GET", f"/api/stats/files/{quote(args.file, safe='')}", timeout=120, raw=True))
+        return 0
     q = {"period": args.period}
     if args.pc:
         q["pc"] = args.pc
-    r = Client(args.url).call("GET", "/api/stats?" + urlencode(q), timeout=90)
+    r = c.call("GET", "/api/stats?" + urlencode(q), timeout=90)
+    if args.files:
+        print("файлы статистики этого ПК (прочитать: rmq stats --file ИМЯ > копия.csv):")
+        for f in r.get("files") or []:
+            print(f"  {f['name']:<24} {f['size'] / 1024:>9.0f} КБ")
+        return 0
     if args.json:
         print(json.dumps(r, ensure_ascii=False, indent=2))
         return 0
@@ -570,7 +839,9 @@ def cmd_stats(args) -> int:
 
 
 def cmd_top(args) -> int:
-    st = Client(args.url).call("GET", "/api/state")
+    st = Client(args.url).call("GET", pc_path(args, "state"), timeout=60)
+    if getattr(args, "pc", None) and not args.json:
+        print(f"ПК {args.pc}:")
     if args.json:
         print(json.dumps({k: st.get(k) for k in ("mode", "game", "gpu_busy", "system", "thermal", "disk")},
                          ensure_ascii=False, indent=2))
@@ -732,6 +1003,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="если ресурсы нужны владельцу: suspend — заморозить (по умолчанию), "
                              "requeue — остановить и перезапустить позже (для задач с чекпоинтами)")
         sp.add_argument("--name", help="короткое название задачи для дашборда")
+        sp.add_argument("--series", help="серия: из задач одной серии работает одна за раз, по порядку постановки")
+        sp.add_argument("--after", type=int, metavar="ID",
+                        help="запустить только после успешного окончания задачи ID (иначе эта будет отменена)")
         sp.add_argument("--cwd", help="рабочая папка (по умолчанию текущая)")
         sp.add_argument("--env", action="append", metavar="K=V", help="дополнительная переменная окружения")
         sp.add_argument("--no-env", action="store_true", help="не передавать своё окружение (PATH, conda, venv)")
@@ -758,8 +1032,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(fn=cmd_submit)
 
-    sp = sub.add_parser("wait", help="дождаться задачи (код выхода = код задачи, 124 = таймаут)")
-    sp.add_argument("id", type=int)
+    sp = sub.add_parser("wait", help="дождаться задачи или нескольких (код выхода = код задачи, 124 = таймаут)")
+    sp.add_argument("id", type=int, nargs="+", help="номер задачи; несколько — ждать, пока закончатся все")
+    sp.add_argument("--all", action="store_true", help="ждать все перечисленные задачи (так и по умолчанию)")
     sp.add_argument("--timeout", type=float, help="секунд; задача продолжит работу после таймаута")
     sp.add_argument("--log", action="store_true", help="печатать лог с начала")
     sp.add_argument("--quiet", action="store_true")
@@ -769,16 +1044,33 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("id", type=int)
     sp.add_argument("-f", "--follow", action="store_true", help="следить до завершения")
     sp.add_argument("--tail", type=int, help="последние N строк")
+    sp.add_argument("--pc", help="задача на другом ПК из «Моих ПК» владельца (номер — тамошний)")
     sp.set_defaults(fn=cmd_logs)
 
     sp = sub.add_parser("status", help="состояние задачи (без номера — вся очередь)")
     sp.add_argument("id", type=int, nargs="?")
     sp.add_argument("--json", action="store_true")
+    sp.add_argument("--pc", help="другой ПК из «Моих ПК» владельца (номер задачи — тамошний)")
+    sp.add_argument("--events", action="store_true", help="все события задачи: старт, паузы, перезапуски, сон ПК…")
     sp.set_defaults(fn=cmd_status)
 
     sp = sub.add_parser("queue", aliases=["ls"], help="очередь и выполняющиеся задачи всех агентов")
     sp.add_argument("--json", action="store_true")
+    sp.add_argument("--pc", help="очередь другого ПК из «Моих ПК» владельца (только чтение)")
     sp.set_defaults(fn=cmd_queue)
+
+    sp = sub.add_parser("retime", help="поправить заявку времени задачи на ходу (видно владельцу в журнале)")
+    sp.add_argument("id", type=int)
+    sp.add_argument("--time", required=True, help="новая ожидаемая длительность от старта: 30m, 2h, 1d")
+    sp.set_defaults(fn=cmd_retime)
+
+    sp = sub.add_parser("past", help="прошлые запуски: время, пик ОЗУ, ядра — чтобы точнее заявить следующий")
+    sp.add_argument("--name", help="часть названия задачи")
+    sp.add_argument("--command", help="часть команды")
+    sp.add_argument("--limit", type=int, default=20, help="сколько последних (по умолчанию 20; хранятся все)")
+    sp.add_argument("--all-agents", dest="all_agents", action="store_true", help="не только мои задачи")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(fn=cmd_past)
 
     sp = sub.add_parser("cancel", help="отменить свою задачу")
     sp.add_argument("id", type=int)
@@ -794,12 +1086,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("top", help="ресурсы ПК и сколько сейчас доступно задачам")
     sp.add_argument("--json", action="store_true")
+    sp.add_argument("--pc", help="другой ПК из «Моих ПК» владельца (только чтение)")
     sp.set_defaults(fn=cmd_top)
+
+    sp = sub.add_parser("history", help="нагрузка по времени: весь ПК или одна задача (--task), по данным графиков")
+    sp.add_argument("--range", default="1h", help="за какой срок: 15m, 1h, 6h, 24h, 7d, 30d (не больше месяца; "
+                                                  "по умолчанию 1h)")
+    sp.add_argument("--task", type=int, help="одна задача: сколько ядер и памяти она брала и колебалась ли нагрузка")
+    sp.add_argument("--pc", help="другой ПК из «Моих ПК» владельца")
+    sp.add_argument("--rows", type=int, default=12, help="на сколько отрезков разбить срок (по умолчанию 12)")
+    sp.add_argument("--json", action="store_true", help="точки графиков как есть")
+    sp.set_defaults(fn=cmd_history)
 
     sp = sub.add_parser("stats", help="статистика менеджера: нагрузка, задачи, температуры — по дням и по агентам")
     sp.add_argument("--period", choices=["24h", "7d", "30d", "all"], default="7d", help="за какой срок (по умолчанию 7d)")
     sp.add_argument("--pc", help="другой мой ПК по имени, или all — все мои ПК вместе")
     sp.add_argument("--json", action="store_true", help="всё как есть, в JSON")
+    sp.add_argument("--files", action="store_true", help="какие CSV-файлы статистики есть (по часам, по агентам, "
+                                                         "поминутно, по задачам)")
+    sp.add_argument("--file", metavar="ИМЯ", help="вывести CSV-файл статистики как есть, например tasks.csv")
     sp.set_defaults(fn=cmd_stats)
 
     sp = sub.add_parser("whoami", help="каким агентом тебя видит менеджер и твои лимиты")

@@ -1,11 +1,13 @@
-"""In-memory history for the charts: 1 s points for the last hour, 15 s averages for a day.
+"""In-memory history for the charts: 1 s points for the last hour, 15 s averages for a day, 5-minute averages
+for a month.
 
 Besides the fixed columns every point carries what each running task used then:
 {task id: [CPU % of the whole processor, RAM GB, VRAM GB, GPU %]}.
 
 The history outlives restarts and updates: the manager saves it (gzip JSON, a few hundred KB) on stop and every
 few minutes, and loads it on start. Without that file (after a crash) the day is rebuilt, coarser, from the
-per-minute statistics in data/stats."""
+per-minute statistics in data/stats; so is the month that is missing (e.g. before the month was kept at all),
+then without the tasks' shares, which those statistics do not have."""
 from __future__ import annotations
 
 import gzip
@@ -45,6 +47,11 @@ def _tasks(per: dict | None) -> dict:
     return {str(k): [round(float(x), 2) for x in v[:TASK_FIELDS]] for k, v in (per or {}).items()}
 
 
+def _avg_rows(rows: list[tuple]) -> tuple:
+    """Points averaged into one (the time too: the middle of them)."""
+    return tuple(_avg(r[i] for r in rows) for i in range(len(rows[0]) - 1)) + (_avg_tasks([r[-1] for r in rows]),)
+
+
 def _avg_tasks(rows: list[dict]) -> dict:
     """A task missing from a point used nothing then."""
     keys = {k for r in rows for k in r}
@@ -54,13 +61,17 @@ def _avg_tasks(rows: list[dict]) -> dict:
 
 
 class Metrics:
-    def __init__(self, fine_s: int = 3600, coarse_step: int = 15, coarse_s: int = 86400):
+    def __init__(self, fine_s: int = 3600, coarse_step: int = 15, coarse_s: int = 86400,
+                 long_step: int = 300, long_s: int = 30 * 86400):
         self._lock = threading.Lock()
         self.fine_s, self.coarse_s = fine_s, coarse_s
         self.coarse_step = coarse_step
+        self.long_step, self.long_s = long_step, long_s
         self._fine: deque[tuple] = deque(maxlen=fine_s)
         self._coarse: deque[tuple] = deque(maxlen=coarse_s // coarse_step)
+        self._long: deque[tuple] = deque(maxlen=long_s // long_step)
         self._acc: list[tuple] = []
+        self._acc_long: list[tuple] = []
         self._last_t = 0.0
 
     def add(self, t: float, values: dict) -> None:
@@ -72,16 +83,20 @@ class Metrics:
             self._fine.append(row)
             self._acc.append(row)
             if t - self._acc[0][0] >= self.coarse_step:
-                avg = tuple(_avg(r[i] for r in self._acc) for i in range(len(row) - 1)) + (
-                    _avg_tasks([r[-1] for r in self._acc]),)
+                avg = _avg_rows(self._acc)
                 self._coarse.append(avg)
                 self._acc = []
+                self._acc_long.append(avg)
+                if avg[0] - self._acc_long[0][0] >= self.long_step - self.coarse_step:
+                    self._long.append(_avg_rows(self._acc_long))
+                    self._acc_long = []
 
     # ------------------------------------------------------------ across restarts
     def save(self, path: Path) -> None:
         with self._lock:
             data = {"v": CACHE_VERSION, "columns": list(COLUMNS), "step": self.coarse_step,
-                    "fine": list(self._fine), "coarse": list(self._coarse)}
+                    "fine": list(self._fine), "coarse": list(self._coarse),
+                    "long_step": self.long_step, "long": list(self._long)}
         tmp = path.with_name(path.name + ".tmp")
         with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=6) as f:
             json.dump(data, f, separators=(",", ":"))
@@ -105,9 +120,12 @@ class Metrics:
 
         fine = [row(r) for r in data.get("fine") or [] if r and r[0] > now - self.fine_s]
         coarse = [row(r) for r in data.get("coarse") or [] if r and r[0] > now - self.coarse_s]
+        long = ([row(r) for r in data.get("long") or [] if r and r[0] > now - self.long_s]
+                if data.get("long_step") == self.long_step else [])
         with self._lock:
             self._fine.extend(fine)
             self._coarse.extend(coarse)
+            self._long.extend(long)
             last = max([r[0] for r in fine[-1:] + coarse[-1:]], default=0.0)
             self._last_t = max(self._last_t, last)
         return last
@@ -131,10 +149,37 @@ class Metrics:
                 self._last_t = max(self._last_t, (fine or coarse)[-1][0])
         return len(minutes)
 
+    def long_missing(self, now: float) -> bool:
+        """Whether the month's history lacks its beginning (more than an hour of it)."""
+        with self._lock:
+            return not self._long or self._long[0][0] > now - self.long_s + 3600
+
+    def seed_long(self, minutes: list[dict], now: float) -> int:
+        """The month before the first 5-minute point, from per-minute rows: their 5-minute averages (without the
+        tasks' shares, which the per-minute statistics do not keep)."""
+        with self._lock:
+            first = self._long[0][0] if self._long else now
+        buckets: dict[int, list[dict]] = {}
+        for m in minutes:
+            if now - self.long_s < m["t"] < first - self.long_step and m["t"] <= now - 60:
+                buckets.setdefault(int(m["t"] // self.long_step), []).append(m)
+        rows = [(round(b * self.long_step + self.long_step / 2, 2),)
+                + tuple(_avg(m.get(c) for m in buckets[b]) for c in COLUMNS) + ({},) for b in sorted(buckets)]
+        if rows:
+            with self._lock:
+                rest = list(self._long)
+                self._long.clear()
+                self._long.extend(rows + rest)
+        return len(rows)
+
     def series(self, range_s: float, since: float = 0.0) -> dict:
         with self._lock:
-            src = self._fine if range_s <= 3600 else self._coarse
-            step = 1 if range_s <= 3600 else self.coarse_step
+            if range_s <= 3600:
+                src, step = self._fine, 1
+            elif range_s <= self.coarse_s:
+                src, step = self._coarse, self.coarse_step
+            else:
+                src, step = self._long, self.long_step
             last = src[-1][0] if src else 0.0
             lo = max(since, last - range_s)
             rows = [r for r in src if r[0] > lo]

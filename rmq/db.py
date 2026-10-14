@@ -88,6 +88,7 @@ TASK_FIELDS = {
     "last_start_at", "finished_at", "run_s", "restarts", "job_name", "pid", "pid_ctime", "suspended_pids",
     "resume_ram_gb", "peak_ram_gb", "peak_vram_gb", "cpu_s", "uses_gpu", "stop_requested_at",
     "origin_node", "origin_task", "remote_node", "remote_id", "remote_status", "net_spec", "origin_net",
+    "held_s", "series", "after_id", "cond",
 }
 # columns added after the first release: (table, column, declaration)
 ADDED_COLUMNS = [("tasks", "stop_requested_at", "REAL"),
@@ -96,7 +97,13 @@ ADDED_COLUMNS = [("tasks", "stop_requested_at", "REAL"),
                  ("tasks", "remote_node", "TEXT"), ("tasks", "remote_id", "INTEGER"),
                  ("tasks", "remote_status", "TEXT"), ("tasks", "net_spec", "TEXT"),
                  # which network a hosted task came over: "home" (one's own PC) or "ext" (other people)
-                 ("tasks", "origin_net", "TEXT")]
+                 ("tasks", "origin_net", "TEXT"),
+                 # running time spent below the CPU it asked for (game, regulator, sharing): not its overtime
+                 ("tasks", "held_s", "REAL"),
+                 # one task of a series at a time; a task that starts only after another one succeeded
+                 ("tasks", "series", "TEXT"), ("tasks", "after_id", "INTEGER"),
+                 # what it ran under: pauses, sleep, E-cores only, the regulator, neighbours (JSON)
+                 ("tasks", "cond", "TEXT")]
 AGENT_FIELDS = {"name", "weight", "max_priority", "max_running", "max_queued", "usage", "enabled", "note"}
 
 
@@ -204,6 +211,11 @@ class DB:
     def tasks_recent(self, limit: int = 30) -> list[dict]:
         return self._all("SELECT * FROM tasks WHERE state NOT IN ('queued','running','suspended','remote')"
                          " ORDER BY finished_at DESC, id DESC LIMIT ?", (limit,))
+
+    def tasks_finished_by(self, agent_id: int, limit: int = 300) -> list[dict]:
+        """An agent's latest finished tasks (what its next request may learn from)."""
+        return self._all("SELECT * FROM tasks WHERE agent_id=? AND state IN ('done','failed','timeout','cancelled')"
+                         " ORDER BY finished_at DESC, id DESC LIMIT ?", (agent_id, limit))
 
     def tasks_remote(self) -> list[dict]:
         """Tasks this PC sent to other PCs of the network and still follows."""

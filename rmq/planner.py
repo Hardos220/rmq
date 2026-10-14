@@ -166,6 +166,8 @@ class TaskView:
     stopping: bool = False          # asked to save a checkpoint and exit; holds its resources until it does
     stop_reason: str = ""           # why it was asked: the reason of the requeue that follows
     stop_requested_at: float | None = None
+    held_s: float = 0.0             # running time it got less CPU than it asked for: not counted as overtime
+    hold: tuple | None = None       # (reason, detail) while it waits for its series or for another task
 
     @property
     def gpu(self) -> bool:
@@ -205,6 +207,9 @@ class Policy:
     w_age: float = 300.0
     w_short: float = 150.0
     w_started: float = 100.0
+    ramp_s: float = 0.0             # a started task's CPU grows to its claim over this time (0 = at once;
+                                    # the settings turn it on)
+    ramp_start: float = 0.3         # ... from this part of the claim
 
     @classmethod
     def from_settings(cls, s: dict) -> "Policy":
@@ -228,6 +233,7 @@ class Policy:
             stop_grace_s=s["tasks"]["stop_grace_s"],
             w_priority=sc["w_priority"], w_fairshare=sc["w_fairshare"], w_age=sc["w_age"],
             w_short=sc["w_short"], w_started=sc["w_started"],
+            ramp_s=max(0.0, float(sc.get("ramp_s", 90))), ramp_start=min(1.0, max(0.05, sc.get("ramp_start_pct", 30) / 100)),
         )
 
 
@@ -293,7 +299,8 @@ def short_factor(time_s: float) -> float:
 
 
 def is_overtime(t: TaskView, pol: Policy) -> bool:
-    return t.run_s > t.time_s * (1.0 + pol.overtime_grace)
+    """Running longer than declared - not counting the time it was given less CPU than it asked for."""
+    return t.run_s - t.held_s > t.time_s * (1.0 + pol.overtime_grace)
 
 
 def fairshare_factors(agents: dict[int, AgentView], demanding: set[int]) -> dict[int, float]:
@@ -604,6 +611,9 @@ def plan(inp: PlanInput) -> Plan:
     for t in candidates():
         if t.id in touched or (t.state == "suspended" and t.suspend_reason == "user"):
             continue
+        if t.state == "queued" and t.hold:  # its series or the task it goes after comes first
+            waits[t.id] = t.hold
+            continue
         ok, reason, detail = start_ok(t)
         if ok:
             admit(t)
@@ -669,7 +679,14 @@ def plan(inp: PlanInput) -> Plan:
     run = list(running.values())
     alloc = allocate_cpu(pools.cpu, run, weights)
     for t in run:
-        P.cpu_caps[t.id] = max(inp.capacity.cpu * 0.01, min(inp.capacity.cpu, alloc[t.id]))
+        cap = alloc[t.id]
+        # a soft start: the CPU of a task just started or resumed grows to its claim over a minute or two, so the
+        # cooling keeps up and the temperature regulator does not swing
+        since = now - t.last_start_at if t.last_start_at is not None else None
+        if pol.ramp_s > 0 and since is not None and 0 <= since < pol.ramp_s and t.state == "running":
+            frac = pol.ramp_start + (1.0 - pol.ramp_start) * since / pol.ramp_s
+            cap = min(cap, max(0.5, t.cpu * frac))
+        P.cpu_caps[t.id] = max(inp.capacity.cpu * 0.01, min(inp.capacity.cpu, cap))
 
     # where each running task stands against the waiting ones (the same rules as pick_victims)
     for t in running.values():

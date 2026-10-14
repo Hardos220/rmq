@@ -138,6 +138,8 @@ DEFAULTS: dict = {
         "w_age": 300.0,
         "w_short": 150.0,
         "w_started": 100.0,
+        "ramp_s": 90,                 # a started task's CPU grows to its claim over this time (0 = at once)
+        "ramp_start_pct": 30.0,       # ... starting from this part of its claim
     },
     "tasks": {
         "default_cpu": 1.0,
@@ -149,7 +151,7 @@ DEFAULTS: dict = {
         "set_thread_env": True,
         "low_io_priority": True,      # task processes get the lowest disk priority
         "log_max_mb": 256,
-        "keep_finished_days": 30,
+        "keep_finished_days": 365,    # finished tasks with their logs, and the journal of events
         "orphan_grace_s": 10,
         "stop_grace_s": 60,           # a --preempt requeue task may save a checkpoint this long (0 = stop at once)
         "hung_after_min": 30,         # no CPU, disk, log or progress activity this long freezes a task as hung (0 = never)

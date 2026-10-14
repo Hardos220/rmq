@@ -855,6 +855,11 @@ class NetService:
                 return
             phase = row["state_reason"] or "net:staging"
             if phase == "net:staging":
+                hold = self.m.net_hold(row)
+                if hold:
+                    if hold[0] == "wait":
+                        self.m.net_remote_update(tid, {"phase_text": hold[1]})
+                    return
                 self._send(row)
             else:
                 self._follow(row)
@@ -910,13 +915,19 @@ class NetService:
         if not rec or rec.get("left_at"):
             m.net_proxy_failed(tid, f"ПК {self.node_name(node)} вышел из сети")
             return
+        cancelling = row["state_reason"] == "net:cancelling"
         try:
             st = self.call(node, "GET", f"/net/v1/tasks/{rid}", kind=kind, timeout=10)
         except PeerError as e:
-            if e.status == 404:
+            rs = json.loads(row["remote_status"] or "{}")
+            if cancelling and (e.status == 404 or time.time() - (rs.get("cancel_at") or 0) > 600):
+                m.net_cancel_gave_up(tid)
+            elif e.status == 404:
                 m.net_proxy_failed(tid, f"на {self.node_name(node)} этой задачи больше нет")
             else:
                 m.net_remote_update(tid, {"phase_text": f"нет связи с {self.node_name(node)}"})
+            return
+        if cancelling and not st.get("final"):
             return
         m.net_remote_update(tid, {"remote": st, "phase_text": ""})
         if not st.get("final"):

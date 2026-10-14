@@ -440,3 +440,26 @@ def test_each_running_task_knows_whether_a_waiting_one_may_take_its_place():
     assert 4 not in st                                                      # only running tasks have a standing
     alone = run([task(5, agent=1, state="running", cpu=16, ram=16)])
     assert alone.standing[5]["kind"] == "fair"                              # nobody else wants the PC
+
+
+def test_a_started_task_gets_its_cpu_gradually():
+    from rmq.planner import Policy
+    pol = Policy(ramp_s=90, ramp_start=0.3)
+    p = run([task(1, state="running", cpu=8, last_start_at=NOW - 45)], policy=pol)
+    assert p.cpu_caps[1] == pytest.approx(8 * (0.3 + 0.7 * 0.5))      # halfway through the ramp
+    p = run([task(1, state="running", cpu=8, last_start_at=NOW - 600)], policy=pol)
+    assert p.cpu_caps[1] >= 8 - 1e-6                                  # after it: the whole claim
+
+
+def test_time_on_less_cpu_than_asked_is_not_overtime():
+    from rmq.planner import Policy, is_overtime
+    t = task(1, state="running", time_s=3600, run_s=5000)
+    assert is_overtime(t, Policy())
+    t.held_s = 2000           # e.g. on E-cores only while the owner played: not the task's fault
+    assert not is_overtime(t, Policy())
+
+
+def test_a_task_waits_for_its_series_and_for_the_task_it_goes_after():
+    p = run([task(1), task(2, hold=("series", {"series": "s", "for": 1})), task(3, hold=("after", {"for": 1}))])
+    assert {a.task_id for a in p.actions if a.kind == "start"} == {1}
+    assert p.waiting[2].reason == "series" and p.waiting[3].reason == "after"

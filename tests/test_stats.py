@@ -166,3 +166,28 @@ def test_reports_of_several_pcs_add_up():
     assert len(out["agents"]) == 1 and a["agent"] == "a" and a["cpu_core_h"] == 14 and a["task_h"] == 2
     assert [p["pc"] for p in out["per_pc"]] == ["Максим", "Пароварка"] and out["missing"] == ["Третий: не в сети"]
     assert out["files"] == []                          # the files stay on each PC
+
+
+def test_charts_keep_a_month_of_5_minute_averages(tmp_path):
+    import time as _t
+    from rmq.metrics import Metrics
+    m = Metrics(coarse_step=3, long_step=12)                   # small steps: four 3-s points make a 12-s one
+    for i in range(48):
+        m.add(1000.0 + i, {"cpu_tasks": 10.0 if i < 24 else 30.0, "tasks": {7: (40.0, 2.0, 0.0, 0.0)}})
+    month = m.series(7 * 86400)
+    assert month["step"] == 12 and len(month["t"]) == 3
+    assert month["cpu_tasks"][0] == 10.0 and month["cpu_tasks"][-1] == 30.0 and month["tasks"][0]["7"][0] == 40.0
+    assert m.series(86400)["step"] == 3 and m.series(3600)["step"] == 1   # the right tier for each period
+    now = _t.time()                                             # the month comes back after a restart
+    m2 = Metrics()
+    m2._long.extend([(now - 3000.0 + k * 300, *([1.0] * 21), {}) for k in range(3)])
+    m2.save(tmp_path / "m.json.gz")
+    again = Metrics()
+    again.load(tmp_path / "m.json.gz", now)
+    assert len(again.series(30 * 86400)["t"]) == 3
+    assert again.long_missing(now)                              # but its beginning is missing: rebuild it
+    minutes = [{"t": now - 20 * 86400 + k * 60, "cpu_user": 20.0} for k in range(10)]
+    n = again.seed_long(minutes, now)
+    s = again.series(30 * 86400)
+    assert n == len({int(x["t"] // 300) for x in minutes})        # 10 minutes: their 5-minute slots
+    assert len(s["t"]) == 3 + n and s["t"] == sorted(s["t"]) and s["cpu_user"][0] == 20.0

@@ -33,6 +33,7 @@ EDGES = [Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / 
          Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft/Edge/Application/msedge.exe"]
 NO_WINDOW = 0x08000000
 SLEEP = 'python -c "import time; time.sleep(900)"'
+FINAL = {"done", "failed", "cancelled", "timeout", "lost"}
 DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 results: list[tuple[bool, str, str]] = []
@@ -205,6 +206,97 @@ def network_checks(a: Instance, b: Instance, project: Path) -> None:
     check(b.label in r.get("asked", []), "«Обновить все мои ПК» доходит до Б", str(r))
 
 
+def order_checks(a: Instance, b: Instance, project: Path) -> None:
+    print("порядок задач, ожидание, отмена на другом ПК:")
+    task = lambda inst, tid: inst.ok("GET", f"/api/tasks/{tid}")
+    # a relative path to the program counts from the task's folder
+    rel = a.ok("POST", "/api/tasks", {"argv": ["scripts/hello.cmd"], "cpu": 0.1, "ram": 0.1, "time": "1m",
+                                      "cwd": str(project), "name": "отн-путь"})["id"]
+    done = wait_for(lambda: task(a, rel)["state"] in ("done", "failed"), 30)
+    check(done and task(a, rel)["state"] == "done" and (project / "out" / "rel.txt").exists(),
+          "относительный путь к программе (scripts/hello.cmd)", task(a, rel).get("reason_text", ""))
+
+    # a series: one task at a time, in order
+    s1 = a.ok("POST", "/api/tasks", {"command": SLEEP, "cpu": 0.1, "ram": 0.1, "time": "15m", "name": "серия-1",
+                                     "series": "e2e", "cwd": str(project)})["id"]
+    s2 = a.ok("POST", "/api/tasks", {"command": SLEEP, "cpu": 0.1, "ram": 0.1, "time": "15m", "name": "серия-2",
+                                     "series": "e2e", "cwd": str(project)})["id"]
+    ok = wait_for(lambda: task(a, s1)["state"] == "running" and task(a, s2)["wait"] == "series", 20)
+    check(ok, "серия: вторая задача ждёт первую", task(a, s2).get("wait_text", ""))
+    a.ok("POST", f"/api/tasks/{s1}/cancel", {})
+    check(wait_for(lambda: task(a, s2)["state"] == "running", 20), "серия: после первой запускается вторая")
+    a.ok("POST", f"/api/tasks/{s2}/cancel", {})
+
+    # "after": only after a success; after a failure the task is cancelled
+    q = a.ok("POST", "/api/tasks", {"argv": ["python", "-c", "print(1)"], "cpu": 0.1, "ram": 0.1, "time": "1m",
+                                    "cwd": str(project), "name": "до"})["id"]
+    d = a.ok("POST", "/api/tasks", {"argv": ["python", "-c", "print(2)"], "cpu": 0.1, "ram": 0.1, "time": "1m",
+                                    "cwd": str(project), "name": "после", "after": q})["id"]
+    f = a.ok("POST", "/api/tasks", {"argv": ["python", "-c", "import sys; sys.exit(3)"], "cpu": 0.1, "ram": 0.1,
+                                    "time": "1m", "cwd": str(project), "name": "неудача"})["id"]
+    d2 = a.ok("POST", "/api/tasks", {"argv": ["python", "-c", "print(3)"], "cpu": 0.1, "ram": 0.1, "time": "1m",
+                                     "cwd": str(project), "name": "после-неудачи", "after": f})["id"]
+    r = a.cli("wait", str(q), str(d), "--timeout", "60")
+    check(r.returncode == 0, "rmq wait двух задач: «после» дождалась «до»", r.stderr[-300:])
+    r = a.cli("wait", str(f), str(d2), "--timeout", "60")
+    check(r.returncode == 3 and task(a, d2)["state"] == "cancelled",
+          "после неудачной задачи зависимая отменяется, rmq wait возвращает код неудачной",
+          f"код {r.returncode}, {task(a, d2)['state']}")
+
+    # a request unlike earlier runs of the same command gets a hint
+    r = a.ok("POST", "/api/tasks", {"argv": ["python", "-c", "print(1)"], "cpu": 0.1, "ram": 4, "time": "1m",
+                                    "cwd": str(project), "name": "до-снова"})
+    check(any("пик ОЗУ" in w for w in r.get("warnings") or []), "подсказка заявки по прошлым запускам",
+          str(r.get("warnings")))
+    wait_for(lambda: task(a, r["id"])["state"] in FINAL, 30)
+    # the conditions a task runs under, and a corrected time request
+    sub = a.cli("submit", "--cpu", "0.1", "--ram", "0.1", "--time", "15m", "--name", "условия", "--",
+                "python", "-c", "import time; time.sleep(900)")  # an agent's own task: the agent may retime it
+    x = int(sub.stdout.strip() or 0)
+    check(wait_for(lambda: task(a, x)["state"] == "running", 20), "задача для условий запустилась")
+    rr = a.cli("retime", str(x), "--time", "2h")
+    check(rr.returncode == 0 and task(a, x)["time_s"] == 7200, "rmq retime", rr.stderr[-200:])
+    c = wait_for(lambda: next(a.home.glob(f"tasks/{x}/conditions.json"), None), 25)
+    check(c and "paused_s" in json.loads(c.read_text(encoding="utf-8")), "файл RMQ_CONDITIONS_FILE")
+    check("paused_s" in (task(a, x).get("conditions") or {}), "условия счёта в статусе задачи")
+    a.ok("POST", f"/api/tasks/{x}/cancel", {})
+
+    # cancelling a task on another PC brings back what it made so far
+    (project / "out" / "partial.txt").unlink(missing_ok=True)
+    rid = a.ok("POST", "/api/tasks", {"argv": ["python", "job2.py"], "cpu": 0.2, "ram": 0.2, "time": "10m",
+                                      "where": b.label, "cwd": str(project), "name": "отмена-там",
+                                      "files": ["job2.py"]})["id"]
+    started = wait_for(lambda: (task(a, rid).get("remote") or {}).get("state") == "running", 60, 2)
+    check(started and task(a, rid).get("started_at"), "у удалённой задачи настоящее время старта")
+    time.sleep(3)
+    r = a.ok("POST", f"/api/tasks/{rid}/cancel", {})
+    check(r.get("state") == "remote" and "вернутся" in (r.get("note") or ""), "отмена удалённой задачи: «отменяется»",
+          str(r))
+    done = wait_for(lambda: task(a, rid)["state"] == "cancelled", 60, 2)
+    check(done and (project / "out" / "partial.txt").exists(), "отменённая на Б задача вернула свои файлы",
+          task(a, rid).get("reason_text", ""))
+
+    # statistics files and the per-task log, readable by agents
+    r = a.cli("stats", "--files")
+    check(r.returncode == 0 and "tasks.csv" in r.stdout, "rmq stats --files", r.stderr[-200:])
+    r = a.cli("stats", "--file", "tasks.csv")
+    check(r.returncode == 0 and r.stdout.lstrip("﻿").startswith("finished,id,agent") and "отн-путь" in r.stdout,
+          "rmq stats --file tasks.csv", r.stderr[-200:])
+    r = a.cli("past", "--all-agents", "--limit", "50")
+    check(r.returncode == 0 and "отн-путь" in r.stdout and "медиана" in r.stdout, "rmq past по журналу задач",
+          r.stderr[-200:])
+    r = a.cli("status", str(rid), "--events")
+    check(r.returncode == 0 and "события:" in r.stdout, "rmq status --events", r.stderr[-200:])
+
+    # agents read the other PC: its queue, and the load over time
+    r = a.cli("queue", "--pc", b.label)
+    check(r.returncode == 0 and "сон-1" in r.stdout, "rmq queue --pc (очередь другого ПК)", r.stderr[-200:])
+    r = a.cli("history", "--range", "5m", "--rows", "3")
+    check(r.returncode == 0 and "владелец CPU" in r.stdout, "rmq history", r.stderr[-200:])
+    r = a.cli("history", "--range", "30d", "--rows", "4")
+    check(r.returncode == 0, "rmq history --range 30d (графики за месяц)", r.stderr[-200:])
+
+
 def dashboard_checks(a: Instance, base: Path) -> None:
     edge = next((p for p in EDGES if p.exists()), None)
     if edge is None:
@@ -248,6 +340,11 @@ def main() -> int:
     project.mkdir()
     (project / "job.py").write_text("import os\nos.makedirs('out', exist_ok=True)\n"
                                     "open('out/hello.txt', 'w', encoding='utf-8').write('привет с Б')\n", encoding="utf-8")
+    (project / "job2.py").write_text("import os, time\nos.makedirs('out', exist_ok=True)\n"
+                                     "open('out/partial.txt', 'w').write('half done')\ntime.sleep(600)\n", encoding="utf-8")
+    (project / "scripts").mkdir()
+    (project / "scripts" / "hello.cmd").write_text("@mkdir out 2>nul\r\n@echo relative ok> out\\rel.txt\r\n",
+                                                   encoding="ascii")
     print(f"папка теста: {base}")
     a = Instance("A", "Тест-А", args.port, 8781, base)
     b = Instance("B", "Тест-Б", args.port + 1, 8782, base)
@@ -256,6 +353,7 @@ def main() -> int:
             if not check(wait_for(inst.healthy, 40), f"менеджер {inst.label} запустился"):
                 raise RuntimeError(f"менеджер {inst.label} не запустился: {base / (inst.name + '.out')}")
         network_checks(a, b, project)
+        order_checks(a, b, project)
         dashboard_checks(a, base)
     except Exception as e:  # a check that could not even run
         check(False, "тест прервался", f"{type(e).__name__}: {e}")
