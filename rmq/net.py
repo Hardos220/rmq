@@ -289,6 +289,9 @@ class NetService:
                             "external": {"in": store.network is not None, "mode": store.mode,
                                          "network": store.network["name"] if store.network else None}}
             info["running"] = self.m.running_brief()
+            up = getattr(self.m, "updater", None)
+            if up is not None:
+                info["home"]["update"] = {k: up.status.get(k) for k in ("state", "latest", "checked_at")}
         return info
 
     def _home_meta(self) -> dict | None:
@@ -712,6 +715,26 @@ class NetService:
                         "at": lv.get("seen"), "known": "running" in info, "tasks": tasks})
         return out
 
+    def update_all(self) -> dict:
+        """The main PC asks each of its PCs to look for an update right now (each one installs it itself)."""
+        st = self.store
+        if not st.is_main:
+            raise NetError("обновлять другие ПК можно только с основного ПК", 403)
+        asked, failed = [], []
+        for nid, rec in st.active_members("home").items():
+            name = rec.get("name") or nid
+            if not self.online(nid):
+                failed.append(f"{name}: не в сети")
+                continue
+            try:
+                self.call(nid, "POST", "/net/v1/home/update", {}, kind="home", timeout=15)
+                asked.append(name)
+            except PeerError as e:
+                failed.append(f"{name}: " + ("менеджер старой версии — обновится сам, в течение нескольких часов"
+                                             if e.status == 404 else e.message))
+        self.m.check_updates_now()
+        return {"asked": asked, "failed": failed}
+
     def peek(self, nid: str, what: str, query: dict | None = None):
         """Read one of one's other PCs: its dashboard state or its charts. Any of one's PCs may look; only the
         main PC manages."""
@@ -1095,8 +1118,30 @@ class NetHandler(BaseHTTPRequestHandler):
             except ValueError:
                 raise NetError("range/since: числа") from None
             return self._json(200, m.metrics_view(rng, since))
+        if method == "GET" and rest == ["stats"]:
+            return self._json(200, m.get_stats(str(q.get("period") or "7d")))
+        if method == "GET" and rest == ["chronicle"]:
+            try:
+                days = float(q.get("days", 7))
+            except ValueError:
+                raise NetError("days: число") from None
+            return self._json(200, m.get_chronicle(max(0.04, min(30.0, days))))
+        task = int(rest[1]) if len(rest) >= 2 and rest[0] == "tasks" and rest[1].isdigit() else None
+        if method == "GET" and task is not None and len(rest) == 2:
+            return self._json(200, m.get_task(m.owner(), task))
+        if method == "GET" and task is not None and rest[2:] == ["log"]:
+            try:
+                offset, limit = int(q.get("offset", 0)), int(q.get("limit", 65536))
+            except ValueError:
+                raise NetError("offset/limit: целые числа") from None
+            return self._json(200, m.read_log(m.owner(), task, offset, limit))
         if node != (st.home or {}).get("main"):
             raise NetError("управлять этим ПК может только основной ПК", 403)
+        if method == "POST" and task is not None and len(rest) == 3 and rest[2] in ("suspend", "resume", "cancel"):
+            act = {"suspend": m.suspend_task, "resume": m.resume_task, "cancel": m.cancel}[rest[2]]
+            return self._json(200, act(m.owner(), task))
+        if rest == ["update"] and method == "POST":
+            return self._json(200, m.check_updates_now())
         if rest == ["settings"] and method == "GET":
             return self._json(200, m.settings_view())
         if rest == ["settings"] and method == "PATCH":

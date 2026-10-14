@@ -232,3 +232,12 @@ def test_the_main_page_shows_what_runs_on_ones_other_pcs(tmp_path):
     assert by["n-c"]["online"] and not by["n-c"]["known"]
     assert not by["n-d"]["online"] and by["n-d"]["tasks"] == []                  # nothing stale on the main page
     svc.pool.shutdown()
+
+
+def test_a_task_done_elsewhere_keeps_the_time_it_really_ended():
+    from rmq.manager import remote_end_time
+    now = 1_000_000.0
+    assert remote_end_time({"finished_at": now - 8 * 3600}, now - 9 * 3600, now) == now - 8 * 3600  # PC was off overnight
+    assert remote_end_time({}, now - 60, now) == now                     # an older version does not say
+    assert remote_end_time({"finished_at": now + 120}, now - 60, now) == now   # its clock is a bit ahead
+    assert remote_end_time({"finished_at": now - 7200}, now - 60, now) == now  # before it was even sent: wrong

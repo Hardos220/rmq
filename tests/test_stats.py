@@ -147,3 +147,22 @@ def test_chart_history_survives_a_restart_and_comes_back_from_minutes(tmp_path):
     assert max(late.series(3600)["t"]) <= now - 1
     late.add(now + 1, {"cpu_user": 6.0})                          # and new points come in right away
     assert late.series(3600)["cpu_user"][-1] == 6.0
+
+
+def test_reports_of_several_pcs_add_up():
+    from rmq.stats import combine_reports
+    def rep(core_h, done, cpu_max, pct, agent_h):
+        b = {"observed_min": 60, "tasks_cpu_core_h": core_h, "tasks_done": done, "cpu_max_c": cpu_max,
+             "tasks_cpu_pct": pct}
+        return {"period": "24h", "bucket": "day", "buckets": [{"key": "2026-10-14", "t": 1, "hours": 1, **b}],
+                "total": dict(b), "agents": [{"agent": "a", "cpu_core_h": agent_h, "task_h": 1}], "since": "2026-10-01",
+                "targets": {}, "hot": {}, "files": [{"name": "hourly.csv"}]}
+    out = combine_reports([("Максим", rep(10, 3, 70, 50, 10)), ("Пароварка", rep(4, 2, 90, 10, 4))], ["Третий: не в сети"])
+    t = out["total"]
+    assert t["tasks_cpu_core_h"] == 14 and t["tasks_done"] == 5 and t["cpu_max_c"] == 90   # sums and the hottest
+    assert t["tasks_cpu_pct"] == 30                    # an average weighted by the time each PC was watched
+    assert out["buckets"][0]["tasks_cpu_core_h"] == 14 and out["buckets"][0]["hours"] == 2
+    a = out["agents"][0]
+    assert len(out["agents"]) == 1 and a["agent"] == "a" and a["cpu_core_h"] == 14 and a["task_h"] == 2
+    assert [p["pc"] for p in out["per_pc"]] == ["Максим", "Пароварка"] and out["missing"] == ["Третий: не в сети"]
+    assert out["files"] == []                          # the files stay on each PC

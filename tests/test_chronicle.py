@@ -31,3 +31,20 @@ def test_a_task_with_a_pruned_log_falls_back_to_its_timestamps():
     assert segs == [[0, 20, "wait", ""], [20, 90, "run", ""]]
     segs, _ = segments({"submitted_at": 0, "started_at": None, "finished_at": None}, [], now=30)
     assert segs == [[0, 30, "wait", ""]]
+
+
+def test_chronicles_of_several_pcs_show_a_sent_task_once():
+    from rmq.chronicle import merge
+    seg = lambda a, b: [[a, b, "run"]]
+    here = {"from": 100, "to": 500, "days": 1, "agents": [{"id": 1, "name": "claude"}],
+            "tasks": [{"id": 7, "agent_id": 1, "segments": seg(200, 300), "where_node": "n-b"},     # sent to B
+                      {"id": 8, "agent_id": 1, "segments": seg(150, 250), "where_node": None}]}
+    there = {"from": 90, "to": 510, "days": 1, "agents": [{"id": 5, "name": "claude (Максим)"}, {"id": 6, "name": "claude"}],
+             "tasks": [{"id": 3, "agent_id": 5, "segments": seg(210, 300), "where_node": None},    # ran on B
+                       {"id": 4, "agent_id": 6, "segments": seg(400, 450), "where_node": None}]}
+    out = merge([("n-a", True, "Максим", here), ("n-b", False, "Пароварка", there)], [])
+    assert [(t["pc"], t["id"]) for t in out["tasks"]] == [("Пароварка", 4), ("Пароварка", 3), ("Максим", 8)]
+    assert {t["node"] for t in out["tasks"] if t["pc"] == "Максим"} == {None}       # this PC's open as before
+    names = {a["id"]: a["name"] for a in out["agents"]}
+    assert names[out["tasks"][0]["agent_id"]] == "claude" == names[out["tasks"][2]["agent_id"]]  # matched by name
+    assert out["from"] == 90 and out["to"] == 510

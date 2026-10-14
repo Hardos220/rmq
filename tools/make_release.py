@@ -22,6 +22,7 @@ FILES = ["rmq_cli.py", "requirements.txt", "install.cmd", "setup.cmd", "start.cm
 DIRS = ["rmq", "bin", "tools"]
 SKIP_DIRS = {"__pycache__", ".pytest_cache"}
 SKIP_SUFFIXES = {".pyc", ".pyo", ".log"}
+DEV_ONLY = {"tools/make_release.py", "tools/e2e_home.py"}  # the author's tools, not for an installation
 
 
 def package_value(name: str) -> str:
@@ -62,7 +63,8 @@ def members():
     for folder in DIRS:
         for path in sorted((ROOT / folder).rglob("*")):
             rel = path.relative_to(ROOT)
-            if path.is_file() and not SKIP_DIRS.intersection(rel.parts) and path.suffix not in SKIP_SUFFIXES:
+            if (path.is_file() and not SKIP_DIRS.intersection(rel.parts) and path.suffix not in SKIP_SUFFIXES
+                    and rel.as_posix() not in DEV_ONLY):
                 yield path
 
 

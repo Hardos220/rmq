@@ -30,6 +30,7 @@ EPILOG = """\
   rmq wait 12 --timeout 540        (код выхода = код задачи; 124 = ещё не закончилась)
   rmq logs 12 --tail 50
   rmq top                          (сколько ресурсов сейчас доступно задачам)
+  rmq stats --period 24h           (статистика менеджера: нагрузка, задачи, температуры)
   rmq guide                        (полное руководство для ИИ-агентов)
 
 ключи не нужны: rmq сам определяет агента (rmq whoami).
@@ -514,6 +515,60 @@ def cmd_queue(args) -> int:
     return 0
 
 
+def cmd_stats(args) -> int:
+    """The manager's own statistics: what the tasks used, how they ended, temperatures, by day and by agent."""
+    from urllib.parse import urlencode
+    q = {"period": args.period}
+    if args.pc:
+        q["pc"] = args.pc
+    r = Client(args.url).call("GET", "/api/stats?" + urlencode(q), timeout=90)
+    if args.json:
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return 0
+    num = lambda v, fmt=".1f": format(v or 0, fmt)
+    hours = lambda m: f"{(m or 0) / 60:.1f} ч"
+    period = {"24h": "24 часа", "7d": "7 дней", "30d": "30 дней", "all": "всё время"}[args.period]
+    where = ("все мои ПК: " + ", ".join(x["pc"] for x in r["per_pc"])) if r.get("per_pc") else f"ПК {r.get('pc') or '—'}"
+    t = r["total"]
+    print(f"статистика за {period} ({where}); ведётся с {r.get('since') or '—'}")
+    print(f"менеджер работал {hours(t['observed_min'])}, задачи выполнялись {hours(t['compute_min'])}")
+    print(f"задачи агентов: процессор {num(t['tasks_cpu_core_h'])} ядро-ч (в среднем {num(t['tasks_cpu_pct'], '.0f')}% "
+          f"процессора), видеокарта {num(t['tasks_gpu_h'])} ч, пик ОЗУ {num(t['tasks_ram_gb_max'])} ГБ")
+    print(f"задачи: запущено {num(t['tasks_started'], '.0f')}, готово {num(t['tasks_done'], '.0f')}, "
+          f"с ошибкой {num(t['tasks_failed'], '.0f')}, отменено {num(t['tasks_cancelled'], '.0f')}, "
+          f"перезапущено {num(t['tasks_requeued'], '.0f')}, зависали {num(t['hung_tasks'], '.0f')}")
+    temps = []
+    for c, name in (("cpu", "процессор"), ("gpu", "видеокарта"), ("board", "плата"), ("ssd", "SSD")):
+        if t.get(f"{c}_max_c") is not None:
+            load = t.get(f"{c}_load_avg_c")
+            temps.append(f"{name} до {t[f'{c}_max_c']:.0f}°C" + (f" (при расчётах в среднем {load:.0f}°C)" if load else ""))
+    if temps:
+        print("температура: " + "; ".join(temps))
+    print(f"ограничения: регулятор температуры {hours(t['regulator_min'])}, заморозка от перегрева "
+          f"{hours(t['heat_frozen_min'])}, от нехватки места {hours(t['disk_frozen_min'])}; "
+          f"игра владельца {hours(t['game_min'])}, пауза всех {hours(t['paused_min'])}")
+    if r.get("per_pc"):
+        print("\nпо ПК:")
+        for x in r["per_pc"]:
+            print(f"  {x['pc']:<18} процессор {num(x['tasks_cpu_core_h']):>7} ядро-ч, готово {num(x['tasks_done'], '.0f')}, "
+                  f"с ошибкой {num(x['tasks_failed'], '.0f')}"
+                  + (f", процессор до {x['cpu_max_c']:.0f}°C" if x.get("cpu_max_c") is not None else ""))
+    print(f"\nпо {'часам' if r['bucket'] == 'hour' else 'дням'} (только где менеджер работал):")
+    for b in r["buckets"]:
+        if b.get("observed_min"):
+            print(f"  {b['key']:<13} процессор {num(b['tasks_cpu_core_h']):>7} ядро-ч ({num(b['tasks_cpu_pct'], '.0f'):>3}%), "
+                  f"готово {num(b['tasks_done'], '.0f')}, с ошибкой {num(b['tasks_failed'], '.0f')}"
+                  + (f", процессор до {b['cpu_max_c']:.0f}°C" if b.get("cpu_max_c") is not None else ""))
+    if r.get("agents"):
+        print("\nпо агентам:")
+        for a in r["agents"]:
+            print(f"  {a['agent']:<44} процессор {num(a['cpu_core_h']):>7} ядро-ч, работа задач {num(a['task_h'])} ч, "
+                  f"готово {num(a['done'], '.0f')}, с ошибкой {num(a['failed'], '.0f')}")
+    for m in r.get("missing") or []:
+        err(f"не вошло: {m}")
+    return 0
+
+
 def cmd_top(args) -> int:
     st = Client(args.url).call("GET", "/api/state")
     if args.json:
@@ -740,6 +795,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("top", help="ресурсы ПК и сколько сейчас доступно задачам")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(fn=cmd_top)
+
+    sp = sub.add_parser("stats", help="статистика менеджера: нагрузка, задачи, температуры — по дням и по агентам")
+    sp.add_argument("--period", choices=["24h", "7d", "30d", "all"], default="7d", help="за какой срок (по умолчанию 7d)")
+    sp.add_argument("--pc", help="другой мой ПК по имени, или all — все мои ПК вместе")
+    sp.add_argument("--json", action="store_true", help="всё как есть, в JSON")
+    sp.set_defaults(fn=cmd_stats)
 
     sp = sub.add_parser("whoami", help="каким агентом тебя видит менеджер и твои лимиты")
     sp.set_defaults(fn=cmd_whoami)

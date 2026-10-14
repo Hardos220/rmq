@@ -241,6 +241,46 @@
     return cur;
   }
 
+  // ---------------------------------------------------------------- hover without redrawing the data
+  // The crosshair, the dots and a highlighted band live on a transparent canvas over the chart, so a mouse move
+  // redraws only them; the data is drawn again only when new data comes or the size changes. Pointer moves come
+  // faster than the screen refreshes: only the last one of each frame is handled.
+  function overlayOf(plot) {
+    const o = h('canvas', { class: 'hover-layer', 'aria-hidden': 'true' });
+    plot.append(o);
+    return o;
+  }
+  function overlayCtx(o, g) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.round(g.w * dpr); const ht = Math.round(g.ht * dpr);
+    if (o.width !== w || o.height !== ht) { o.width = w; o.height = ht; }
+    const c = o.getContext('2d');
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    c.clearRect(0, 0, g.w, g.ht);
+    return c;
+  }
+  function perFrame(fn) {
+    let last = null; let raf = 0;
+    return (e) => {
+      last = e;
+      if (!raf) raf = requestAnimationFrame(() => { raf = 0; fn(last); });
+    };
+  }
+  function nearestIndex(t, x) {
+    let lo = 0; let hi = t.length - 1;
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (t[mid] < x) lo = mid; else hi = mid; }
+    return Math.abs(t[lo] - x) < Math.abs(t[hi] - x) ? lo : hi;
+  }
+  function crosshair(c, g, x) {
+    c.strokeStyle = cssVar('--axis'); c.lineWidth = 1;
+    c.beginPath(); c.moveTo(x, g.pad.t); c.lineTo(x, g.pad.t + g.ph); c.stroke();
+  }
+  function ringDot(c, x, y, color) {
+    c.beginPath(); c.arc(x, y, 4, 0, Math.PI * 2);
+    c.fillStyle = color; c.fill();
+    c.lineWidth = 2; c.strokeStyle = cssVar('--surface'); c.stroke();
+  }
+
   class Chart {
     constructor(def, src = MAIN_SRC) {
       this.def = def;
@@ -252,13 +292,14 @@
       this.legend = h('div', { class: 'legend' });
       this.canvas = h('canvas', { role: 'img', 'aria-label': `${def.title}: график` });
       this.plot = h('div', { class: 'plot' }, this.canvas);
+      this.overlay = overlayOf(this.plot);
       this.tableEl = h('div', { class: 'table-view', hidden: true });
       this.na = h('div', { class: 'na', hidden: true }, 'Видеокарта не найдена');
       this.root = h('section', { class: 'chart', 'aria-label': def.title },
         h('header', null, h('span', { class: 'title' }, def.title), this.sub, this.tbtn),
         this.legend, this.plot, this.tableEl, this.na);
-      this.canvas.addEventListener('pointermove', (e) => this.onMove(e));
-      this.canvas.addEventListener('pointerleave', () => { this.hover = null; tooltip.hidden = true; this.draw(); });
+      this.canvas.addEventListener('pointermove', perFrame((e) => this.onMove(e)));
+      this.canvas.addEventListener('pointerleave', () => { this.hover = null; tooltip.hidden = true; this.drawHover(); });
       new ResizeObserver(() => this.draw()).observe(this.plot);
     }
 
@@ -361,6 +402,8 @@
       c.font = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
       const m = chartData(this.src);
       const has = m && m.t.length > 1;
+      this._g = g;
+      this._m = has ? m : null;
 
       // game-mode periods as a quiet background band
       if (has) {
@@ -401,6 +444,7 @@
         c.fillStyle = col.muted;
         c.textBaseline = 'middle';
         c.fillText('Данные появятся через пару секунд', g.pad.l + g.pw / 2, g.pad.t + g.ph / 2);
+        this.drawHover();
         return;
       }
       c.save();
@@ -440,32 +484,31 @@
         c.beginPath(); c.moveTo(g.pad.l, y); c.lineTo(g.w - g.pad.r, y); c.stroke(); c.setLineDash([]);
       }
       c.restore();
-      // hover: crosshair snapped to the nearest sample, ringed dots on each series
-      if (this.hover != null && this.hover < m.t.length) {
-        const i = this.hover;
-        const x = Math.round(g.X(m.t[i])) + 0.5;
-        c.strokeStyle = col.axis; c.lineWidth = 1;
-        c.beginPath(); c.moveTo(x, g.pad.t); c.lineTo(x, g.pad.t + g.ph); c.stroke();
-        const dots = [[U[i], col.user], [lo(i) + T[i], col.tasks]];
-        for (const [v, color] of dots) {
-          c.beginPath(); c.arc(x, g.Y(v), 4, 0, Math.PI * 2);
-          c.fillStyle = color; c.fill();
-          c.lineWidth = 2; c.strokeStyle = col.surface; c.stroke();
-        }
-      }
+      this.drawHover();
+    }
+
+    // the crosshair snapped to the nearest sample, ringed dots on each series
+    drawHover() {
+      const g = this._g; const m = this._m;
+      if (!g) return;
+      const c = overlayCtx(this.overlay, g);
+      if (this.hover == null || !m || this.hover >= m.t.length) return;
+      const i = this.hover;
+      const U = m[this.def.user]; const T = m[this.def.tasks];
+      const x = Math.round(g.X(m.t[i])) + 0.5;
+      crosshair(c, g, x);
+      ringDot(c, x, g.Y(U[i]), cssVar('--s-user'));
+      ringDot(c, x, g.Y((this.def.stacked ? U[i] : 0) + T[i]), cssVar('--s-tasks'));
     }
 
     onMove(e) {
-      const m = chartData(this.src);
-      if (!m || m.t.length < 2) return;
-      const g = this.geometry();
+      const m = this._m; const g = this._g;
+      if (!m || !g || m.t.length < 2) return;
       const rect = this.canvas.getBoundingClientRect();
-      const t = g.t0 + ((e.clientX - rect.left - g.pad.l) / g.pw) * (g.t1 - g.t0);
-      let lo = 0; let hi = m.t.length - 1;
-      while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (m.t[mid] < t) lo = mid; else hi = mid; }
-      const i = Math.abs(m.t[lo] - t) < Math.abs(m.t[hi] - t) ? lo : hi;
+      const i = nearestIndex(m.t, g.t0 + ((e.clientX - rect.left - g.pad.l) / g.pw) * (g.t1 - g.t0));
+      if (i === this.hover && !tooltip.hidden) { placeTooltip(e); return; }
       this.hover = i;
-      this.draw();
+      this.drawHover();
       const f = this.def.fmt;
       const row = (val, label, color, dash) => h('div', { class: 'r' },
         h('span', { class: `lk${dash ? ' dash' : ''}`, style: `border-top-color: var(${color})` }),
@@ -473,13 +516,7 @@
       tooltip.replaceChildren(
         h('div', { class: 't' }, clock(m.t[i], true) + (m.game[i] > 0.5 ? ' · игровой режим' : '') + smoothNote()),
         ...this.series().map((s) => row(f(m[s.key][i]), s.label, s.color, s.kind === 'dash')));
-      tooltip.hidden = false;
-      const tw = tooltip.offsetWidth; const th = tooltip.offsetHeight;
-      let left = e.clientX + 14; let top = e.clientY + 14;
-      if (left + tw > window.innerWidth - 8) left = e.clientX - tw - 14;
-      if (top + th > window.innerHeight - 8) top = e.clientY - th - 14;
-      tooltip.style.left = `${left}px`;
-      tooltip.style.top = `${top}px`;
+      placeTooltip(e);
     }
   }
 
@@ -563,15 +600,29 @@
       this.legend = h('div', { class: 'legend' });
       this.canvas = h('canvas', { role: 'img', 'aria-label': 'Ресурсы по задачам: сколько берёт каждая задача в каждый момент; те же данные — в таблице' });
       this.plot = h('div', { class: 'plot' }, this.canvas);
+      this.overlay = overlayOf(this.plot);
       this.tableEl = h('div', { class: 'table-view', hidden: true });
       this.root = h('section', { class: 'chart wide taskchart', 'aria-label': 'Ресурсы по задачам' },
         h('header', null, h('span', { class: 'title' }, 'Ресурсы по задачам'), this.sub, this.seg, tableToggle(this)),
         this.legend, this.plot, this.tableEl);
       this.hit = null;  // the task whose band is under the cursor
-      this.canvas.addEventListener('pointermove', (e) => this.onMove(e));
-      this.canvas.addEventListener('pointerleave', () => { this.hover = null; this.hit = null; tooltip.hidden = true; this.draw(); });
+      this.canvas.addEventListener('pointermove', perFrame((e) => this.onMove(e)));
+      this.canvas.addEventListener('pointerleave', () => {
+        this.hover = null; this.hit = null; tooltip.hidden = true; this.canvas.style.cursor = ''; this.drawHover();
+      });
       this.canvas.addEventListener('click', () => { if (typeof this.hit === 'number' && this.src.open) this.src.open(this.hit); });
       new ResizeObserver(() => this.draw()).observe(this.plot);
+    }
+
+    // the bands, worked out once per new data (never on a mouse move)
+    layers() {
+      const m = this.src.metrics;
+      const key = m && m.t.length ? `${this.view}|${SMOOTH}|${m.t.length}|${m.t[0]}|${m.t[m.t.length - 1]}|${Object.keys(this.src.names).length}` : '';
+      if (this._ser && this._serKey === key && this._serM === m) return this._ser;
+      this._ser = this.series();
+      this._serKey = key;
+      this._serM = m;
+      return this._ser;
     }
 
     // the same moving average as the other charts while "Скользящее среднее" is on
@@ -641,11 +692,11 @@
       if (this.view === 'vram' && !hasGpu) this.view = 'cpu';
       this.plot.hidden = this.showTable;
       this.tableEl.hidden = !this.showTable;
-      const ser = this.series();
+      const ser = this.layers();
       const running = (S.tasks || []).filter((t) => t.state === 'running').length;
       setText(this.sub, `${TASK_VIEWS[this.view].unit} · сейчас выполняется ${running}${smoothNote()}`);
       this.renderLegend(ser);
-      if (this.showTable) this.renderTable(ser); else this.draw(ser);
+      if (this.showTable) this.renderTable(ser); else this.draw();
     }
 
     lastIndex() { const m = this.src.metrics; return m && m.t.length ? m.t.length - 1 : -1; }
@@ -694,11 +745,15 @@
         Y: (v) => pad.t + ph - (Math.max(0, Math.min(max, v)) / max) * ph };
     }
 
-    draw(ser) {
+    draw() {
       if (this.plot.hidden || !this.src.state) return;
-      ser = ser || this.series();
-      const dpr = window.devicePixelRatio || 1;
+      const ser = this.layers();
       const g = this.geometry();
+      this._g = g;
+      const sig = `${this._serKey}|${g.w}x${g.ht}|${RANGE}|${isDark()}|${this.view}`;
+      if (sig === this._drawn) return;  // nothing new: the picture stays
+      this._drawn = sig;
+      const dpr = window.devicePixelRatio || 1;
       this.canvas.width = Math.round(g.w * dpr);
       this.canvas.height = Math.round(g.ht * dpr);
       const c = this.canvas.getContext('2d');
@@ -726,59 +781,95 @@
         c.fillText(clock(t), x, g.pad.t + g.ph + 6);
       }
       const m = this.src.metrics;
+      this._pix = null;
       if (!m || m.t.length < 2) {
         c.fillStyle = col.muted; c.textBaseline = 'middle';
         c.fillText('Данные появятся через пару секунд', g.pad.l + g.pw / 2, g.pad.t + g.ph / 2);
+        this.drawHover();
         return;
       }
+      // no more points than the plot has pixels: blocks of samples are averaged (never across a gap)
+      const per = Math.max(1, Math.floor(m.t.length / Math.max(60, g.pw)));
+      const blocks = [];
+      const segB = [];
+      for (const [a, b] of segmentsOf(m)) {
+        const k0 = blocks.length;
+        for (let i = a; i <= b; i += per) blocks.push([i, Math.min(b, i + per - 1)]);
+        segB.push([k0, blocks.length - 1]);
+      }
+      const nb = blocks.length;
+      const xs = new Float64Array(nb);
+      blocks.forEach(([a, b], k) => { xs[k] = g.X((m.t[a] + m.t[b]) / 2); });
+      const layers = [];
+      let base = new Float64Array(nb);
+      for (const s of ser) {
+        const top = new Float64Array(nb);
+        for (let k = 0; k < nb; k += 1) {
+          const [a, b] = blocks[k];
+          let sum = 0;
+          for (let i = a; i <= b; i += 1) sum += s.get(i) || 0;
+          top[k] = base[k] + sum / (b - a + 1);
+        }
+        layers.push({ s, base, top, color: colorOf(s.color) });
+        base = top;
+      }
+      this._pix = { xs, segB, layers };
       c.save();
       c.beginPath(); c.rect(g.pad.l, g.pad.t - 2, g.pw, g.ph + 4); c.clip();
-      const segs = segmentsOf(m);
-      const n = m.t.length;
-      const base = new Float64Array(n);
-      for (const s of ser) {
-        const top = new Float64Array(n);
-        for (let i = 0; i < n; i += 1) top[i] = base[i] + (s.get(i) || 0);
-        const color = colorOf(s.color);
-        const alpha = s.id === 'user' ? 0.55 : this.hit == null || this.hit === s.id ? 0.88 : 0.35;
-        for (const [a, b] of segs) {
+      for (const L of layers) {
+        this.band(c, g, L, rgba(L.color, L.s.id === 'user' ? 0.55 : 0.88));
+        // a thin gap in the surface color between neighbouring bands
+        c.strokeStyle = col.surface; c.lineWidth = 1.5; c.lineJoin = 'round';
+        for (const [k0, k1] of segB) {
           c.beginPath();
-          for (let i = a; i <= b; i += 1) c.lineTo(g.X(m.t[i]), g.Y(top[i]));
-          for (let i = b; i >= a; i -= 1) c.lineTo(g.X(m.t[i]), g.Y(base[i]));
-          c.closePath();
-          c.fillStyle = rgba(color, alpha);
-          c.fill();
-          // a thin gap in the surface color between neighbouring bands
-          c.strokeStyle = col.surface; c.lineWidth = 1.5; c.lineJoin = 'round';
-          c.beginPath();
-          for (let i = a; i <= b; i += 1) c.lineTo(g.X(m.t[i]), g.Y(top[i]));
+          for (let k = k0; k <= k1; k += 1) c.lineTo(xs[k], g.Y(L.top[k]));
           c.stroke();
         }
-        base.set(top);
       }
       c.restore();
       if (ser.length === 1) {
         c.fillStyle = col.muted; c.textAlign = 'center'; c.textBaseline = 'middle';
         c.fillText('В этом окне задачи не выполнялись', g.pad.l + g.pw / 2, g.pad.t + g.ph / 3);
       }
-      if (this.hover != null && this.hover < n) {
-        const x = Math.round(g.X(m.t[this.hover])) + 0.5;
-        c.strokeStyle = col.axis; c.lineWidth = 1;
-        c.beginPath(); c.moveTo(x, g.pad.t); c.lineTo(x, g.pad.t + g.ph); c.stroke();
+      this.drawHover();
+    }
+
+    band(c, g, L, fill) {
+      const { xs, segB } = this._pix;
+      for (const [k0, k1] of segB) {
+        c.beginPath();
+        for (let k = k0; k <= k1; k += 1) c.lineTo(xs[k], g.Y(L.top[k]));
+        for (let k = k1; k >= k0; k -= 1) c.lineTo(xs[k], g.Y(L.base[k]));
+        c.closePath();
+        c.fillStyle = fill;
+        c.fill();
       }
     }
 
+    // the crosshair, and the band under the cursor lifted above the others
+    drawHover() {
+      const g = this._g;
+      if (!g) return;
+      const c = overlayCtx(this.overlay, g);
+      const m = this._serM;
+      if (this.hover == null || !m || !this._pix || this.hover >= m.t.length) return;
+      const L = this.hit == null ? null : this._pix.layers.find((x) => x.s.id === this.hit);
+      if (L) {
+        c.save();
+        c.beginPath(); c.rect(g.pad.l, g.pad.t - 2, g.pw, g.ph + 4); c.clip();
+        c.fillStyle = rgba(cssVar('--surface'), 0.55);
+        c.fillRect(g.pad.l, g.pad.t - 2, g.pw, g.ph + 4);
+        this.band(c, g, L, rgba(L.color, 0.95));
+        c.restore();
+      }
+      crosshair(c, g, Math.round(g.X(m.t[this.hover])) + 0.5);
+    }
+
     onMove(e) {
-      const m = this.src.metrics;
-      if (!m || m.t.length < 2) return;
-      const g = this.geometry();
+      const m = this._serM; const g = this._g; const ser = this._ser;
+      if (!m || !g || !ser || m.t.length < 2) return;
       const rect = this.canvas.getBoundingClientRect();
-      const t = g.t0 + ((e.clientX - rect.left - g.pad.l) / g.pw) * (g.t1 - g.t0);
-      let lo = 0; let hi = m.t.length - 1;
-      while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (m.t[mid] < t) lo = mid; else hi = mid; }
-      const i = Math.abs(m.t[lo] - t) < Math.abs(m.t[hi] - t) ? lo : hi;
-      this.hover = i;
-      const ser = this.series();
+      const i = nearestIndex(m.t, g.t0 + ((e.clientX - rect.left - g.pad.l) / g.pw) * (g.t1 - g.t0));
       const level = g.max * (1 - (e.clientY - rect.top - g.pad.t) / g.ph);
       let acc = 0;
       let hit = null;
@@ -787,9 +878,12 @@
         if (v > 0 && level >= acc && level <= acc + v) { hit = s; break; }
         acc += v;
       }
-      this.hit = hit ? hit.id : null;
+      const hitId = hit ? hit.id : null;
+      if (i === this.hover && hitId === this.hit && !tooltip.hidden) { placeTooltip(e); return; }
+      this.hover = i;
+      this.hit = hitId;
       this.canvas.style.cursor = hit && typeof hit.id === 'number' && this.src.open ? 'pointer' : '';
-      this.draw(ser);
+      this.drawHover();
       const f = TASK_VIEWS[this.view].fmt;
       const row = (s) => h('div', { class: 'r' }, h('span', { class: 'lk', style: `border-top-color: ${colorCss(s.color)}` }),
         h('b', null, f(s.get(i))), h('span', null, s.agent ? `${s.label} · ${s.agent}` : s.label));
@@ -799,13 +893,7 @@
         hit ? h('div', { class: 'hit' }, row(hit)) : null,
         ...shown.map(row),
         others.length > shown.length ? h('div', { class: 'r muted' }, `… и ещё ${others.length - shown.length}`) : null);
-      tooltip.hidden = false;
-      const tw = tooltip.offsetWidth; const th = tooltip.offsetHeight;
-      let left = e.clientX + 14; let top = e.clientY + 14;
-      if (left + tw > window.innerWidth - 8) left = e.clientX - tw - 14;
-      if (top + th > window.innerHeight - 8) top = e.clientY - th - 14;
-      tooltip.style.left = `${left}px`;
-      tooltip.style.top = `${top}px`;
+      placeTooltip(e);
     }
   }
   const taskChart = new TaskChart();
@@ -829,11 +917,12 @@
       this.legend = h('div', { class: 'legend' });
       this.canvas = h('canvas', { role: 'img', 'aria-label': `${o.title}: график` });
       this.plot = h('div', { class: 'plot' }, this.canvas);
+      this.overlay = overlayOf(this.plot);
       this.tableEl = h('div', { class: 'table-view', hidden: true });
       this.root = h('section', { class: `chart${o.wide ? ' wide' : ''}`, 'aria-label': o.title },
         h('header', null, h('span', { class: 'title' }, o.title), this.sub, this.tbtn), this.legend, this.plot, this.tableEl);
-      this.canvas.addEventListener('pointermove', (e) => this.onMove(e));
-      this.canvas.addEventListener('pointerleave', () => { this.hover = null; tooltip.hidden = true; this.draw(); });
+      this.canvas.addEventListener('pointermove', perFrame((e) => this.onMove(e)));
+      this.canvas.addEventListener('pointerleave', () => { this.hover = null; tooltip.hidden = true; this.drawHover(); });
       new ResizeObserver(() => this.draw()).observe(this.plot);
     }
 
@@ -912,6 +1001,9 @@
       const m = chartData(this.src);
       const v = this.o.values();
       const has = m && m.t.length > 1;
+      this._g = g;
+      this._m = has ? m : null;
+      this._v = v;
       // periods of regulation and of the freeze as quiet bands
       if (has && m.heat) {
         for (const [level, color, a] of [[1, col.warm, 0.10], [2, col.hot, 0.09]]) {
@@ -956,6 +1048,8 @@
         c.fillStyle = col.muted;
         c.textBaseline = 'middle';
         c.fillText(this.o.empty(), g.pad.l + g.pw / 2, g.pad.t + g.ph / 2);
+        this._m = null;
+        this.drawHover();
         return;
       }
       const gapAt = Math.max(3, (m.step || 1) * 3.5);
@@ -969,42 +1063,34 @@
         if (pen) c.lineTo(x, y); else { c.moveTo(x, y); pen = true; }
       }
       c.stroke();
-      if (this.hover != null && this.hover < m.t.length) {
-        const i = this.hover;
-        const x = Math.round(g.X(m.t[i])) + 0.5;
-        c.strokeStyle = col.axis; c.lineWidth = 1;
-        c.beginPath(); c.moveTo(x, g.pad.t); c.lineTo(x, g.pad.t + g.ph); c.stroke();
-        if (v[i] != null) {
-          c.beginPath(); c.arc(x, g.Y(v[i]), 4, 0, Math.PI * 2);
-          c.fillStyle = col.line; c.fill(); c.lineWidth = 2; c.strokeStyle = col.surface; c.stroke();
-        }
-      }
+      this.drawHover();
+    }
+
+    drawHover() {
+      const g = this._g; const m = this._m; const v = this._v;
+      if (!g) return;
+      const c = overlayCtx(this.overlay, g);
+      if (this.hover == null || !m || this.hover >= m.t.length) return;
+      const x = Math.round(g.X(m.t[this.hover])) + 0.5;
+      crosshair(c, g, x);
+      if (v[this.hover] != null) ringDot(c, x, g.Y(v[this.hover]), cssVar(this.o.color));
     }
 
     onMove(e) {
-      const m = chartData(this.src);
-      if (!m || m.t.length < 2) return;
-      const g = this.geometry();
+      const m = this._m; const g = this._g;
+      if (!m || !g || m.t.length < 2) return;
       const rect = this.canvas.getBoundingClientRect();
-      const t = g.t0 + ((e.clientX - rect.left - g.pad.l) / g.pw) * (g.t1 - g.t0);
-      let lo = 0; let hi = m.t.length - 1;
-      while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (m.t[mid] < t) lo = mid; else hi = mid; }
-      const i = Math.abs(m.t[lo] - t) < Math.abs(m.t[hi] - t) ? lo : hi;
+      const i = nearestIndex(m.t, g.t0 + ((e.clientX - rect.left - g.pad.l) / g.pw) * (g.t1 - g.t0));
+      if (i === this.hover && !tooltip.hidden) { placeTooltip(e); return; }
       this.hover = i;
-      this.draw();
-      const v = this.o.values();
+      this.drawHover();
+      const v = this._v;
       tooltip.replaceChildren(
         h('div', { class: 't' }, clock(m.t[i], true) + smoothNote()),
         h('div', { class: 'r' }, h('span', { class: 'lk', style: `border-top-color: var(${this.o.color})` }),
           h('b', null, v[i] == null ? '–' : this.o.fmt(v[i])), h('span', null, this.o.series)),
         h('div', { class: 'r' }, h('span', null, `режим: ${HEAT_NAMES[Math.round(m.heat[i] || 0)] || '–'}`)));
-      tooltip.hidden = false;
-      const tw = tooltip.offsetWidth; const th = tooltip.offsetHeight;
-      let left = e.clientX + 14; let top = e.clientY + 14;
-      if (left + tw > window.innerWidth - 8) left = e.clientX - tw - 14;
-      if (top + th > window.innerHeight - 8) top = e.clientY - th - 14;
-      tooltip.style.left = `${left}px`;
-      tooltip.style.top = `${top}px`;
+      placeTooltip(e);
     }
   }
 
@@ -1058,9 +1144,8 @@
       ? `Все компоненты не выше своих целей — расчёты идут без ограничений. Сейчас: ${temps || 'нет данных'}.`
       : `Плавный регулятор выключен: процессор урезается только заморозкой при перегреве. Сейчас: ${temps || 'нет данных'}.`;
     if (th.regulate && share < 100) body += ` Задачам пока ${share}% процессора: остальное возвращается постепенно.`;
-    const noCpu = th.cpu_source === 'не отвечает' ? ' Датчик процессора недоступен: LibreHardwareMonitor не отвечает (он запускается при входе в Windows).'
-      : th.cpu_source === 'нет' ? ' Датчика процессора нет: LibreHardwareMonitor не установлен (tools\\install_cpu_sensors.ps1).' : '';
-    body += noCpu;
+    const noCpu = cpuSourceNote(th);
+    if (noCpu) body += ` ${noCpu}`;
     if (!th.enabled) {
       head = 'Защита от перегрева выключена';
       body = `Включается в «Правилах и настройках». Сейчас: ${temps || 'нет данных'}.`;
@@ -1079,6 +1164,16 @@
       h('div', null, h('div', { class: 'head' }, head), h('div', { class: 'ink2' }, body)));
     $('#thermal-tiles').replaceChildren(...thermalTiles(th));
     tempCharts.forEach((c) => c.update());
+  }
+
+  // why there is no CPU temperature: LibreHardwareMonitor gives it, through its local web server
+  function cpuSourceNote(th) {
+    return {
+      'нет': 'Датчика процессора нет: LibreHardwareMonitor не запущен (установить: tools\\install_cpu_sensors.ps1).',
+      'не отвечает': 'Датчик процессора недоступен: LibreHardwareMonitor не отвечает (он запускается при входе в Windows).',
+      'веб-сервер выключен': 'LibreHardwareMonitor запущен, но его веб-сервер выключен, а температуру менеджер берёт через него. В LibreHardwareMonitor: Options → Remote Web Server → Run (порт 8085). Если Windows спросит про брандмауэр — можно запретить: менеджеру сеть не нужна.',
+      'закрыт паролем': 'Веб-сервер LibreHardwareMonitor закрыт паролем, а файл его настроек менеджер не нашёл. Снимите пароль (Options → Remote Web Server) или поставьте датчик установщиком tools\\install_cpu_sensors.ps1.',
+    }[th.cpu_source] || '';
   }
 
   function thermalTiles(th) {
@@ -1316,14 +1411,26 @@
     }
   }
 
-  function actionButtons(t) {
+  // node: a task of another of one's PCs (only the main PC acts on those)
+  function actionButtons(t, node) {
     const btns = [];
-    if (t.state === 'running') btns.push(h('button', { class: 'btn', type: 'button', onclick: (e) => { e.stopPropagation(); taskAction(t.id, 'suspend'); } }, 'Пауза'));
-    if (t.state === 'suspended') btns.push(h('button', { class: 'btn', type: 'button', onclick: (e) => { e.stopPropagation(); taskAction(t.id, 'resume'); } }, 'Продолжить'));
+    if (node && !canManage()) return btns;
+    const act = (a) => (e) => { e.stopPropagation(); taskAction(t.id, a, node); };
+    if (t.state === 'running') btns.push(h('button', { class: 'btn', type: 'button', onclick: act('suspend') }, 'Пауза'));
+    if (t.state === 'suspended') btns.push(h('button', { class: 'btn', type: 'button', onclick: act('resume') }, 'Продолжить'));
     if (['running', 'suspended', 'queued', 'remote'].includes(t.state)) {
-      btns.push(h('button', { class: 'btn danger', type: 'button', onclick: (e) => { e.stopPropagation(); if (confirm(`Отменить задачу #${t.id} «${t.name}»?`)) taskAction(t.id, 'cancel'); } }, 'Отменить'));
+      btns.push(h('button', { class: 'btn danger', type: 'button', onclick: (e) => {
+        e.stopPropagation();
+        if (confirm(`Отменить задачу #${t.id} «${t.name}»${node ? ` на ПК ${pcName(node)}` : ''}?`)) taskAction(t.id, 'cancel', node);
+      } }, 'Отменить'));
     }
     return btns;
+  }
+  const canManage = () => !!(STATE && STATE.network && STATE.network.is_main);
+  const taskBase = (id, node) => (node ? `/api/home/${encodeURIComponent(node)}/tasks/${id}` : `/api/tasks/${id}`);
+  function pcName(node) {
+    const pc = ((STATE && STATE.home_running) || []).find((p) => p.node_id === node);
+    return pc ? pc.name : node;
   }
 
   function taskRow(cells, open = (it) => openTask(it.id)) {
@@ -1519,12 +1626,13 @@
     const old = pcs.filter((p) => p.online && !p.known).map((p) => p.name);
     const notes = [off.length ? `не в сети: ${off.join(', ')}` : '', old.length ? `нужно обновить менеджер: ${old.join(', ')}` : ''].filter(Boolean);
     rows('#t-home-running', items, homeRunCols, `Сейчас ничего не выполняется${notes.length ? ` (${notes.join('; ')})` : ''}`,
-      (it) => openPc('home', it.node));
+      (it) => openTask(it.tid, it.node));
   }
 
-  async function taskAction(id, action) {
+  async function taskAction(id, action, node) {
     try {
-      await api('POST', `/api/tasks/${id}/${action}`);
+      await api('POST', `${taskBase(id, node)}/${action}`);
+      if (node && homeView.node === node) homeView.load(false);
       poll(true);
     } catch (e) { alert(e.message); }
   }
@@ -1910,9 +2018,9 @@
 
   // ================================================================ task drawer
   let drawer = null;
-  function openTask(id) {
+  function openTask(id, node = null) {
     closeTask();
-    drawer = { id, offset: -65536, timer: null, sig: '' };
+    drawer = { id, node, offset: -65536, timer: null, sig: '' };
     $('#overlay').hidden = false;
     $('#drawer').hidden = false;
     $('#logbox').replaceChildren();
@@ -1938,14 +2046,14 @@
     if (!drawer) return;
     const d = drawer;
     try {
-      const t = await api('GET', `/api/tasks/${d.id}`);
+      const t = await api('GET', taskBase(d.id, d.node));
       if (drawer !== d) return;
-      setText($('#drawer-title'), `#${t.id} ${t.name}`);
-      const sig = `${t.state}|${t.priority}`;
+      setText($('#drawer-title'), `#${t.id} ${t.name}${d.node ? ` · ПК ${pcName(d.node)}` : ''}`);
+      const sig = `${t.state}|${t.priority}|${canManage()}`;
       if (d.sig !== sig) {
         d.sig = sig;
-        const acts = actionButtons(t);
-        if (['queued', 'running', 'suspended'].includes(t.state) && (STATE && STATE.me.admin)) {
+        const acts = actionButtons(t, d.node);
+        if (!d.node && ['queued', 'running', 'suspended'].includes(t.state) && (STATE && STATE.me.admin)) {
           const sel = h('select', { 'aria-label': 'Приоритет', title: 'Приоритет' }, ['low', 'normal', 'high'].map((p) => h('option', { value: p }, PRIO[p])));
           sel.value = t.priority;
           sel.addEventListener('change', async () => { try { await api('POST', `/api/tasks/${t.id}/priority`, { priority: sel.value }); poll(true); } catch (e) { alert(e.message); } });
@@ -1984,7 +2092,7 @@
       const box = $('#logbox');
       const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
       for (let guard = 0; guard < 8; guard += 1) {
-        const chunk = await api('GET', `/api/tasks/${d.id}/log?offset=${d.offset}&limit=131072`);
+        const chunk = await api('GET', `${taskBase(d.id, d.node)}/log?offset=${d.offset}&limit=131072`);
         if (drawer !== d) return;
         if (chunk.rotated) box.append('\n[лог был ротирован]\n');
         if (d.offset < 0 && chunk.offset > chunk.data.length) setText($('#log-note'), '(показан конец)');
@@ -1997,7 +2105,7 @@
     } catch (e) {
       setText($('#log-note'), e.message);
     }
-    if (drawer === d) d.timer = setTimeout(refreshTask, 1500);
+    if (drawer === d) d.timer = setTimeout(refreshTask, d.node ? 3000 : 1500);
   }
 
   // ================================================================ statistics (saved in data\stats)
@@ -2314,6 +2422,13 @@
 
   function renderStatsFiles(rep) {
     const box = $('#stats-files');
+    if (!rep.files.length && !rep.folder) {
+      box.dataset.sig = '';
+      fill(box, h('p', { class: 'small ink2' }, rep.pc === 'all'
+        ? 'Файлы статистики хранятся на каждом ПК — в папке data\\stats его менеджера.'
+        : `Файлы статистики ПК ${rep.pc || ''} хранятся на нём самом — в папке data\\stats его менеджера.`));
+      return;
+    }
     const sig = `${rep.folder}|${rep.files.map((f) => `${f.name}|${f.size}`).join(',')}`;
     if (box.dataset.sig === sig) return;
     box.dataset.sig = sig;
@@ -2332,16 +2447,53 @@
     statCharts.forEach((c) => c.update());
     renderStatsTable(REPORT);
     renderStatsAgents(REPORT);
+    renderStatsPcs(REPORT);
     renderStatsFiles(REPORT);
     const since = REPORT.since ? new Date(REPORT.since.replace(' ', 'T')).toLocaleString('ru-RU', {
       day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
-    setText($('#stats-note'), since ? `Статистика копится с ${since}; обновляется раз в минуту.` : 'Статистика копится с этого часа.');
+    const missing = (REPORT.missing || []).length ? ` Не вошли: ${REPORT.missing.join('; ')}.` : '';
+    setText($('#stats-note'), (since ? `Статистика копится с ${since}; обновляется раз в минуту.` : 'Статистика копится с этого часа.') + missing);
+  }
+
+  // which PC: this one (''), another of one's PCs by name, or all of them ('all')
+  let STATS_PC = '';
+  let CHRON_PC = '';
+  function pcSeg(box, current, pick) {
+    const pcs = (STATE && STATE.home_running) || [];
+    box.hidden = !pcs.length;
+    box.previousElementSibling.hidden = !pcs.length;
+    const opts = [['', 'Этот ПК'], ...pcs.map((p) => [p.name, p.name]), ['all', 'Все мои ПК']];
+    if (!opts.some(([k]) => k === current)) current = '';
+    const sig = `${current}|${opts.map(([k]) => k).join(',')}`;
+    if (box.dataset.sig === sig) return current;
+    box.dataset.sig = sig;
+    box.replaceChildren(...opts.map(([k, label]) => h('button', {
+      type: 'button', 'aria-pressed': String(k === current), onclick: () => pick(k),
+    }, label)));
+    return current;
+  }
+  function renderStatsPcs(rep) {
+    const box = $('#stats-pcs-box');
+    box.hidden = !rep.per_pc;
+    if (!rep.per_pc) return;
+    const num = (x) => h('td', { class: 'num' }, x);
+    $('#t-stats-pcs tbody').replaceChildren(...rep.per_pc.map((p) => h('tr', null,
+      h('td', null, p.pc), num(mins(p.observed_min)), num(n1(p.tasks_cpu_core_h)), num(p.tasks_cpu_pct == null ? '–' : pct(p.tasks_cpu_pct)),
+      num(`${Math.round(p.tasks_done || 0)} / ${Math.round(p.tasks_failed || 0)}`), num(deg(p.cpu_max_c)),
+      num(mins(p.regulator_min)), num(mins((p.heat_frozen_min || 0) + (p.disk_frozen_min || 0))))));
+  }
+
+  // the PC choice follows the list of one's PCs (it may come after the tab was opened)
+  function syncPcSegs() {
+    STATS_PC = pcSeg($('#stats-pc'), STATS_PC, (k) => { STATS_PC = k; $('#stats-pc').dataset.sig = ''; loadStats(); });
+    CHRON_PC = pcSeg($('#chron-pc'), CHRON_PC, (k) => { CHRON_PC = k; $('#chron-pc').dataset.sig = ''; loadChronicle(); });
   }
 
   async function loadStats() {
     statsLoadedAt = Date.now();
+    syncPcSegs();
     try {
-      REPORT = await api('GET', `/api/stats?period=${PERIOD}`);
+      REPORT = await api('GET', `/api/stats?period=${PERIOD}&pc=${encodeURIComponent(STATS_PC)}`);
       if (TAB === 'stats') renderStats();
     } catch (e) { setText($('#stats-note'), e.message); }
   }
@@ -2353,6 +2505,7 @@
 
   // ================================================================ chronicle: the life of every task
   let CHRON = null;
+  const taskLabel = (t) => `${t.pc ? `${t.pc} · ` : ''}#${t.id} ${t.name}`;
   let CHRON_DAYS = 7;
   let chronLoadedAt = 0;
   const SEG_NAMES = { run: 'работала', wait: 'ждала в очереди', frozen: 'заморожена' };
@@ -2458,7 +2611,7 @@
         h('span', null, h('span', { class: 'key tick' }), 'перезапуск'), h('span', null, h('span', { class: 'key tick bad' }), 'зависла'));
       this.canvas.addEventListener('pointermove', (e) => this.onMove(e));
       this.canvas.addEventListener('pointerleave', () => { this.hover = null; tooltip.hidden = true; this.draw(); });
-      this.canvas.addEventListener('click', () => { if (this.hover) openTask(this.hover.task.id); });
+      this.canvas.addEventListener('click', () => { if (this.hover) openTask(this.hover.task.id, this.hover.task.node); });
       new ResizeObserver(() => this.draw()).observe(this.scroll);
     }
 
@@ -2485,8 +2638,8 @@
       this.tableEl.replaceChildren(h('table', null,
         h('thead', null, h('tr', null, ['#', 'Задача', 'Агент', 'Работала', 'Ждала', 'Заморожена', 'Перезапусков', 'Итог']
           .map((x, i) => h('th', { class: [0, 3, 4, 5, 6].includes(i) ? 'num' : null }, x)))),
-        h('tbody', null, CHRON.tasks.map((t) => h('tr', { class: 'click', onclick: () => openTask(t.id) },
-          num(`#${t.id}`), h('td', null, t.name), h('td', null, agentLabel(t.agent)), num(dur(t.totals.run)),
+        h('tbody', null, CHRON.tasks.map((t) => h('tr', { class: 'click', onclick: () => openTask(t.id, t.node) },
+          num(`#${t.id}`), h('td', null, t.pc ? `${t.name} · ${t.pc}` : t.name), h('td', null, agentLabel(t.agent)), num(dur(t.totals.run)),
           num(dur(t.totals.wait)), num(dur(t.totals.frozen)), num(String(t.restarts)), h('td', null, outcomeText(t)))))));
     }
 
@@ -2545,7 +2698,7 @@
         if (this.hover && this.hover.row === i) { c.fillStyle = col.hl; c.fillRect(0, y, g.w, g.rowH); }
         c.textAlign = 'left';
         c.font = '12px system-ui, -apple-system, "Segoe UI", sans-serif';
-        const name = fitText(c, `#${t.id} ${t.name}`, g.labelW - 12);
+        const name = fitText(c, `${taskLabel(t)}`, g.labelW - 12);
         c.fillStyle = col.ink; c.fillText(name, 0, cy);
         const used = c.measureText(name).width;
         c.font = font;
@@ -2589,7 +2742,7 @@
       if (!this.hover || this.hover.row !== row) { this.hover = { row, task: t }; this.draw(); }
       const tot = t.totals;
       tooltip.replaceChildren(
-        h('div', { class: 't' }, `#${t.id} ${t.name} · ${agentLabel(t.agent)}`),
+        h('div', { class: 't' }, `${taskLabel(t)} · ${agentLabel(t.agent)}`),
         seg ? tipRow(`${SEG_NAMES[seg[2]]}, ${when(seg[0])}–${when(seg[1])}`, dur(seg[1] - seg[0]), SEG_COLORS[seg[2]]) : null,
         seg && seg[3] ? h('div', { class: 'r' }, h('span', null, seg[3])) : null,
         tipRow('работала', dur(tot.run)), tipRow('ждала', dur(tot.wait)), tot.frozen ? tipRow('заморожена', dur(tot.frozen)) : null,
@@ -2625,7 +2778,7 @@
         this.legend, this.plot, this.tableEl);
       this.canvas.addEventListener('pointermove', (e) => this.onMove(e));
       this.canvas.addEventListener('pointerleave', () => { this.hover = null; tooltip.hidden = true; this.draw(); });
-      this.canvas.addEventListener('click', () => { if (this.hover) openTask(this.hover.t.id); });
+      this.canvas.addEventListener('click', () => { if (this.hover) openTask(this.hover.t.id, this.hover.t.node); });
       new ResizeObserver(() => this.draw()).observe(this.plot);
     }
 
@@ -2666,7 +2819,7 @@
           h('thead', null, h('tr', null, h('th', null, 'Задача'), h('th', null, 'Агент'), h('th', { class: 'num' }, 'Заявлено'),
             h('th', { class: 'num' }, this.mode === 'ram' ? 'Пик' : 'В среднем'), h('th', { class: 'num' }, 'Доля'))),
           h('tbody', null, pts.sort((a, b) => a.y / a.x - b.y / b.x).map((q) => h('tr', null,
-            h('td', null, `#${q.t.id} ${q.t.name}`), h('td', null, agentLabel(q.t.agent)), num(this.fmt(q.x)), num(this.fmt(q.y)),
+            h('td', null, `${taskLabel(q.t)}`), h('td', null, agentLabel(q.t.agent)), num(this.fmt(q.x)), num(this.fmt(q.y)),
             num(`${Math.round((q.y / q.x) * 100)}%`))))));
       } else this.draw();
     }
@@ -2730,7 +2883,7 @@
         return;
       }
       for (const q of pts) {
-        const on = this.hover && this.hover.t.id === q.t.id;
+        const on = this.hover && this.hover.t === q.t;
         c.beginPath(); c.arc(g.X(q.x), g.Y(q.y), on ? 6 : 4.5, 0, Math.PI * 2);
         c.fillStyle = cssVar(agentColor(q.t.agent_id)); c.fill();
         c.lineWidth = 2; c.strokeStyle = col.surface; c.stroke();
@@ -2751,7 +2904,7 @@
       if ((best && best.t) !== (this.hover && this.hover.t)) { this.hover = best; this.draw(); }
       if (!best) { tooltip.hidden = true; return; }
       const t = best.t;
-      tooltip.replaceChildren(h('div', { class: 't' }, `#${t.id} ${t.name}`),
+      tooltip.replaceChildren(h('div', { class: 't' }, `${taskLabel(t)}`),
         tipRow('агент', agentLabel(t.agent), agentColor(t.agent_id)),
         tipRow('заявлено', this.fmt(best.x)), tipRow(this.mode === 'ram' ? 'пик' : 'в среднем', this.fmt(best.y)),
         tipRow('от заявки', `${Math.round((best.y / best.x) * 100)}%`),
@@ -2904,8 +3057,8 @@
         n(['running', 'queued', 'suspended']) ? `сейчас в работе: ${n(['running', 'queued', 'suspended'])}` : null,
         restarts.restarts ? `больше всех перезапусков: #${restarts.id} (${restarts.restarts})` : null,
       ].filter(Boolean)),
-      tile('Самая долгая', dur(longest.totals.run), '', null, [`#${longest.id} ${longest.name}`, agentLabel(longest.agent)]),
-      tile('Дольше всех ждала', dur(patient.totals.wait), '', null, [`#${patient.id} ${patient.name}`, agentLabel(patient.agent)]),
+      tile('Самая долгая', dur(longest.totals.run), '', null, [`${taskLabel(longest)}`, agentLabel(longest.agent)]),
+      tile('Дольше всех ждала', dur(patient.totals.wait), '', null, [`${taskLabel(patient)}`, agentLabel(patient.agent)]),
       tile('Главный трудяга', n1(hs.core), 'ядро-ч', null, [agentLabel(hero), `${hs.n} ${hs.n % 10 === 1 && hs.n % 100 !== 11 ? 'задача' : hs.n % 10 >= 2 && hs.n % 10 <= 4 && (hs.n % 100 < 12 || hs.n % 100 > 14) ? 'задачи' : 'задач'}, работали ${dur(hs.run)}`]));
   }
 
@@ -2919,7 +3072,8 @@
   async function loadChronicle() {
     chronLoadedAt = Date.now();
     try {
-      CHRON = await api('GET', `/api/chronicle?days=${CHRON_DAYS}`);
+      syncPcSegs();
+      CHRON = await api('GET', `/api/chronicle?days=${CHRON_DAYS}&pc=${encodeURIComponent(CHRON_PC)}`);
       if (TAB === 'chronicle') renderChronicle();
     } catch (e) { setText($('#chron-note'), e.message); }
   }
@@ -3059,6 +3213,49 @@
       } }, 'Получить код'), copy), codeBox);
   }
 
+  // which of one's PCs run an older manager than the newest one known (a developer's copy is left out)
+  const verCmp = (a, b) => {
+    const x = String(a || '0').split('.').map(Number); const y = String(b || '0').split('.').map(Number);
+    for (let i = 0; i < Math.max(x.length, y.length); i += 1) { const d = (x[i] || 0) - (y[i] || 0); if (d) return d; }
+    return 0;
+  };
+  function versionGap(v) {
+    if (!v.home) return null;
+    const pcs = v.home.members.filter((m) => !m.left && m.info && m.info.version).map((m) => {
+      const upd = ((m.info.home || {}).update) || {};
+      return { m, version: m.info.version, dev: upd.state === 'dev' || (m.self && STATE && STATE.update && STATE.update.state === 'dev'), upd };
+    });
+    let target = (STATE && STATE.update && STATE.update.latest) || null;
+    for (const p of pcs) if (!p.dev && (!target || verCmp(p.version, target) > 0)) target = p.version;
+    const old = pcs.filter((p) => !p.dev && target && verCmp(p.version, target) < 0);
+    return old.length ? { target, old } : null;
+  }
+  async function updateAll(btn) {
+    btn.disabled = true;
+    try {
+      const r = await api('POST', '/api/network/home/update', {});
+      alert([r.asked.length ? `Проверяют обновления: ${r.asked.join(', ')}. Каждый ПК скачает и поставит новую версию сам, задачи продолжат с того же места.` : '',
+        r.failed.length ? `Не получилось: ${r.failed.join('; ')}.` : ''].filter(Boolean).join('\n') || 'Других ПК нет.');
+      loadNetwork();
+    } catch (e) { alert(e.message); }
+    btn.disabled = false;
+  }
+  const updateAllBtn = () => {
+    const b = h('button', { class: 'btn', type: 'button', title: 'Каждый из моих ПК сразу проверит обновления и поставит новую версию сам' }, 'Обновить все мои ПК');
+    b.addEventListener('click', () => updateAll(b));
+    return b;
+  };
+  function versionNote(v) {
+    const gap = versionGap(v);
+    if (!gap) return null;
+    const busy = ['available', 'downloading', 'installing'];
+    const list = gap.old.map((p) => `${p.m.name} — ${p.version}${busy.includes(p.upd.state) ? ' (обновляется…)' : ''}`).join(', ');
+    return h('div', { class: 'card fw-note' },
+      h('div', null, h('b', null, `Не на всех ваших ПК версия ${gap.target}. `), list, '.'),
+      h('div', { class: 'small ink2' }, 'Задачи, графики и время завершения задач других ПК видны полностью, когда версии совпадают. ПК обновляются сами при запуске и раз в несколько часов.'),
+      v.home.is_main ? h('div', { class: 'form-actions' }, updateAllBtn()) : null);
+  }
+
   function renderHomeActions(v) {
     const cards = [];
     if (!v.home) {
@@ -3083,7 +3280,7 @@
           homeCode, '/api/network/home/invite', (c) => { homeCode = c; }));
         cards.push(h('div', { class: 'card' }, h('h3', null, 'Этот ПК — основной'),
           h('p', { class: 'small ink2' }, 'С него можно менять настройки всех ваших ПК («Подробнее» → «Настройки этого ПК») и решать, какие из них видны друзьям (столбец «Для друзей»).'),
-          h('div', { class: 'form-actions' }, leave)));
+          h('div', { class: 'form-actions' }, updateAllBtn(), leave)));
       } else {
         cards.push(h('div', { class: 'card' }, h('h3', null, `Основной ПК: ${H.main_name || '—'}`),
           H.main_left ? h('div', { class: 'msg err' }, 'Основной ПК вышел из «Моих ПК». Сделайте основным этот ПК, чтобы снова управлять остальными.') : null,
@@ -3094,7 +3291,8 @@
             } }, 'Сделать этот ПК основным'), leave)));
       }
     }
-    $('#home-actions').replaceChildren(...cards);
+    const note = versionNote(v);
+    $('#home-actions').replaceChildren(...(note ? [note] : []), ...cards);
   }
 
   function hwCells(m, known) {
@@ -3213,10 +3411,10 @@
         h('div', { class: 'charts' }, this.charts.map((c) => c.root)),
         h('h2', null, 'Выполняются'),
         table('pc-active', [th('#', 'num'), th('Задача'), th('Агент'), th('Состояние'), th('CPU, яд.', 'num'), th('ОЗУ, ГБ', 'num'),
-          th('VRAM, ГБ', 'num'), th('Время', 'num'), th('Очки', 'num'), th('Выполнено')]),
+          th('VRAM, ГБ', 'num'), th('Время', 'num'), th('Очки', 'num'), th('Выполнено'), th('')]),
         h('h2', null, 'Очередь'),
         table('pc-queue', [th('Поз.', 'num'), th('#', 'num'), th('Задача'), th('Агент'), th('Заявка', 'num'), th('Ждёт', 'num'),
-          th('Очки', 'num'), th('Почему ждёт')]),
+          th('Очки', 'num'), th('Почему ждёт'), th('')]),
         h('h2', null, 'Температура'), this.thermal,
         h('div', { class: 'charts' }, this.temps.map((c) => c.root)),
         h('h2', null, 'Недавно завершённые'),
@@ -3286,7 +3484,7 @@
       const info = m.info || {};
       const hm = info.home || {};
       const isMain = v.home.is_main;
-      const sig = JSON.stringify([m.name, m.main, m.online, m.rtt_ms, m.reaches, m.they_reach, info.version, hm.preset, hm.external, info.busy, isMain]);
+      const sig = JSON.stringify([m.name, m.main, m.online, m.rtt_ms, m.reaches, m.they_reach, info.version, hm.preset, hm.external, hm.update, info.busy, isMain, STATE && STATE.update && STATE.update.latest]);
       if (this.head.dataset.sig !== sig) {
         this.head.dataset.sig = sig;
         const acts = [];
@@ -3298,7 +3496,11 @@
         }
         fill(this.head, pcHeadRow(m), netNotes(m),
           h('div', { class: 'small ink2' }, hwLine(info)),
-          h('div', { class: 'small ink2' }, `Версия ${info.version || '?'}${hm.preset ? ` · настройки «${hm.preset}»` : ''}${hm.external ? ` · для друзей: ${EXT_TEXT[extState(hm.external)]}` : ''}`),
+          h('div', { class: 'small ink2' }, `Версия ${info.version || '?'}${(() => {
+            const gap = versionGap(v);
+            const me = gap && gap.old.find((p) => p.m.node_id === m.node_id);
+            return me ? ` — есть ${gap.target}` : '';
+          })()}${hm.preset ? ` · настройки «${hm.preset}»` : ''}${hm.external ? ` · для друзей: ${EXT_TEXT[extState(hm.external)]}` : ''}`),
           acts.length ? h('div', { class: 'form-actions' }, acts) : null);
       }
       this.msg.hidden = !this.err;
@@ -3309,17 +3511,28 @@
       renderTiles(s, this.tiles, this.src.metrics);
       renderDisks(s, this.disks);
       this.charts.forEach((c) => c.update());
-      if (s.thermal) this.thermal.replaceChildren(...thermalTiles(s.thermal));
+      if (s.thermal) {
+        const note = cpuSourceNote(s.thermal);
+        fill(this.thermal, thermalTiles(s.thermal), note ? h('div', { class: 'tile note' }, h('div', { class: 'label' }, 'Процессор'), h('div', { class: 'small ink2' }, note)) : null);
+      }
       this.temps.forEach((c) => c.update());
       const local = s.tasks.filter((t) => t.state !== 'remote');
-      rows('#pc-active', local.filter((t) => t.state === 'running'), pcActiveCols, 'Сейчас ничего не выполняется', null);
-      rows('#pc-queue', waitingOf(local), pcQueueCols, 'Очередь пуста', null);
-      rows('#pc-recent', s.recent || [], recentCols, 'Пока ничего не завершалось', null);
+      rows('#pc-active', local.filter((t) => t.state === 'running'), pcActiveCols, 'Сейчас ничего не выполняется', openPcTask);
+      rows('#pc-queue', waitingOf(local), pcQueueCols, 'Очередь пуста', openPcTask);
+      rows('#pc-recent', s.recent || [], recentCols, 'Пока ничего не завершалось', openPcTask);
     }
   }
-  const pcActiveCols = activeCols.filter(([cls]) => cls !== 'actions');
+  const pcActionsCell = (td, t) => {
+    const sig = `${t.state}|${canManage()}`;
+    if (td._sig === sig) return;
+    td._sig = sig;
+    td.replaceChildren(...actionButtons(t, homeView.node));
+  };
+  const withPcActions = (cols) => cols.map((c) => (c[0] === 'actions' ? ['actions', pcActionsCell] : c));
+  const pcActiveCols = withPcActions(activeCols);
   const homeView = new PcView();
-  const pcQueueCols = queueColsFor(() => (homeView.src.state || {}).now || Date.now() / 1000).filter(([cls]) => cls !== 'actions');
+  const pcQueueCols = withPcActions(queueColsFor(() => (homeView.src.state || {}).now || Date.now() / 1000));
+  const openPcTask = (it) => openTask(it.id, homeView.node);
   $('#home-pane').append(homeView.root);
 
   function renderHomePane(v) {
@@ -3567,6 +3780,7 @@
       renderDisks(s);
       charts.forEach((c) => c.update());
     }
+    if (TAB === 'stats' || TAB === 'chronicle') syncPcSegs();
     if (TAB === 'stats' && Date.now() - statsLoadedAt > 60000) loadStats();
     if (TAB === 'chronicle' && Date.now() - chronLoadedAt > 30000) loadChronicle();
     if (TAB === 'network') {

@@ -32,7 +32,7 @@ from .net import NetService, PeerError
 from .netbase import NetError, NetStore, changed_files, collect_files, make_zip, matches_any, requirements_hash, \
     safe_extract, safe_name
 from .settings import Settings, SettingsError
-from .stats import StatsBook
+from .stats import StatsBook, combine_reports
 from .updater import Updater
 from .util import PRIORITY_NAMES, parse_duration, parse_priority, parse_size_gb
 
@@ -80,6 +80,15 @@ def python_for_tasks() -> str:
     if p.name.lower() == "pythonw.exe" and p.with_name("python.exe").exists():
         p = p.with_name("python.exe")
     return str(p)
+
+
+def remote_end_time(st: dict, submitted_at: float | None, now: float) -> float:
+    """When a task sent to another PC really ended there: this PC may have been off and fetched the results hours
+    later. Now, if that PC does not say (an older version) or its answer cannot be right."""
+    end = st.get("finished_at")
+    if isinstance(end, (int, float)) and (submitted_at or 0) <= end <= now + 300:  # clocks may differ a little
+        return min(float(end), now)
+    return now
 
 
 def command_text(row: dict) -> str:
@@ -849,7 +858,9 @@ class Manager:
                 "peak_vram": max(r["peak_vram_gb"], lv.get("peak_vram_gb", 0.0)),
                 "run_s": self.run_time(r, now), "cpu_s": r["cpu_s"], "submitted_at": r["submitted_at"],
                 "finished_at": r["finished_at"], "segments": segs, "marks": [m for m in marks if m[0] >= start],
-                "totals": chronicle.totals(segs)})
+                "totals": chronicle.totals(segs), "where_node": r["remote_node"],
+                "where": self.net.node_name(r["remote_node"]) if r["remote_node"] else None,
+                "from": self.net.node_name(r["origin_node"]) if r["origin_node"] else None})
         tasks.sort(key=lambda t: (-t["segments"][0][0], -t["id"]))  # the newest on top
         agents = [{"id": a["id"], "name": a["name"], "builtin": bool(a["builtin"])} for a in self.db.agents()]
         return {"from": start, "to": now, "days": days, "tasks": tasks, "agents": agents}
@@ -1072,7 +1083,8 @@ class Manager:
             note = f"выполнена на ПК {where}; вернулось файлов: {nfiles} ({nbytes / 2**20:.1f} МБ) в {row['cwd']}"
             if state != "done" and st.get("reason_text"):
                 note = f"{st['reason_text']}; {note}"
-            self._finalize(row, state, st.get("exit_code"), note, when=time.time())
+            self._finalize(row, state, st.get("exit_code"), note,
+                           when=remote_end_time(st, row["submitted_at"], time.time()))
 
     def net_cancel_all(self, why: str, kind: str = "ext") -> None:
         """This PC leaves one of its networks: what it sent there and what it runs from there ends."""
@@ -1225,7 +1237,8 @@ class Manager:
             agents = {a["id"]: a for a in self.db.agents()}
             d = self.task_json(row, agents)
         keep = ("id", "state", "state_text", "reason", "reason_text", "wait_text", "position", "run_s", "progress",
-                "used", "exit_code", "peak_ram", "peak_vram", "restarts", "cap_cores", "hung", "idle_s", "stopping")
+                "used", "exit_code", "peak_ram", "peak_vram", "restarts", "cap_cores", "hung", "idle_s", "stopping",
+                "finished_at")
         out = {k: d.get(k) for k in keep}
         out["final"] = row["state"] in FINAL_STATES
         return out
@@ -1291,6 +1304,61 @@ class Manager:
             shutil.rmtree(row["cwd"], ignore_errors=True)
         (self.net_dir("out") / f"results-{tid}.zip").unlink(missing_ok=True)
         (self.net_dir("manifests") / f"{tid}.json").unlink(missing_ok=True)
+
+    # ---------------------------------------------------------------- statistics of one's other PCs too
+    def owner(self) -> Identity:
+        """The owner of this PC (the dashboard): what the main PC acts as on one of its PCs."""
+        return Identity(True, self.db.agent(self.user_agent_id))
+
+    def _own_pcs(self) -> list[tuple[str, str]]:
+        st = self.net.store
+        return [(nid, rec.get("name") or nid) for nid, rec in st.active_members("home").items()] if st.home else []
+
+    def _gather(self, what: str, query: dict) -> tuple[list[tuple[str, str, dict]], list[str]]:
+        """(node, name, answer) of each of one's other PCs that answered, and why the rest did not."""
+        got, missing = [], []
+        for nid, name in self._own_pcs():
+            if not self.net.online(nid):
+                missing.append(f"{name}: не в сети")
+                continue
+            try:
+                got.append((nid, name, self.net.peek(nid, what, query)))
+            except NetError as e:
+                missing.append(f"{name}: {e.message}")
+        return got, missing
+
+    def stats_for(self, pc: str | None, period: str) -> dict:
+        """This PC's statistics, another of one's PCs' (by name), or all of them together ("all")."""
+        me = self.net.store
+        pc = (pc or "").strip()
+        if pc.lower() == "all":
+            got, missing = self._gather("stats", {"period": period})
+            return combine_reports([(me.node_name, self.get_stats(period))] + [(n, r) for _, n, r in got], missing)
+        nid = self.net.find_home(pc) if pc else me.node_id
+        if nid == me.node_id:
+            return dict(self.get_stats(period), pc=me.node_name)
+        return dict(self.net.peek(nid, "stats", {"period": period}), pc=self.net.node_name(nid), files=[])
+
+    def chronicle_for(self, pc: str | None, days: float) -> dict:
+        me = self.net.store
+        pc = (pc or "").strip()
+        if pc.lower() == "all":
+            got, missing = self._gather("chronicle", {"days": days})
+            return chronicle.merge([(me.node_id, True, me.node_name, self.get_chronicle(days))]
+                                   + [(nid, False, n, ch) for nid, n, ch in got], missing)
+        nid = self.net.find_home(pc) if pc else me.node_id
+        if nid == me.node_id:
+            return self.get_chronicle(days)
+        out = self.net.peek(nid, "chronicle", {"days": days})
+        for t in out.get("tasks") or []:
+            t.update(node=nid, pc=self.net.node_name(nid))
+        return out
+
+    def check_updates_now(self) -> dict:
+        """Look for an update right away (it installs itself if there is one)."""
+        up = self.updater
+        threading.Thread(target=up.check_and_install, name="rmq-update", daemon=True).start()
+        return {k: v for k, v in up.status.items() if k != "release"}
 
     def get_stats(self, period: str) -> dict:
         if period not in ("24h", "7d", "30d", "all"):

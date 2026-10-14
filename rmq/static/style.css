@@ -233,6 +233,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 16px 24px 60px; }
 .legend b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
 .plot { position: relative; height: 196px; }
 .plot canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.plot canvas.hover-layer { pointer-events: none; }
 .plot.loading canvas { opacity: 0.45; }
 .chart .table-view { max-height: 196px; overflow: auto; }
 .chart .na { height: 196px; display: grid; place-items: center; color: var(--muted); }

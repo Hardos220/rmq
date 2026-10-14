@@ -67,3 +67,26 @@ def totals(segs: list) -> dict:
     for s0, s1, kind, _ in segs:
         out[kind] += s1 - s0
     return out
+
+
+def merge(parts: list[tuple[str, bool, str, dict]], missing: list[str]) -> dict:
+    """Several of one's PCs' chronicles as one: (node, is this PC, its name, its chronicle) each. Agents are matched
+    by name; a task one PC sent to another is shown once, where it ran (the sender's copy is left out when the PC
+    that ran it is in the picture)."""
+    shown = {nid for nid, _, _, _ in parts}
+    agents: dict[str, dict] = {}
+    tasks = []
+    for nid, local, pc, ch in parts:
+        by_id = {a["id"]: a for a in ch.get("agents") or []}
+        for a in ch.get("agents") or []:
+            agents.setdefault(a["name"], {"id": len(agents) + 1, "name": a["name"], "builtin": a.get("builtin")})
+        for t in ch.get("tasks") or []:
+            if t.get("where_node") in shown:
+                continue
+            a = by_id.get(t.get("agent_id"))
+            tasks.append(dict(t, node=None if local else nid, pc=pc, agent_id=agents[a["name"]]["id"] if a else 0))
+    tasks.sort(key=lambda t: -t["segments"][0][0])  # the newest on top
+    chs = [ch for _, _, _, ch in parts]
+    return {"from": min(ch["from"] for ch in chs), "to": max(ch["to"] for ch in chs), "days": chs[0]["days"],
+            "tasks": tasks, "agents": list(agents.values()), "missing": missing, "pc": "all"}
+

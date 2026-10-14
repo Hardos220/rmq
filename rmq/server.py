@@ -291,7 +291,8 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", "/api/stats")
     def stats(self, ident, body, q):
-        return self.manager.get_stats(q.get("period", "7d"))
+        # agents may read it too; pc: another of one's PCs by name, or "all" of them together
+        return self.manager.stats_for(q.get("pc"), q.get("period", "7d"))
 
     # ------------------------------------------------------------ the compute network
     @route("GET", "/api/nodes")
@@ -421,12 +422,35 @@ class Handler(BaseHTTPRequestHandler):
         net = self.manager.net
         return net.peek(net.find_home(node), "metrics", {"range": q.get("range", 900), "since": q.get("since", 0)})
 
+    # tasks on one's other PCs: their card and log from any of one's PCs, actions only from the main one
+    @route("GET", r"/api/home/([\w.-]+)/tasks/(\d+)")
+    def home_task(self, ident, body, q, node, tid):
+        self._admin(ident)
+        net = self.manager.net
+        return net.peek(net.find_home(node), f"tasks/{int(tid)}")
+
+    @route("GET", r"/api/home/([\w.-]+)/tasks/(\d+)/log")
+    def home_task_log(self, ident, body, q, node, tid):
+        self._admin(ident)
+        net = self.manager.net
+        return net.peek(net.find_home(node), f"tasks/{int(tid)}/log",
+                        {"offset": self._int(q, "offset", 0), "limit": self._int(q, "limit", 65536)})
+
+    @route("POST", r"/api/home/([\w.-]+)/tasks/(\d+)/(suspend|resume|cancel)")
+    def home_task_action(self, ident, body, q, node, tid, action):
+        self._admin(ident)
+        net = self.manager.net
+        return net.manage(net.find_home(node), "POST", f"tasks/{int(tid)}/{action}", {})
+
+    @route("POST", "/api/network/home/update")
+    def home_update(self, ident, body, q):
+        self._admin(ident)
+        return self.manager.net.update_all()
+
     @route("POST", "/api/update/check")
     def update_check(self, ident, body, q):
         self._admin(ident)
-        up = self.manager.updater
-        threading.Thread(target=up.check_and_install, name="rmq-update", daemon=True).start()
-        return {k: v for k, v in up.status.items() if k != "release"}
+        return self.manager.check_updates_now()
 
     @route("GET", "/api/chronicle")
     def chronicle(self, ident, body, q):
@@ -434,7 +458,7 @@ class Handler(BaseHTTPRequestHandler):
             days = float(q.get("days", 7))
         except ValueError:
             raise ApiError(400, "days: число") from None
-        return self.manager.get_chronicle(max(0.04, min(30.0, days)))
+        return self.manager.chronicle_for(q.get("pc"), max(0.04, min(30.0, days)))
 
     @route("GET", r"/api/stats/files/([\w.-]+)")
     def stats_file(self, ident, body, q, name):

@@ -236,6 +236,8 @@
           <button type="button" data-period="30d">30 дней</button>
           <button type="button" data-period="all">Всё время</button>
         </div>
+        <span class="label" hidden>ПК</span>
+        <div class="seg" id="stats-pc" role="group" aria-label="Чья статистика" hidden></div>
         <span class="small muted" id="stats-note"></span>
       </div>
       <div class="tiles" id="stats-tiles"></div>
@@ -250,6 +252,15 @@
           <th class="num">Готово / ошибок</th><th class="num">Отменено / перезапущено</th>
         </tr></thead><tbody></tbody>
       </table></div>
+      <div id="stats-pcs-box" hidden>
+        <h2>По ПК</h2>
+        <div class="tbl-wrap"><table id="t-stats-pcs">
+          <thead><tr>
+            <th>ПК</th><th class="num">Менеджер работал</th><th class="num">Процессор, ядро-ч</th><th class="num">Загрузка задачами</th>
+            <th class="num">Готово / ошибок</th><th class="num">Процессор, макс.</th><th class="num">Регулятор</th><th class="num">Заморозки</th>
+          </tr></thead><tbody></tbody>
+        </table></div>
+      </div>
       <h2>Файлы статистики</h2>
       <div class="card" id="stats-files"></div>
     </section>
@@ -262,6 +273,8 @@
           <button type="button" data-days="7" aria-pressed="true">7 дней</button>
           <button type="button" data-days="30">30 дней</button>
         </div>
+        <span class="label" hidden>ПК</span>
+        <div class="seg" id="chron-pc" role="group" aria-label="Чья хроника" hidden></div>
         <span class="small muted" id="chron-note"></span>
       </div>
       <div class="tiles" id="chron-facts"></div>

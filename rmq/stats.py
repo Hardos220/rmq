@@ -207,6 +207,31 @@ def combine(rows: list[dict]) -> dict:
     return out
 
 
+def combine_reports(parts: list[tuple[str, dict]], missing: list[str]) -> dict:
+    """The reports of several of one's PCs as one: sums add up, averages are weighted by time, maxima are the
+    highest on any PC. The first report (this PC's) gives the period, the buckets and the temperature limits."""
+    base = parts[0][1]
+    by_key: dict[str, list[dict]] = {}
+    for _, rep in parts:
+        for b in rep.get("buckets") or []:
+            by_key.setdefault(b["key"], []).append(b)
+    buckets = [{"key": b["key"], "t": b["t"], "hours": sum(x.get("hours") or 0 for x in by_key[b["key"]]),
+                **combine(by_key[b["key"]])} for b in base["buckets"]]
+    agents: dict[str, dict] = {}
+    for _, rep in parts:
+        for a in rep.get("agents") or []:
+            acc = agents.setdefault(a["agent"], dict.fromkeys(_AGENT_SUM, 0.0))
+            for k in _AGENT_SUM:
+                acc[k] += a.get(k) or 0
+    out = dict(base)
+    out.update(buckets=buckets, total=combine([rep["total"] for _, rep in parts]),
+               agents=sorted(({"agent": n, **a} for n, a in agents.items()), key=lambda x: -x["cpu_core_h"]),
+               since=min((rep["since"] for _, rep in parts if rep.get("since")), default=None),
+               per_pc=[{"pc": pc, **rep["total"]} for pc, rep in parts], missing=missing,
+               files=[], folder=None, pc="all")
+    return out
+
+
 class StatsBook:
     def __init__(self, folder: Path, now: float | None = None):
         self.folder = folder

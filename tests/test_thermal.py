@@ -219,3 +219,83 @@ def test_a_dummy_acpi_zone_neither_shows_nor_freezes_anything():
     # the dummy is skipped, the real zone next to it counts
     assert zone_reading({"A": k + 17, "B": k + 57}, {"A": 0.0, "B": 100.0}, {}) == (57.0, False)
     assert zone_reading({"Z": 0.0}, {}, {}) == (None, False)          # an unpopulated zone
+
+
+def _lhm_server(auth=None):
+    """A stand-in for LibreHardwareMonitor's web server on a free port: (server, port)."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    tree = {"Children": [{"SensorId": "/intelcpu/0/temperature/16", "Text": "CPU Package", "Value": "64,0 °C"}]}
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if auth and self.headers.get("Authorization") != auth:
+                self.send_response(401)
+                self.end_headers()
+                return
+            data = json.dumps(tree).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1]
+
+
+def _free_port():
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def test_lhm_is_found_wherever_the_owner_runs_it(tmp_path, monkeypatch):
+    from rmq.thermal import LhmCpu
+    monkeypatch.setattr(LhmCpu, "CONFIG", tmp_path / "nowhere" / "LibreHardwareMonitor.config")
+    srv, port = _lhm_server()
+    try:
+        # started from Downloads, its settings next to it (web server on, no password)
+        exe = tmp_path / "Downloads" / "LHM" / "LibreHardwareMonitor.exe"
+        exe.parent.mkdir(parents=True)
+        exe.with_name("LibreHardwareMonitor.config").write_text(
+            f'<configuration><appSettings><add key="listenerPort" value="{port}" /></appSettings></configuration>',
+            encoding="utf-8")
+        monkeypatch.setattr(LhmCpu, "_process", staticmethod(lambda: (True, exe)))
+        lhm = LhmCpu()
+        assert lhm.read() == 64.0 and lhm.status == "работает"
+        # running elevated (its folder hidden), no settings at hand: the default port, no password
+        monkeypatch.setattr(LhmCpu, "_process", staticmethod(lambda: (True, None)))
+        monkeypatch.setattr(LhmCpu, "PORT", port)
+        lhm = LhmCpu()
+        assert lhm.read() == 64.0
+    finally:
+        srv.shutdown()
+
+
+def test_lhm_says_what_is_missing(tmp_path, monkeypatch):
+    from rmq.thermal import LhmCpu
+    monkeypatch.setattr(LhmCpu, "CONFIG", tmp_path / "LibreHardwareMonitor.config")
+    monkeypatch.setattr(LhmCpu, "_process", staticmethod(lambda: (False, None)))
+    lhm = LhmCpu()
+    assert lhm.read() is None and lhm.status == "нет"                      # not running, not installed
+    monkeypatch.setattr(LhmCpu, "_process", staticmethod(lambda: (True, None)))
+    monkeypatch.setattr(LhmCpu, "PORT", _free_port())
+    lhm = LhmCpu()
+    assert lhm.read() is None and lhm.status == "веб-сервер выключен"      # runs, but the server is off
+    srv, port = _lhm_server(auth="Basic secret")
+    try:
+        monkeypatch.setattr(LhmCpu, "PORT", port)
+        lhm = LhmCpu()
+        assert lhm.read() is None and lhm.status == "закрыт паролем"       # a password, and no settings to read it
+    finally:
+        srv.shutdown()

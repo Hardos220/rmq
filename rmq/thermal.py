@@ -7,9 +7,9 @@ Sensors (documented, read-only):
 - GPU: NVIDIA's NVML library that ships with the driver. It is queried only while the GPU is
   awake (busy, or still warm), because polling a sleeping laptop GPU would wake it up and heat it.
 - SSD: the drive's own temperature and its limits via the standard storage property query.
-- CPU die: LibreHardwareMonitor's local web server, when it is installed (tools/install_cpu_sensors.ps1):
-  it reads the CPU sensors through the signed PawnIO driver and runs with administrator rights, so
-  the manager itself does not need them.
+- CPU die: LibreHardwareMonitor's local web server, when it is installed (tools/install_cpu_sensors.ps1)
+  or the owner runs it from any folder with its web server on: it reads the CPU sensors through its
+  driver and runs with administrator rights, so the manager itself does not need them.
 
 HeatRegulator keeps every component at or below its target temperature by smoothly scaling the CPU
 the tasks get. ThermalGuard is the safety net behind it: a component past its hot limit freezes every
@@ -24,6 +24,7 @@ import json
 import os
 import re
 import struct
+import time
 import urllib.error
 import urllib.request
 from collections import deque
@@ -238,28 +239,77 @@ def parse_lhm(tree: dict) -> float | None:
 
 
 class LhmCpu:
-    """Reads the CPU temperature from LibreHardwareMonitor's local web server (password-protected)."""
+    """Reads the CPU temperature from LibreHardwareMonitor's local web server.
+
+    Installed by tools/install_cpu_sensors.ps1 (Program Files; port and password from its settings), or started by
+    the owner from any folder: then its settings lie next to its exe, and without them the default port is tried
+    with no password. Whether it runs and whether its port is open is looked up every half a minute, not on every
+    reading: a closed port on this PC answers only after ~2 s on Windows, which would stall the manager's loop."""
 
     CONFIG = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "LibreHardwareMonitor" / "LibreHardwareMonitor.config"
+    PORT = 8085            # its default
+    FIND_EVERY_S = 30.0
 
     def __init__(self):
-        self.status = "нет"          # нет | работает | не отвечает
+        # нет | работает | не отвечает | веб-сервер выключен | закрыт паролем
+        self.status = "нет"
         self._stamp: float | None = None
         self._auth: str | None = None
         self._good_auth: str | None = None
-        self._port = 8085
+        self._port = self.PORT
+        self._config: Path | None = None
+        self._running = False
+        self._open = True                # someone listens on its port
+        self._found_at = -1e9
 
-    @property
-    def installed(self) -> bool:
-        return self.CONFIG.exists()
+    @staticmethod
+    def _process() -> tuple[bool, Path | None]:
+        """(whether LibreHardwareMonitor runs, its exe when this process may see it)."""
+        try:
+            import psutil
+        except ImportError:
+            return False, None
+        for p in psutil.process_iter(["name"]):
+            if (p.info.get("name") or "").lower() == "librehardwaremonitor.exe":
+                try:
+                    return True, Path(p.exe())
+                except (psutil.Error, OSError, ValueError):
+                    return True, None  # it runs elevated: its folder may be hidden from a normal process
+        return False, None
+
+    @staticmethod
+    def _listening(port: int) -> bool:
+        try:
+            import psutil
+            return any(c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port == port
+                       for c in psutil.net_connections(kind="tcp"))
+        except Exception:
+            return True  # cannot tell: just try it
+
+    def _find(self) -> None:
+        now = time.monotonic()
+        if now - self._found_at < self.FIND_EVERY_S:
+            return
+        self._found_at = now
+        self._running, exe = self._process()
+        near = exe.with_name("LibreHardwareMonitor.config") if exe else None
+        config = self.CONFIG if self.CONFIG.exists() else near if near and near.exists() else None
+        if config != self._config:
+            self._config, self._stamp, self._auth, self._good_auth, self._port = config, None, None, None, self.PORT
+        if self._config is not None:
+            try:
+                self._load()
+            except (OSError, ValueError):
+                pass
+        self._open = self._listening(self._port)
 
     def _load(self) -> None:
         # LibreHardwareMonitor re-hashes its stored password on every save, so the current file is the truth
-        stamp = self.CONFIG.stat().st_mtime
+        stamp = self._config.stat().st_mtime
         if stamp == self._stamp:
             return
-        vals = dict(re.findall(r'<add key="([^"]+)" value="([^"]*)"', self.CONFIG.read_text(encoding="utf-8")))
-        self._port = int(vals.get("listenerPort", "8085") or 8085)
+        vals = dict(re.findall(r'<add key="([^"]+)" value="([^"]*)"', self._config.read_text(encoding="utf-8")))
+        self._port = int(vals.get("listenerPort") or self.PORT)
         auth = None
         if vals.get("authenticationEnabled") == "true":
             pair = f'{vals.get("authenticationUserName", "")}:{vals.get("authenticationPassword", "")}'
@@ -273,11 +323,16 @@ class LhmCpu:
             return json.load(r)
 
     def read(self) -> float | None:
-        if not self.installed:
+        self._find()
+        if self._config is None and not self._running:
             self.status = "нет"
             return None
+        if not self._open:
+            self.status = "веб-сервер выключен" if self._running else "не отвечает"
+            return None
         try:
-            self._load()
+            if self._config is not None:
+                self._load()
             try:
                 tree = self._get(self._auth)
                 self._good_auth = self._auth
@@ -285,8 +340,12 @@ class LhmCpu:
                 if e.code != 401 or not self._good_auth or self._good_auth == self._auth:
                     raise
                 tree = self._get(self._good_auth)
+        except urllib.error.HTTPError as e:
+            self.status = "закрыт паролем" if e.code == 401 and self._auth is None else "не отвечает"
+            return None
         except (OSError, ValueError):
             self.status = "не отвечает"
+            self._found_at = -1e9  # it may have closed: look again before the next try
             return None
         self.status = "работает"
         return parse_lhm(tree)
