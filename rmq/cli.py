@@ -592,17 +592,28 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cpu_text(power, clock_p, clock_e) -> str:
+    """The CPU's package power and core clocks (LibreHardwareMonitor), as far as they are known."""
+    out = [f"{power:.0f} Вт" if power is not None else None,
+           f"{'P-ядра' if clock_e is not None else 'ядра'} {clock_p:.2f} ГГц" if clock_p is not None else None,
+           f"E-ядра {clock_e:.2f} ГГц" if clock_e is not None else None]
+    return ", ".join(x for x in out if x)
+
+
 def conditions_text(c: dict) -> str:
-    """What the task ran under (for its own timings): "чистые" or what disturbed them."""
+    """What the task ran under (for its own timings): "чистые" or what disturbed them; the CPU's average power and
+    clocks meanwhile, where they were measured."""
+    cpu = cpu_text(c.get("cpu_power_w"), c.get("clock_p_ghz"), c.get("clock_e_ghz"))
+    tail = f"; процессор в среднем {cpu}" if cpu else ""
     if c.get("clean"):
-        return "чистые: без пауз, сна, урезания процессора и соседних задач"
+        return "чистые: без пауз, сна, урезания процессора и соседних задач" + tail
     parts = [(c.get("paused_s"), "на паузе"), (c.get("slept_s"), "ПК спал"), (c.get("held_s"), "урезанный процессор"),
              (c.get("ecores_s"), "только E-ядра (игра)"), (c.get("throttled_s"), "регулятор температуры"),
              (c.get("shared_s"), f"рядом другие задачи (до {c.get('max_neighbours', 0)})")]
     out = [f"{label} {fmt_dur(v)}" for v, label in parts if (v or 0) >= 1]
     if (c.get("owner_cpu_avg") or 0) >= 0.5:
         out.append(f"владелец занимал в среднем {c['owner_cpu_avg']:.1f} яд.")
-    return "; ".join(out) or "чистые"
+    return ("; ".join(out) or "чистые") + tail
 
 
 def cmd_retime(args) -> int:
@@ -637,7 +648,8 @@ def past_rows(c: Client, all_agents: bool) -> list[dict]:
                     "peak_ram": num(row.get("peak_ram_gb")) or 0.0, "ram": num(row.get("ram_claim_gb")) or 0.0,
                     "cpu": num(row.get("cpu_claim")) or 0.0, "cpu_avg": num(row.get("cpu_avg_cores")),
                     "pc": row.get("pc"), "finished": row.get("finished"), "agent": row.get("agent"),
-                    "wait_s": (num(row.get("wait_min")) or 0) * 60})
+                    "wait_s": (num(row.get("wait_min")) or 0) * 60, "cpu_power_w": num(row.get("cpu_power_w")),
+                    "clock_p_ghz": num(row.get("clock_p_ghz")), "clock_e_ghz": num(row.get("clock_e_ghz"))})
     return list(reversed(out))
 
 
@@ -659,15 +671,18 @@ def cmd_past(args) -> int:
     if not rows:
         print("подходящих завершённых задач нет")
         return 0
+    clocks = any(t.get("clock_p_ghz") is not None for t in rows)  # the CPU's speed then (LibreHardwareMonitor)
     print(f"{'#':<6}{'задача':<28}{'итог':<12}{'работала':>10}{'заявка':>9}{'пик ОЗУ':>10}{'заявка':>8}"
-          f"{'ядер ср.':>10}{'заявка':>8}")
+          f"{'ядер ср.':>10}{'заявка':>8}" + (f"{'ГГц':>7}" if clocks else ""))
     for t in rows:
         run = t.get("run_s") or 0
         cores = t.get("cpu_avg") if "cpu_avg" in t else (t.get("cpu_s") or 0) / run if run > 60 and t.get("cpu_s") else None
         pr = t.get("peak_ram") or 0
         peak = f"{pr:.1f} ГБ" if pr >= 1 else f"{pr * 1024:.0f} МБ"
+        ghz = f"{t['clock_p_ghz']:.2f}" if t.get("clock_p_ghz") is not None else "–"
         print(f"#{t['id']:<5}{(t['name'] or '')[:27]:<28}{t['state_text'][:11]:<12}{fmt_dur(run):>10}{fmt_dur(t['time_s']):>9}"
-              f"{peak:>10}{t['ram']:>6g} ГБ{(f'{cores:.1f}' if cores is not None else '–'):>10}{t['cpu']:>8g}")
+              f"{peak:>10}{t['ram']:>6g} ГБ{(f'{cores:.1f}' if cores is not None else '–'):>10}{t['cpu']:>8g}"
+              + (f"{ghz:>7}" if clocks else ""))
     done = [t for t in rows if t["state"] == "done" and (t.get("run_s") or 0) > 0]
     if done:
         runs = sorted(t["run_s"] for t in done)
@@ -736,9 +751,12 @@ def cmd_history(args) -> int:
     span = (ts[-1] - ts[0]) / rows
     where = f"ПК {args.pc}" if args.pc else "этот ПК"
     head = f"задача #{args.task}" + (f" «{claim['name']}», заявка {claim['cpu']:g} яд." if claim else "") if key else "весь ПК"
-    print(f"{head}, {where}: последние {fmt_dur(ts[-1] - ts[0])}, отрезки по ~{fmt_dur(span)} (средние; °C — максимум)")
-    cols = "владелец CPU  задачи CPU  ОЗУ задач  CPU °C" + ("   задача: ядер сред/макс  ОЗУ, ГБ" if key else "")
-    print(f"{'время':<13}  {cols}  примечания")
+    print(f"{head}, {where}: последние {fmt_dur(ts[-1] - ts[0])}, отрезки по ~{fmt_dur(span)} (средние; °C — максимум"
+          f"{'; ГГц — средняя частота P-ядер' if any(x is not None for x in m.get('clock_p') or []) else ''})")
+    power = any(x is not None for x in m.get("cpu_power") or [])  # measured (LibreHardwareMonitor)
+    cols = ("владелец CPU  задачи CPU  ОЗУ задач  CPU °C" + ("  CPU Вт  ГГц" if power else "")
+            + ("   задача: ядер сред/макс  ОЗУ, ГБ" if key else ""))
+    print(f"{'время':<{25 if ts[-1] - ts[0] > 86400 else 13}}  {cols}  примечания")
     avg = lambda xs: sum(xs) / len(xs) if xs else None
     for k in range(rows):
         lo, hi = ts[0] + k * span, ts[0] + (k + 1) * span
@@ -756,9 +774,13 @@ def cmd_history(args) -> int:
             notes.append("перегрев — задачи стояли")
         elif heat >= 1:
             notes.append("регулятор урезал")
-        line = (f"{time.strftime('%H:%M', time.localtime(lo))}–{time.strftime('%H:%M', time.localtime(hi))}  "
+        when = "%d.%m %H:%M" if ts[-1] - ts[0] > 86400 else "%H:%M"  # longer than a day: with dates
+        line = (f"{time.strftime(when, time.localtime(lo))}–{time.strftime(when, time.localtime(hi))}  "
                 f"{(user or 0):>11.0f}%  {(tasks or 0):>9.0f}%  {(ram or 0):>6.1f} ГБ  "
                 f"{(f'{max(temps):.0f}' if temps else '–'):>6}")
+        if power:
+            pw, ck = avg(pick("cpu_power")), avg(pick("clock_p"))
+            line += f"  {(f'{pw:.0f}' if pw is not None else '–'):>6}  {(f'{ck:.2f}' if ck is not None else '–'):>4}"
         if key:
             per = [(m["tasks"][i] or {}).get(key) for i in idx]
             cores = [v[0] * n_cpu / 100 if v else 0.0 for v in per]
@@ -813,6 +835,9 @@ def cmd_stats(args) -> int:
             temps.append(f"{name} до {t[f'{c}_max_c']:.0f}°C" + (f" (при расчётах в среднем {load:.0f}°C)" if load else ""))
     if temps:
         print("температура: " + "; ".join(temps))
+    if t.get("cpu_power_max_w") is not None:
+        cpu = cpu_text(t.get("cpu_power_load_avg_w"), t.get("clock_p_load_ghz"), t.get("clock_e_load_ghz"))
+        print(f"процессор: мощность до {t['cpu_power_max_w']:.0f} Вт" + (f"; во время расчётов в среднем {cpu}" if cpu else ""))
     print(f"ограничения: регулятор температуры {hours(t['regulator_min'])}, заморозка от перегрева "
           f"{hours(t['heat_frozen_min'])}, от нехватки места {hours(t['disk_frozen_min'])}; "
           f"игра владельца {hours(t['game_min'])}, пауза всех {hours(t['paused_min'])}")
@@ -866,6 +891,10 @@ def cmd_top(args) -> int:
     if c["total"] > c["limit"] * c["max_pct"] / 100:
         print(f"ПОДКАЧКА: занято {c['total']:.0f} из {c['limit']:.0f} ГБ — новые задачи не стартуют")
     th = st.get("thermal") or {}
+    temps = [f"{r['label']} {r['temp']:.0f}°C" for r in th.get("readings") or [] if r.get("temp") is not None]
+    cpu = cpu_text(th.get("cpu_power"), th.get("clock_p"), th.get("clock_e"))
+    if temps or cpu:
+        print("датчики: " + ", ".join(temps) + (f"; процессор: {cpu}" if cpu else ""))
     if th.get("enabled") and th.get("state") == "hot":
         print(f"ТЕМПЕРАТУРА: перегрев — {th['trigger']}; все задачи заморожены до остывания")
     elif th.get("enabled") and th.get("factor", 1) < 0.995:

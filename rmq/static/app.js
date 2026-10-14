@@ -913,7 +913,8 @@
   const HEAT_NAMES = ['норма', 'регулятор урезает процессор задачам', 'перегрев — задачи агентов заморожены'];
   class LevelChart {
     // o: { title, series, color, min, max, step, values(), fmt(v), tick(v), refs() -> [{ v, color, dash, cls, label, text }],
-    //      sub(), hidden(), empty(), wide }
+    //      sub(), hidden(), empty(), wide, more() -> [{ series, color, values() }] (further lines) }
+    // max may be a function (a scale that follows the data); step then a function of max
     constructor(o, src = MAIN_SRC) {
       this.o = o;
       this.src = src;
@@ -946,12 +947,16 @@
       if (off) return;
       setText(this.sub, this.o.sub());
       const refs = this.o.refs();
-      const sig = refs.map((r) => `${r.label}|${r.text}`).join(',');
+      const lines = [{ series: this.o.series, color: this.o.color }, ...this.more()];
+      const sig = [...lines.map((s) => s.series), ...refs.map((r) => `${r.label}|${r.text}`)].join(',');
       if (this.legend.dataset.sig !== sig) {
         this.legend.dataset.sig = sig;
-        const key = h('span', { class: 'key line' });
-        key.style.borderTop = `2px solid var(${this.o.color})`;
-        this.legend.replaceChildren(h('span', null, key, this.o.series),
+        const lineKey = (s) => {
+          const key = h('span', { class: 'key line' });
+          key.style.borderTop = `2px solid var(${s.color})`;
+          return h('span', null, key, s.series);
+        };
+        this.legend.replaceChildren(...lines.map(lineKey),
           ...refs.map((r) => h('span', null, h('span', { class: `key ${r.cls}` }), `${r.label} `, h('b', null, r.text))));
       }
       this.plot.hidden = this.showTable;
@@ -959,18 +964,25 @@
       if (this.showTable) this.renderTable(); else this.draw();
     }
 
+    more() { return this.o.more ? this.o.more() : []; }
+
+    scale() {
+      const max = typeof this.o.max === 'function' ? this.o.max() : this.o.max;
+      return { min: this.o.min, max, step: typeof this.o.step === 'function' ? this.o.step(max) : this.o.step };
+    }
+
     renderTable() {
       const m = chartData(this.src);
-      const v = this.o.values();
+      const lines = [{ series: this.o.series, v: this.o.values() }, ...this.more().map((s) => ({ series: s.series, v: s.values() }))];
       if (!m || !m.t.length) { this.tableEl.replaceChildren(h('p', { class: 'muted' }, 'Нет данных')); return; }
       const n = m.t.length;
       const stride = Math.max(1, Math.floor(n / 30));
       const rows = [];
       for (let i = n - 1; i >= 0; i -= stride) rows.push(i);
       this.tableEl.replaceChildren(h('table', null,
-        h('thead', null, h('tr', null, h('th', null, `Время${smoothNote()}`), h('th', { class: 'num' }, this.o.series), h('th', null, 'Режим'))),
+        h('thead', null, h('tr', null, h('th', null, `Время${smoothNote()}`), lines.map((s) => h('th', { class: 'num' }, s.series)), h('th', null, 'Режим'))),
         h('tbody', null, rows.map((i) => h('tr', null, h('td', { class: 'num' }, tipTime(m.t[i])),
-          h('td', { class: 'num' }, v[i] == null ? '–' : this.o.fmt(v[i])),
+          lines.map((s) => h('td', { class: 'num' }, s.v[i] == null ? '–' : this.o.fmt(s.v[i]))),
           h('td', null, HEAT_NAMES[Math.round(m.heat[i] || 0)] || ''))))));
     }
 
@@ -978,7 +990,7 @@
       const w = this.plot.clientWidth;
       const ht = this.plot.clientHeight;
       const pad = { l: 40, r: 12, t: 8, b: 24 };
-      const { min, max } = this.o;
+      const { min, max } = this.scale();
       const mx = this.src.metrics;
       const t1 = mx && mx.t.length ? mx.t[mx.t.length - 1] : Date.now() / 1000;
       const t0 = t1 - RANGE;
@@ -1011,6 +1023,7 @@
       this._g = g;
       this._m = has ? m : null;
       this._v = v;
+      this._more = this.more().map((s) => ({ ...s, v: s.values() }));
       // periods of regulation and of the freeze as quiet bands
       if (has && m.heat) {
         for (const [level, color, a] of [[1, col.warm, 0.10], [2, col.hot, 0.09]]) {
@@ -1030,9 +1043,10 @@
       c.lineWidth = 1;
       c.textAlign = 'right';
       c.textBaseline = 'middle';
-      for (let t = this.o.min; t <= this.o.max; t += this.o.step) {
+      const sc = this.scale();
+      for (let t = sc.min; t <= sc.max + 1e-9; t += sc.step) {
         const y = Math.round(g.Y(t)) + 0.5;
-        c.strokeStyle = t === this.o.min ? col.axis : col.grid;
+        c.strokeStyle = t === sc.min ? col.axis : col.grid;
         c.beginPath(); c.moveTo(g.pad.l, y); c.lineTo(g.w - g.pad.r, y); c.stroke();
         c.fillStyle = col.muted;
         c.fillText(this.o.tick(t), g.pad.l - 6, y);
@@ -1052,7 +1066,7 @@
         c.beginPath(); c.moveTo(g.pad.l, y); c.lineTo(g.w - g.pad.r, y); c.stroke();
       }
       c.setLineDash([]);
-      if (!has || !v.some((x) => x != null)) {
+      if (!has || ![v, ...this._more.map((s) => s.v)].some((vals) => vals.some((x) => x != null))) {
         c.fillStyle = col.muted;
         c.textBaseline = 'middle';
         c.fillText(this.o.empty(), g.pad.l + g.pw / 2, g.pad.t + g.ph / 2);
@@ -1061,16 +1075,19 @@
         return;
       }
       const gapAt = Math.max(3, (m.step || 1) * 3.5);
-      c.strokeStyle = col.line; c.lineWidth = 2; c.lineJoin = 'round'; c.lineCap = 'round';
-      c.beginPath();
-      let pen = false;
-      for (let i = 0; i < m.t.length; i += 1) {
-        if (v[i] == null || (i > 0 && m.t[i] - m.t[i - 1] > gapAt)) pen = false;
-        if (v[i] == null) continue;
-        const x = g.X(m.t[i]); const y = g.Y(v[i]);
-        if (pen) c.lineTo(x, y); else { c.moveTo(x, y); pen = true; }
+      c.lineWidth = 2; c.lineJoin = 'round'; c.lineCap = 'round';
+      for (const [vals, color] of [...this._more.map((s) => [s.v, cssVar(s.color)]), [v, col.line]]) {
+        c.strokeStyle = color;
+        c.beginPath();
+        let pen = false;
+        for (let i = 0; i < m.t.length; i += 1) {
+          if (vals[i] == null || (i > 0 && m.t[i] - m.t[i - 1] > gapAt)) pen = false;
+          if (vals[i] == null) continue;
+          const x = g.X(m.t[i]); const y = g.Y(vals[i]);
+          if (pen) c.lineTo(x, y); else { c.moveTo(x, y); pen = true; }
+        }
+        c.stroke();
       }
-      c.stroke();
       this.drawHover();
     }
 
@@ -1081,6 +1098,7 @@
       if (this.hover == null || !m || this.hover >= m.t.length) return;
       const x = Math.round(g.X(m.t[this.hover])) + 0.5;
       crosshair(c, g, x);
+      for (const s of this._more || []) if (s.v[this.hover] != null) ringDot(c, x, g.Y(s.v[this.hover]), cssVar(s.color));
       if (v[this.hover] != null) ringDot(c, x, g.Y(v[this.hover]), cssVar(this.o.color));
     }
 
@@ -1092,11 +1110,11 @@
       if (i === this.hover && !tooltip.hidden) { placeTooltip(e); return; }
       this.hover = i;
       this.drawHover();
-      const v = this._v;
+      const lines = [{ series: this.o.series, color: this.o.color, v: this._v }, ...(this._more || [])];
       tooltip.replaceChildren(
         h('div', { class: 't' }, tipTime(m.t[i]) + smoothNote()),
-        h('div', { class: 'r' }, h('span', { class: 'lk', style: `border-top-color: var(${this.o.color})` }),
-          h('b', null, v[i] == null ? '–' : this.o.fmt(v[i])), h('span', null, this.o.series)),
+        ...lines.map((s) => h('div', { class: 'r' }, h('span', { class: 'lk', style: `border-top-color: var(${s.color})` }),
+          h('b', null, s.v[i] == null ? '–' : this.o.fmt(s.v[i])), h('span', null, s.series))),
         h('div', { class: 'r' }, h('span', null, `режим: ${HEAT_NAMES[Math.round(m.heat[i] || 0)] || '–'}`)));
       placeTooltip(e);
     }
@@ -1133,8 +1151,42 @@
     refs: () => [{ v: src.state.thermal.min_cpu_factor * 100, color: '--muted', dash: [2, 3], cls: 'thr', label: 'не меньше', text: `${Math.round(src.state.thermal.min_cpu_factor * 100)}%` }],
     empty: () => 'Данные появятся через пару секунд',
   }, src);
+  // a scale that follows the data: the highest value seen, rounded up to `unit`, but never below `floor`
+  const peakOf = (arrays, floor, unit) => {
+    let hi = floor;
+    for (const a of arrays) for (const x of a || []) if (x != null && x > hi) hi = x;
+    return Math.ceil(hi / unit) * unit;
+  };
+  const thermalOf = (src) => (src.state && src.state.thermal) || {};
+  const powerChart = (src) => new LevelChart({
+    title: 'Мощность процессора, Вт', series: 'пакет процессора', color: '--s-temp', min: 0,
+    max: () => { const hi = peakOf([(chartData(src) || {}).cpu_power], 40, 1); const st = niceStep(hi / 4); return Math.ceil(hi / st) * st; },
+    step: (mx) => niceStep(mx / 4),
+    values: () => (chartData(src) || {}).cpu_power || [],
+    fmt: (v) => `${Math.round(v)} Вт`, tick: (v) => `${v}`,
+    hidden: () => thermalOf(src).cpu_power == null,
+    sub: () => `сейчас ${Math.round(thermalOf(src).cpu_power)} Вт · по LibreHardwareMonitor`,
+    refs: () => [],
+    empty: () => 'Данные появятся через пару секунд',
+  }, src);
+  const clockChart = (src) => new LevelChart({
+    title: 'Частота ядер процессора, ГГц', color: '--c1', min: 0,
+    get series() { return thermalOf(src).clock_e != null ? 'P-ядра' : 'ядра'; },
+    max: () => { const m = chartData(src) || {}; return peakOf([m.clock_p, m.clock_e], 3, 1); }, step: () => 1,
+    values: () => (chartData(src) || {}).clock_p || [],
+    more: () => (thermalOf(src).clock_e != null
+      ? [{ series: 'E-ядра', color: '--c2', values: () => (chartData(src) || {}).clock_e || [] }] : []),
+    fmt: (v) => `${nf2.format(v)} ГГц`, tick: (v) => `${v}`,
+    hidden: () => thermalOf(src).clock_p == null,
+    sub: () => {
+      const th = thermalOf(src);
+      return `сейчас ${th.clock_e != null ? `P ${nf2.format(th.clock_p)} · E ${nf2.format(th.clock_e)}` : nf2.format(th.clock_p)} ГГц · в среднем по ядрам`;
+    },
+    refs: () => [],
+    empty: () => 'Данные появятся через пару секунд',
+  }, src);
   const thermalCharts = (src) => [tempChart('cpu', 'Процессор', src), tempChart('gpu', 'Видеокарта', src),
-    tempChart('board', 'Плата (ACPI)', src), tempChart('ssd', 'SSD', src), shareChart(src)];
+    tempChart('board', 'Плата (ACPI)', src), tempChart('ssd', 'SSD', src), powerChart(src), clockChart(src), shareChart(src)];
   const tempCharts = thermalCharts(MAIN_SRC);
   $('#thermal-charts').append(...tempCharts.map((c) => c.root));
 
@@ -1483,13 +1535,17 @@
 
   // what a task ran under, for timings it makes itself (the same as its RMQ_CONDITIONS_FILE)
   function conditionsText(c) {
-    if (c.clean) return 'чистые: без пауз, сна, урезания процессора и соседних задач';
+    const cpu = [c.cpu_power_w != null ? `процессор в среднем ${Math.round(c.cpu_power_w)} Вт` : null,
+      c.clock_p_ghz != null ? `${c.clock_e_ghz != null ? 'P-ядра' : 'ядра'} ${nf2.format(c.clock_p_ghz)} ГГц` : null,
+      c.clock_e_ghz != null ? `E-ядра ${nf2.format(c.clock_e_ghz)} ГГц` : null].filter(Boolean).join(', ');
+    const withCpu = (text) => (cpu ? `${text}; ${cpu}` : text);
+    if (c.clean) return withCpu('чистые: без пауз, сна, урезания процессора и соседних задач');
     const parts = [[c.paused_s, 'на паузе'], [c.slept_s, 'ПК спал'], [c.held_s, 'урезанный процессор'],
       [c.ecores_s, 'только E-ядра (игра)'], [c.throttled_s, 'регулятор температуры'],
       [c.shared_s, `рядом другие задачи (до ${c.max_neighbours})`]];
     const out = parts.filter(([v]) => (v || 0) >= 1).map(([v, label]) => `${label} ${dur(v)}`);
     if ((c.owner_cpu_avg || 0) >= 0.5) out.push(`владелец занимал в среднем ${n1(c.owner_cpu_avg)} яд.`);
-    return out.join('; ') || 'чистые';
+    return withCpu(out.join('; ') || 'чистые');
   }
 
   // a task whose CPU use goes up and down in waves (phases of waiting: checks, locks, disk or network)
@@ -2383,6 +2439,9 @@
   const statCharts = [computeChart, tempStatChart];
   $('#stats-charts').append(...statCharts.map((c) => c.root));
 
+  const watts = (v) => (v == null ? '–' : `${Math.round(v)} Вт`);
+  const ghz = (v) => (v == null ? '–' : `${nf2.format(v)} ГГц`);
+
   function renderStatsTiles(rep) {
     const t = rep.total;
     const obsH = t.observed_min / 60;
@@ -2398,7 +2457,12 @@
         kv(null, 'В среднем во время расчётов', deg(t.cpu_load_avg_c)),
         kv(null, `Выше цели ${rep.targets.cpu}°`, mins(t.cpu_over_target_min)),
         kv(null, 'Регулятор урезал процессор', `${mins(t.regulator_min)}${t.regulator_min >= 1 && t.cpu_share_pct != null ? `; задачам в среднем ${Math.round(t.cpu_share_pct)}%` : ''}`),
-      ]),
+        t.cpu_power_max_w == null ? null
+          : kv(null, 'Мощность во время расчётов', `${watts(t.cpu_power_load_avg_w)} в среднем, до ${watts(t.cpu_power_max_w)}`),
+        t.clock_p_load_ghz == null ? null
+          : kv(null, 'Частота во время расчётов', t.clock_e_load_ghz == null ? ghz(t.clock_p_load_ghz)
+            : `P-ядра ${ghz(t.clock_p_load_ghz)} · E-ядра ${ghz(t.clock_e_load_ghz)}`),
+      ].filter(Boolean)),
       tile('Перегревы', String(t.heat_freezes), times(t.heat_freezes), null, [
         kv(null, 'Расчёты стояли из-за перегрева', mins(t.heat_frozen_min)),
         kv(null, 'Максимум', others.map((c) => `${COMP_SHORT[c]} ${deg(t[`${c}_max_c`])}`).join(' · ')),
@@ -2414,15 +2478,16 @@
   function renderStatsTable(rep) {
     setText($('#stats-table-title'), rep.bucket === 'hour' ? 'По часам' : 'По дням');
     const head = [rep.bucket === 'hour' ? 'Час' : 'День', 'Расчёты', 'CPU задачам, ядро-ч', 'GPU задачам, ч',
-      'Макс. °C: CPU · плата · GPU · SSD', 'CPU при расчётах', 'CPU выше цели', 'Регулятор', 'Перегревы', 'Записано, ГБ',
-      'Готово / ошибок'];
+      'Макс. °C: CPU · плата · GPU · SSD', 'CPU при расчётах', 'CPU, Вт при расчётах', 'CPU выше цели', 'Регулятор',
+      'Перегревы', 'Записано, ГБ', 'Готово / ошибок'];
     $('#t-stats thead').replaceChildren(h('tr', null, head.map((x, i) => h('th', { class: i ? 'num' : null }, x))));
     const num = (x) => h('td', { class: 'num' }, x);
     $('#t-stats tbody').replaceChildren(...[...rep.buckets].reverse().map((b) => (b.hours
       ? h('tr', null, h('td', { class: 'nowrap' }, bucketLabel(b, true)), num(mins(b.compute_min)), num(n1(b.tasks_cpu_core_h)),
         num(nf2.format(b.tasks_gpu_h)),
         num(['cpu', 'board', 'gpu', 'ssd'].map((c) => (b[`${c}_max_c`] == null ? '–' : Math.round(b[`${c}_max_c`]))).join(' · ')),
-        num(deg(b.cpu_load_avg_c)), num(mins(b.cpu_over_target_min)), num(mins(b.regulator_min)),
+        num(deg(b.cpu_load_avg_c)), num(b.cpu_power_load_avg_w == null ? '–' : String(Math.round(b.cpu_power_load_avg_w))),
+        num(mins(b.cpu_over_target_min)), num(mins(b.regulator_min)),
         num(b.heat_freezes ? `${b.heat_freezes} (${mins(b.heat_frozen_min)})` : '0'), num(n1(b.disk_write_gb)),
         num(`${b.tasks_done} / ${b.tasks_failed}`))
       : h('tr', { class: 'off' }, h('td', { class: 'nowrap' }, bucketLabel(b, true)), h('td', { colspan: head.length - 1 }, 'менеджер не работал')))));

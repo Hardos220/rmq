@@ -305,7 +305,9 @@ def dashboard_checks(a: Instance, base: Path) -> None:
     print("дашборд (Edge без окна):")
     shots = Path(tempfile.gettempdir()) / "rmq-e2e-shots"  # kept after the run, replaced by the next one
     shots.mkdir(exist_ok=True)
-    pages = {"main": "tab=overview", "home": "tab=network&net=home", "stats": "tab=stats", "chronicle": "tab=chronicle"}
+    pages = {"main": "tab=overview", "home": "tab=network&net=home", "stats": "tab=stats", "chronicle": "tab=chronicle",
+             "thermal": "tab=thermal"}
+    power = a.ok("GET", "/api/state")["thermal"].get("cpu_power") is not None  # LibreHardwareMonitor on this PC
     for name, hash_ in pages.items():
         url = f"http://127.0.0.1:{a.port}/#token={a.token}&{hash_}"
         flags = ["--headless=new", "--disable-gpu", "--no-first-run", f"--user-data-dir={base / 'edge'}",
@@ -324,6 +326,9 @@ def dashboard_checks(a: Instance, base: Path) -> None:
             check('id="pc-active"' in dom and "сон-2" in dom, "во «Внутренней сети» задачи Б")
         if name == "stats":
             check('id="stats-pc"' in dom and "Все мои ПК" in dom, "в статистике выбор ПК")
+        if name == "thermal" and power:
+            tag = re.search(r'<section[^>]*aria-label="Мощность процессора, Вт"[^>]*>', dom)
+            check(bool(tag) and "hidden" not in tag.group(0), "на вкладке «Температура» мощность процессора")
     print(f"  снимки страниц: {shots}")
 
 

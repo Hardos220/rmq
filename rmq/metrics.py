@@ -28,6 +28,8 @@ COLUMNS = (
     "temp_cpu", "temp_board", "temp_gpu", "temp_ssd",  # degrees C, None = not measured
     "heat",                                        # 0 normal, 1 the regulator cuts the CPU, 2 hot (frozen)
     "cpu_factor",                                  # % of their CPU the temperature regulator leaves tasks
+    "cpu_power",                                   # W, the CPU package (LibreHardwareMonitor), None = not measured
+    "clock_p", "clock_e",                          # GHz, the P- and E-cores' average clock (no E-cores: all in clock_p)
 )
 
 

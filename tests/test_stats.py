@@ -180,7 +180,8 @@ def test_charts_keep_a_month_of_5_minute_averages(tmp_path):
     assert m.series(86400)["step"] == 3 and m.series(3600)["step"] == 1   # the right tier for each period
     now = _t.time()                                             # the month comes back after a restart
     m2 = Metrics()
-    m2._long.extend([(now - 3000.0 + k * 300, *([1.0] * 21), {}) for k in range(3)])
+    from rmq.metrics import COLUMNS
+    m2._long.extend([(now - 3000.0 + k * 300, *([1.0] * len(COLUMNS)), {}) for k in range(3)])
     m2.save(tmp_path / "m.json.gz")
     again = Metrics()
     again.load(tmp_path / "m.json.gz", now)
@@ -191,3 +192,54 @@ def test_charts_keep_a_month_of_5_minute_averages(tmp_path):
     s = again.series(30 * 86400)
     assert n == len({int(x["t"] // 300) for x in minutes})        # 10 minutes: their 5-minute slots
     assert len(s["t"]) == 3 + n and s["t"] == sorted(s["t"]) and s["cpu_user"][0] == 20.0
+
+
+def test_cpu_power_and_clocks_by_the_hour_and_minute(tmp_path):
+    book = StatsBook(tmp_path, now=H14)
+    for t in range(0, 600):                                 # 10 min computing at 60 W, then 10 idle at 10 W
+        s = sample(compute=t < 300)
+        s["metrics"].update(cpu_power=60.0 if t < 300 else 10.0, clock_p=4.0 if t < 300 else 1.0, clock_e=3.0)
+        book.add(H14 + t, 1.0, s)
+    book.add(H14 + 3600, 1.0, sample())
+    r = rows(tmp_path / "hourly.csv")[0]
+    assert float(r["cpu_power_avg_w"]) == pytest.approx(35, abs=0.1)
+    assert float(r["cpu_power_load_avg_w"]) == pytest.approx(60, abs=0.1) and float(r["cpu_power_max_w"]) == 60
+    assert float(r["clock_p_load_ghz"]) == pytest.approx(4.0) and float(r["clock_e_load_ghz"]) == pytest.approx(3.0)
+    m = rows(tmp_path / "minutes-2026-10.csv")
+    assert float(m[0]["cpu_power_w"]) == 60 and float(m[0]["clock_p_ghz"]) == 4 and float(m[-1]["cpu_power_w"]) == 10
+    t = book.report("24h", now=H14 + 3600)["total"]
+    assert t["cpu_power_load_avg_w"] == pytest.approx(60, abs=0.1)
+
+
+def test_a_file_from_an_older_version_gets_the_new_columns(tmp_path):
+    from rmq import stats
+    old = [c for c in stats.MINUTES if c not in ("cpu_power_w", "clock_p_ghz", "clock_e_ghz")]
+    path = tmp_path / "minutes-2026-10.csv"
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(old)
+        w.writerow(["2026-10-10 13:59" if c == "time" else "1" for c in old])
+    stats._HEADERS.pop(str(path), None)
+    book = StatsBook(tmp_path, now=H14)
+    for t in range(0, 61):
+        s = sample()
+        s["metrics"].update(cpu_power=50.0)
+        book.add(H14 + t, 1.0, s)
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        head = next(csv.reader(f))
+    assert head == stats.MINUTES                              # the header now has the new columns
+    m = rows(path)
+    assert m[0]["time"] == "2026-10-10 13:59" and m[0]["temp_cpu"] == "1" and m[0]["cpu_power_w"] == ""
+    assert m[1]["time"] == "2026-10-10 14:00" and float(m[1]["cpu_power_w"]) == 50 and float(m[1]["temp_cpu"]) == 70
+
+
+def test_a_task_keeps_the_cpu_power_and_clocks_it_ran_at():
+    import json
+    from rmq.manager import Manager
+    m = object.__new__(Manager)
+    c = m._cond_of({"cond": None})
+    assert c["sense"] == {} and Manager._sensed(c) == {"cpu_power_w": None, "clock_p_ghz": None, "clock_e_ghz": None}
+    c["sense"]["power"] = [40.0 * 10 + 80.0 * 30, 40.0]       # 10 s at 40 W, 30 s at 80 W
+    c["sense"]["clock_p"] = [3.5 * 40, 40.0]
+    again = m._cond_of({"cond": json.dumps(c)})               # saved with the task and read back
+    assert Manager._sensed(again) == {"cpu_power_w": 70.0, "clock_p_ghz": 3.5, "clock_e_ghz": None}

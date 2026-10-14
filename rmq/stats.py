@@ -38,6 +38,8 @@ HOURLY = ["hour", "observed_min", "compute_min", "tasks_cpu_core_h", "tasks_cpu_
 for _c in COMPONENTS:
     HOURLY += [f"{_c}_avg_c", f"{_c}_load_avg_c", f"{_c}_max_c", f"{_c}_over_target_min",
                f"{_c}_measured_min", f"{_c}_load_measured_min"]
+HOURLY += ["cpu_power_avg_w", "cpu_power_load_avg_w", "cpu_power_max_w", "clock_p_load_ghz", "clock_e_load_ghz",
+           "cpu_power_measured_min", "cpu_power_load_measured_min"]
 HOURLY += ["regulator_min", "cpu_share_pct", "heat_frozen_min", "disk_frozen_min", "disk_free_min_gb",
            "game_min", "paused_min", "battery_min", *COUNTS]
 AGENTS = ["hour", "agent", "task_h", "cpu_core_h", "gpu_h", "ram_gb_h", "disk_read_gb", "disk_write_gb",
@@ -45,27 +47,30 @@ AGENTS = ["hour", "agent", "task_h", "cpu_core_h", "gpu_h", "ram_gb_h", "disk_re
 MINUTES = ["time", "cpu_user_pct", "cpu_tasks_pct", "cpu_limit_pct", "ram_user_gb", "ram_tasks_gb",
            "vram_user_gb", "vram_tasks_gb", "gpu_user_pct", "gpu_tasks_pct", "running", "queued", "suspended",
            "game", "cpu_share_pct", "heat", "temp_cpu", "temp_cpu_max", "temp_board", "temp_gpu", "temp_ssd",
-           "disk_free_gb"]
+           "cpu_power_w", "clock_p_ghz", "clock_e_ghz", "disk_free_gb"]
 # minute columns averaged from the dashboard's metrics (the rest are computed separately)
 _MINUTE_AVG = {"cpu_user_pct": "cpu_user", "cpu_tasks_pct": "cpu_tasks", "cpu_limit_pct": "cpu_limit",
                "ram_user_gb": "ram_user", "ram_tasks_gb": "ram_tasks", "vram_user_gb": "vram_user",
                "vram_tasks_gb": "vram_tasks", "gpu_user_pct": "gpu_user", "gpu_tasks_pct": "gpu_tasks",
                "running": "running", "queued": "queued", "suspended": "suspended", "game": "game",
                "cpu_share_pct": "cpu_factor", "temp_cpu": "temp_cpu", "temp_board": "temp_board",
-               "temp_gpu": "temp_gpu", "temp_ssd": "temp_ssd"}
+               "temp_gpu": "temp_gpu", "temp_ssd": "temp_ssd", "cpu_power_w": "cpu_power", "clock_p_ghz": "clock_p",
+               "clock_e_ghz": "clock_e"}
 KEEP_MINUTES_MONTHS = 12
 TASKS = ["finished", "id", "agent", "name", "state", "exit_code", "pc", "from_pc", "submitted", "started", "wait_min",
          "run_min", "cpu_claim", "ram_claim_gb", "vram_claim_gb", "time_claim_min", "cpu_avg_cores", "peak_ram_gb",
          "peak_vram_gb", "restarts", "held_min", "paused_min", "slept_min", "ecores_min", "throttled_min", "shared_min",
-         "series", "command"]
+         "cpu_power_w", "clock_p_ghz", "clock_e_ghz", "series", "command"]
 
 # summing, weighted-average, max and min columns, for combining hours into days and periods
 _SUM = {"observed_min", "compute_min", "tasks_cpu_core_h", "tasks_gpu_h", "gpu_busy_min", "disk_read_gb",
         "disk_write_gb", "regulator_min", "heat_frozen_min", "disk_frozen_min", "game_min", "paused_min",
-        "battery_min", *COUNTS}
+        "battery_min", "cpu_power_measured_min", "cpu_power_load_measured_min", *COUNTS}
 _WAVG = {"tasks_cpu_pct": "observed_min", "user_cpu_pct": "observed_min", "tasks_ram_gb_avg": "observed_min",
-         "cpu_share_pct": "compute_min"}
-_MAX = {"tasks_ram_gb_max", "tasks_vram_gb_max"}
+         "cpu_share_pct": "compute_min", "cpu_power_avg_w": "cpu_power_measured_min",
+         "cpu_power_load_avg_w": "cpu_power_load_measured_min", "clock_p_load_ghz": "cpu_power_load_measured_min",
+         "clock_e_load_ghz": "cpu_power_load_measured_min"}
+_MAX = {"tasks_ram_gb_max", "tasks_vram_gb_max", "cpu_power_max_w"}
 _MIN = {"disk_free_min_gb"}
 for _c in COMPONENTS:
     _SUM |= {f"{_c}_over_target_min", f"{_c}_measured_min", f"{_c}_load_measured_min"}
@@ -96,6 +101,11 @@ hourly.csv — по одной строке на час:
   <компонент>_max_c       максимальная температура, °C
   <компонент>_over_target_min  минуты выше цели регулятора
   <компонент>_measured_min, _load_measured_min  сколько минут температура измерялась (всего и под нагрузкой)
+  cpu_power_avg_w, _load_avg_w, _max_w  мощность процессора (пакет, по LibreHardwareMonitor): в среднем, в среднем
+                          во время расчётов и максимум, Вт
+  clock_p_load_ghz, clock_e_load_ghz  средняя частота P- и E-ядер во время расчётов, ГГц (у процессора без E-ядер —
+                          всех ядер, в clock_p)
+  cpu_power_measured_min, _load_measured_min  сколько минут мощность измерялась (всего и во время расчётов)
   regulator_min           минуты, когда регулятор урезал процессор задачам
   cpu_share_pct           средняя доля процессора, которую регулятор оставлял задачам, пока они работали, %
   heat_frozen_min         минуты заморозки из-за перегрева
@@ -116,12 +126,16 @@ tasks.csv — по строке на каждую завершённую зад�
   заявка (cpu_claim, ram_claim_gb, vram_claim_gb, time_claim_min), cpu_avg_cores (сколько ядер занимала в среднем),
   peak_ram_gb, peak_vram_gb, restarts, условия счёта в минутах: held_min (меньше заявленного процессора),
   paused_min, slept_min (ПК спал), ecores_min (только E-ядра, игра), throttled_min (регулятор), shared_min (рядом
-  другие задачи); series, command.
+  другие задачи); cpu_power_w, clock_p_ghz, clock_e_ghz (средняя мощность процессора и частоты ядер, пока задача
+  работала; пусто, если не измерялись); series, command.
 
 minutes-ГГГГ-ММ.csv — поминутно (хранятся 12 месяцев): средние значения графиков дашборда за минуту — нагрузка
   процессора (%), память и видеопамять (ГБ), видеокарта (%), число задач, доля игрового режима, доля процессора
   от регулятора (%), режим температуры (0 норма, 1 регулятор, 2 перегрев — максимум за минуту), температуры (°C;
-  temp_cpu_max — максимум за минуту) и свободное место на системном диске (ГБ).
+  temp_cpu_max — максимум за минуту), мощность процессора (cpu_power_w, Вт), частоты P- и E-ядер (clock_p_ghz,
+  clock_e_ghz, ГГц) и свободное место на системном диске (ГБ).
+
+Старые строки файлов, записанные до появления новой колонки, в ней пустые.
 """
 
 
@@ -142,6 +156,30 @@ def _parse(v: str):
         return v
 
 
+_HEADERS: dict[str, list[str]] = {}  # the header of each file appended to, as it is on disk
+
+
+def _upgrade_header(path: Path, columns: list[str]) -> list[str]:
+    """A file begun by an older version gets the columns added since (empty in its old rows), then rows are
+    appended to it in its new order. Columns are only ever added, but one the file has and the code no longer
+    writes is kept, not dropped."""
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        head = next(csv.reader(f), [])
+        if head == columns:
+            return head
+        rows = list(csv.DictReader(f, fieldnames=head))
+    keep = list(columns) + [c for c in head if c not in columns]
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(keep)
+        for r in rows:
+            w.writerow([r.get(c) or "" for c in keep])
+    os.replace(tmp, path)
+    log.info("statistics file %s: new columns %s", path.name, ", ".join(c for c in columns if c not in head))
+    return keep
+
+
 def _hour_key(t: float) -> str:
     return time.strftime("%Y-%m-%d %H", time.localtime(t))
 
@@ -155,7 +193,8 @@ def _new_hour() -> dict:
     a = {"observed": 0.0, "compute": 0.0, "cpu_core_s": 0.0, "user_core_s": 0.0, "cpu_n_s": 0.0, "ram_gbs": 0.0,
          "ram_max": 0.0, "vram_max": 0.0, "gpu_util_s": 0.0, "gpu_busy": 0.0, "io_read": 0.0, "io_write": 0.0,
          "regulated": 0.0, "share_s": 0.0, "heat_frozen": 0.0, "disk_frozen": 0.0, "disk_free_min": None,
-         "game": 0.0, "paused": 0.0, "battery": 0.0}
+         "game": 0.0, "paused": 0.0, "battery": 0.0, "pw_sum": 0.0, "pw_s": 0.0, "pw_lsum": 0.0, "pw_ls": 0.0,
+         "pw_max": None, "cp_lsum": 0.0, "cp_ls": 0.0, "ce_lsum": 0.0, "ce_ls": 0.0}
     for c in COMPONENTS:
         a.update({f"{c}_sum": 0.0, f"{c}_s": 0.0, f"{c}_lsum": 0.0, f"{c}_ls": 0.0, f"{c}_max": None,
                   f"{c}_over": 0.0})
@@ -188,6 +227,10 @@ def hour_row(key: str, a: dict) -> dict:
         r[f"{c}_over_target_min"] = a[f"{c}_over"] / 60
         r[f"{c}_measured_min"] = a[f"{c}_s"] / 60
         r[f"{c}_load_measured_min"] = a[f"{c}_ls"] / 60
+    r.update({"cpu_power_avg_w": ratio(a["pw_sum"], a["pw_s"]), "cpu_power_load_avg_w": ratio(a["pw_lsum"], a["pw_ls"]),
+              "cpu_power_max_w": a["pw_max"], "clock_p_load_ghz": ratio(a["cp_lsum"], a["cp_ls"]),
+              "clock_e_load_ghz": ratio(a["ce_lsum"], a["ce_ls"]), "cpu_power_measured_min": a["pw_s"] / 60,
+              "cpu_power_load_measured_min": a["pw_ls"] / 60})
     r.update({"regulator_min": a["regulated"] / 60, "cpu_share_pct": ratio(a["share_s"], comp, 100),
               "heat_frozen_min": a["heat_frozen"] / 60, "disk_frozen_min": a["disk_frozen"] / 60,
               "disk_free_min_gb": a["disk_free_min"], "game_min": a["game"] / 60, "paused_min": a["paused"] / 60,
@@ -283,13 +326,18 @@ class StatsBook:
     @staticmethod
     def _append(path: Path, columns: list[str], rows: list[dict], digits: dict | None = None) -> None:
         new = not path.exists() or path.stat().st_size == 0
+        if new:
+            _HEADERS[str(path)] = list(columns)
+        elif str(path) not in _HEADERS:
+            _HEADERS[str(path)] = _upgrade_header(path, columns)
+        header = _HEADERS[str(path)]
         with open(path, "a", encoding="utf-8-sig" if new else "utf-8", newline="") as f:
             w = csv.writer(f)
             if new:
                 w.writerow(columns)
             for r in rows:
                 w.writerow([r.get(c) if isinstance(r.get(c), str) else _fmt(r.get(c), (digits or {}).get(c, 3))
-                            for c in columns])
+                            for c in header])
 
     def _write_readme(self) -> None:
         path = self.folder / "README.txt"
@@ -323,7 +371,8 @@ class StatsBook:
             return
         row = hour_row(key, acc)
         arows = [agent_row(key, n, a) for n, a in sorted(agents.items())]
-        digits = {c: 1 for c in HOURLY if c.endswith(("_min", "_c", "_pct"))}
+        digits = {c: 1 for c in HOURLY if c.endswith(("_min", "_c", "_pct", "_w"))}
+        digits.update(clock_p_load_ghz=2, clock_e_load_ghz=2)
         self._append(self.hourly_path, HOURLY, [row], digits)
         if arows:
             self._append(self.agents_path, AGENTS, arows)
@@ -357,7 +406,8 @@ class StatsBook:
             try:
                 self._append(self.tasks_path, TASKS, rows, {"wait_min": 2, "run_min": 2, "time_claim_min": 1,
                                                              "held_min": 1, "paused_min": 1, "slept_min": 1,
-                                                             "ecores_min": 1, "throttled_min": 1, "shared_min": 1})
+                                                             "ecores_min": 1, "throttled_min": 1, "shared_min": 1,
+                                                             "cpu_power_w": 1, "clock_p_ghz": 2, "clock_e_ghz": 2})
             except OSError as e:
                 self._io_failed(e)
 
@@ -374,7 +424,8 @@ class StatsBook:
                        "vram_tasks": "vram_tasks_gb", "gpu_user": "gpu_user_pct", "gpu_tasks": "gpu_tasks_pct",
                        "running": "running", "queued": "queued", "suspended": "suspended", "game": "game",
                        "cpu_factor": "cpu_share_pct", "heat": "heat", "temp_cpu": "temp_cpu",
-                       "temp_board": "temp_board", "temp_gpu": "temp_gpu", "temp_ssd": "temp_ssd"}
+                       "temp_board": "temp_board", "temp_gpu": "temp_gpu", "temp_ssd": "temp_ssd",
+                       "cpu_power": "cpu_power_w", "clock_p": "clock_p_ghz", "clock_e": "clock_e_ghz"}
 
     def minutes_since(self, since: float) -> list[dict]:
         """Per-minute rows after `since`, as {"t": the minute's start, chart column: value}."""
@@ -448,6 +499,19 @@ class StatsBook:
                 a[f"{c}_max"] = temp if a[f"{c}_max"] is None else max(a[f"{c}_max"], temp)
                 if temp > target:
                     a[f"{c}_over"] += dt
+            mv = s.get("metrics") or {}
+            pw = mv.get("cpu_power")
+            if pw is not None:
+                a["pw_sum"] += pw * dt
+                a["pw_s"] += dt
+                a["pw_max"] = pw if a["pw_max"] is None else max(a["pw_max"], pw)
+                if compute:
+                    a["pw_lsum"] += pw * dt
+                    a["pw_ls"] += dt
+            for src, k in (("clock_p", "cp"), ("clock_e", "ce")):
+                if compute and mv.get(src) is not None:
+                    a[f"{k}_lsum"] += mv[src] * dt
+                    a[f"{k}_ls"] += dt
             for flag, col in (("regulating", "regulated"), ("heat_frozen", "heat_frozen"),
                               ("disk_frozen", "disk_frozen"), ("game", "game"), ("paused", "paused"),
                               ("battery", "battery")):
@@ -502,8 +566,9 @@ class StatsBook:
             row[col] = m[col] / m[col + "#"] if m.get(col + "#") else None
         path = self.folder / f"minutes-{self._minute[:7]}.csv"
         digits = {c: 1 for c in MINUTES if c.endswith(("_pct", "temp_cpu", "temp_board", "temp_gpu", "temp_ssd",
-                                                        "_max"))}
-        self._append(path, MINUTES, [row], {**digits, "game": 2, "running": 2, "queued": 2, "suspended": 2})
+                                                        "_max", "_w"))}
+        self._append(path, MINUTES, [row], {**digits, "game": 2, "running": 2, "queued": 2, "suspended": 2,
+                                            "clock_p_ghz": 2, "clock_e_ghz": 2})
 
     def close(self) -> None:
         with self._lock:

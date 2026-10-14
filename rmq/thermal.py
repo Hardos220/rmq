@@ -238,8 +238,43 @@ def parse_lhm(tree: dict) -> float | None:
     return max(cores) if cores else None
 
 
+_CORE_CLOCK = re.compile(r"(P-Core|E-Core|CPU Core|Core) #\d+")
+
+
+def parse_lhm_cpu(tree: dict) -> dict:
+    """The CPU's package power ("power", W) and its cores' average clock ("clock_p", "clock_e", GHz: P- and E-cores
+    apart on a hybrid CPU, all cores in "clock_p" otherwise) from LibreHardwareMonitor's data.json. What it does
+    not show is left out."""
+    power: dict[str, float] = {}
+    clocks: dict[str, list[float]] = {"clock_p": [], "clock_e": []}
+
+    def walk(node: dict) -> None:
+        sid = node.get("SensorId", "")
+        if "cpu/" in sid:
+            name = node.get("Text", "")
+            v = _number(node.get("Value", ""))
+            if v is not None and "/power/" in sid:
+                power.setdefault(name, v)
+            elif v is not None and v > 0 and "/clock/" in sid and _CORE_CLOCK.fullmatch(name):
+                clocks["clock_e" if name.startswith("E-") else "clock_p"].append(v)
+        for child in node.get("Children", []):
+            walk(child)
+
+    walk(tree)
+    out = {}
+    for name in ("CPU Package", "Package"):
+        if name in power:
+            out["power"] = round(power[name], 1)
+            break
+    for k, vals in clocks.items():
+        if vals:
+            out[k] = round(sum(vals) / len(vals) / 1000, 2)
+    return out
+
+
 class LhmCpu:
-    """Reads the CPU temperature from LibreHardwareMonitor's local web server.
+    """Reads the CPU temperature from LibreHardwareMonitor's local web server, and with it the CPU's package power
+    and core clocks (`extra`, see parse_lhm_cpu; empty while it cannot be read).
 
     Installed by tools/install_cpu_sensors.ps1 (Program Files; port and password from its settings), or started by
     the owner from any folder: then its settings lie next to its exe, and without them the default port is tried
@@ -261,6 +296,7 @@ class LhmCpu:
         self._running = False
         self._open = True                # someone listens on its port
         self._found_at = -1e9
+        self.extra: dict = {}
 
     @staticmethod
     def _process() -> tuple[bool, Path | None]:
@@ -323,6 +359,7 @@ class LhmCpu:
             return json.load(r)
 
     def read(self) -> float | None:
+        self.extra = {}
         self._find()
         if self._config is None and not self._running:
             self.status = "нет"
@@ -348,6 +385,7 @@ class LhmCpu:
             self._found_at = -1e9  # it may have closed: look again before the next try
             return None
         self.status = "работает"
+        self.extra = parse_lhm_cpu(tree)
         return parse_lhm(tree)
 
 

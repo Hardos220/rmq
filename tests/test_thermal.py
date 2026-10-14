@@ -299,3 +299,22 @@ def test_lhm_says_what_is_missing(tmp_path, monkeypatch):
         assert lhm.read() is None and lhm.status == "закрыт паролем"       # a password, and no settings to read it
     finally:
         srv.shutdown()
+
+
+def test_parse_lhm_cpu_power_and_clocks():
+    from rmq.thermal import parse_lhm_cpu
+    s = lambda text, value, sid: {"Text": text, "Value": value, "SensorId": sid}
+    hybrid = {"Text": "Sensor", "Children": [{"Text": "Intel Core i7-13650HX", "Children": [
+        {"Text": "Powers", "Children": [s("CPU Package", "46,4 W", "/intelcpu/0/power/0"),
+                                        s("CPU Cores", "38,6 W", "/intelcpu/0/power/1")]},
+        {"Text": "Clocks", "Children": [s("Bus Speed", "100,1 MHz", "/intelcpu/0/clock/0"),
+                                        s("P-Core #1", "3000 MHz", "/intelcpu/0/clock/1"),
+                                        s("P-Core #2", "3200 MHz", "/intelcpu/0/clock/2"),
+                                        s("E-Core #1", "2500 MHz", "/intelcpu/0/clock/7")]},
+        {"Text": "GPU", "Children": [s("GPU Package", "20 W", "/gpu-nvidia/0/power/0")]}]}]}
+    assert parse_lhm_cpu(hybrid) == {"power": 46.4, "clock_p": 3.1, "clock_e": 2.5}
+    amd = {"Text": "Sensor", "Children": [
+        s("Package", "88.2 W", "/amdcpu/0/power/0"), s("Core #1", "4400 MHz", "/amdcpu/0/clock/1"),
+        s("Core #2", "4200 MHz", "/amdcpu/0/clock/2")]}
+    assert parse_lhm_cpu(amd) == {"power": 88.2, "clock_p": 4.3}      # no E-cores: all of them in clock_p
+    assert parse_lhm_cpu({"Text": "Sensor", "Children": []}) == {}

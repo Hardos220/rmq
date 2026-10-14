@@ -652,6 +652,10 @@ class Manager:
                         c["shared_s"] += dt
                         c["max_neighbours"] = max(c["max_neighbours"], n_running - 1)
                     c["owner_core_s"] += cpu_user * dt
+                    for k, x in self.lhm.extra.items():  # the CPU's power and clocks meanwhile
+                        acc = c["sense"].setdefault(k, [0.0, 0.0])
+                        acc[0] += x * dt
+                        acc[1] += dt
                 if now - self._cond_written >= 10:
                     self._cond_written = now
                     self._write_conditions(views, rows, now)
@@ -684,6 +688,8 @@ class Manager:
                 "temp_ssd": next((r.temp for r in readings if r.key == "ssd"), None),
                 "heat": {"normal": 0.0, "warm": 1.0, "hot": 2.0}[heat],
                 "cpu_factor": factor * 100,
+                "cpu_power": self.lhm.extra.get("power"), "clock_p": self.lhm.extra.get("clock_p"),
+                "clock_e": self.lhm.extra.get("clock_e"),
                 "tasks": {tid: (u.cpu / N * 100, u.ws / GB, task_vram.get(tid, 0.0), task_gpu.get(tid, 0.0))
                           for tid, u in usage.items()},
             }
@@ -705,7 +711,9 @@ class Manager:
                             "cool_confirm_s": tc["cool_confirm_s"], "factor": factor,
                             "min_cpu_factor": tc["min_cpu_factor"],
                             "limiting": {"label": lim.label, "temp": lim.temp, "target": lim.target} if lim else None,
-                            "cpu_source": self.lhm.status, "readings": [vars(r) for r in readings]},
+                            "cpu_source": self.lhm.status, "readings": [vars(r) for r in readings],
+                            "cpu_power": self.lhm.extra.get("power"), "clock_p": self.lhm.extra.get("clock_p"),
+                            "clock_e": self.lhm.extra.get("clock_e")},
                 "disk": {"enabled": S["disk"]["enabled"], "min_free_gb": S["disk"]["min_free_gb"],
                          "drives": self._disk_info, "held": len(disk_hold)},
                 "network": self.net_summary(),
@@ -1556,7 +1564,18 @@ class Manager:
         for k in self.COND_KEYS:
             c[k] = float(c.get(k) or 0.0)
         c["max_neighbours"] = int(c.get("max_neighbours") or 0)
+        sense = c.get("sense")  # {"power" | "clock_p" | "clock_e": [value x seconds, seconds measured]}
+        c["sense"] = ({k: [float(v[0]), float(v[1])] for k, v in sense.items() if isinstance(v, list) and len(v) == 2}
+                      if isinstance(sense, dict) else {})
         return c
+
+    @staticmethod
+    def _sensed(c: dict) -> dict:
+        """The CPU's average package power and core clocks while the task ran (LibreHardwareMonitor); None where
+        they were not measured."""
+        s = c.get("sense") or {}
+        avg = lambda k, d: round(s[k][0] / s[k][1], d) if k in s and s[k][1] > 0 else None
+        return {"cpu_power_w": avg("power", 1), "clock_p_ghz": avg("clock_p", 2), "clock_e_ghz": avg("clock_e", 2)}
 
     def conditions(self, row: dict, now: float | None = None) -> dict:
         """What the task ran under since it first started: the time it was frozen, the PC slept, it got less CPU
@@ -1573,7 +1592,7 @@ class Manager:
                **{k: round(c[k], 1) for k in self.COND_KEYS if k != "owner_core_s"},
                "max_neighbours": c["max_neighbours"],
                "owner_cpu_avg": round(c["owner_core_s"] / run_s, 2) if run_s > 0 else 0.0,
-               "cpu_claim": row["cpu"]}
+               **self._sensed(c), "cpu_claim": row["cpu"]}
         out["clean"] = all(out[k] < 1 for k in ("paused_s", "slept_s", "held_s", "ecores_s", "throttled_s", "shared_s"))
         return out
 
@@ -1935,7 +1954,7 @@ class Manager:
             "peak_ram_gb": r["peak_ram_gb"], "peak_vram_gb": r["peak_vram_gb"], "restarts": r["restarts"],
             "held_min": (r.get("held_s") or 0.0) / 60, "paused_min": c["paused_s"] / 60, "slept_min": c["slept_s"] / 60,
             "ecores_min": c["ecores_s"] / 60, "throttled_min": c["throttled_s"] / 60, "shared_min": c["shared_s"] / 60,
-            "series": r.get("series") or "", "command": command_text(r),
+            **self._sensed(c), "series": r.get("series") or "", "command": command_text(r),
         }
 
     def _backfill_task_log(self) -> None:
