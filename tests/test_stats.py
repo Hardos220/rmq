@@ -286,3 +286,38 @@ def test_power_falls_on_tasks_by_their_share():
     assert w[1] == pytest.approx(80 * 6 / 10) and w[2] == pytest.approx(80 * 2 / 10 + 120 * 0.9)
     m.lhm.extra, m.nv.extra = {}, {}                       # nothing measured: nothing counted
     assert m._watts_of(usage, {}, 2.0, 8.0, 0.0, 0.0) == {1: 0.0, 2: 0.0}
+
+
+def test_the_charts_scale_comes_from_averages_not_from_one_bogus_reading():
+    from rmq.metrics import Metrics
+    m = Metrics(coarse_step=15)
+    for i in range(60):                                       # a minute at 45 W with one bogus 567 W reading
+        m.add(1000.0 + i, {"cpu_power": 567.0 if i == 30 else 45.0})
+    assert m.extent(("cpu_power",)) == (45.0, 567.0)           # every reading
+    lo, hi = m.extent(("cpu_power",), averaged=True)          # the 15-second averages
+    assert lo == 45.0 and hi < 82
+
+
+def test_an_agent_gets_high_priority_only_with_the_owners_code_word():
+    from types import SimpleNamespace
+    from rmq.manager import Manager
+    events = []
+    m = object.__new__(Manager)
+    m._code_fails = {}
+    m.db = SimpleNamespace(event=lambda kind, msg, **kw: events.append(msg))
+    m.settings = SimpleNamespace(section=lambda name: {"priority_code": ""}, snapshot=lambda: {"agents": {"priority_code": "Облако"}})
+    agent = {"id": 7, "name": "claude-code@x"}
+    assert m._code_ok(agent, "Облако") == (False, "владелец не задал кодовое слово")   # none set: nobody gets it
+    import copy
+    from rmq.settings import DEFAULTS
+    full = copy.deepcopy(DEFAULTS)
+    full["agents"]["priority_code"] = "Облако"
+    m.settings = SimpleNamespace(section=lambda name: {"priority_code": " Облако "}, snapshot=lambda: copy.deepcopy(full))
+    assert m._code_ok(agent, "облако")[0] and m._code_ok(agent, "  ОБЛАКО ")[0]          # case and spaces aside
+    for _ in range(Manager.CODE_TRIES):
+        assert not m._code_ok(agent, "гроза")[0]
+    ok, why = m._code_ok(agent, "Облако")                                                # closed for an hour now
+    assert not ok and "на час" in why and len(events) == Manager.CODE_TRIES
+    assert m._code_ok({"id": 8, "name": "other"}, "Облако")[0]                          # another agent is not affected
+    assert m.settings_view(reveal=False)["agents"]["priority_code"] == ""                # agents never read it
+    assert m.settings_view()["agents"]["priority_code"] == "Облако"                      # the owner's dashboard does

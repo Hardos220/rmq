@@ -51,6 +51,8 @@ def describe(code: str | None, detail: dict | None = None) -> str:
         return ""
     if code.startswith("fair:"):
         return f"Уступила ресурсы задаче #{code[5:]} (честная очередь между агентами)"
+    if code.startswith("prio:"):
+        return f"Уступила место задаче #{code[5:]} с высоким приоритетом; продолжит, когда освободится место"
     if code.startswith("requeued:"):
         return "Перезапущена с начала: " + describe(code[9:]).lower()
     if code.startswith("stopping:"):

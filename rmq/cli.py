@@ -267,6 +267,8 @@ def task_body(args) -> dict:
         v = getattr(args, field)
         if v is not None:
             body[field] = v
+    if getattr(args, "code", None):
+        body["priority_code"] = args.code
     return body
 
 
@@ -655,6 +657,15 @@ def conditions_text(c: dict) -> str:
     if (c.get("owner_cpu_avg") or 0) >= 0.5:
         out.append(f"владелец занимал в среднем {c['owner_cpu_avg']:.1f} яд.")
     return ("; ".join(out) or "чистые") + tail
+
+
+def cmd_priority(args) -> int:
+    body = {"priority": args.priority}
+    if args.code:
+        body["code"] = args.code
+    r = Client(args.url).call("POST", f"/api/tasks/{args.id}/priority", body)
+    err(f"задача #{r['id']}: приоритет {r['priority']}")
+    return 0
 
 
 def cmd_retime(args) -> int:
@@ -1083,7 +1094,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--time", help="ожидаемая длительность: 30m, 2h, 1d (по умолчанию 1h); "
                                        "дольше заявленного — задачу легче вытеснить")
         sp.add_argument("--time-limit", dest="time_limit", help="жёсткий лимит: по истечении задача будет убита")
-        sp.add_argument("--priority", choices=["low", "normal"], help="low — фоновая задача (по умолчанию normal)")
+        sp.add_argument("--priority", choices=["low", "normal", "high"],
+                        help="low — фоновая задача (по умолчанию normal); high — только с кодовым словом владельца (--code)")
+        sp.add_argument("--code", metavar="СЛОВО", help="кодовое слово владельца для высокого приоритета — только если "
+                                                        "владелец сам назвал его тебе")
         sp.add_argument("--preempt", choices=["suspend", "requeue"],
                         help="если ресурсы нужны владельцу: suspend — заморозить (по умолчанию), "
                              "requeue — остановить и перезапустить позже (для задач с чекпоинтами)")
@@ -1143,6 +1157,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.add_argument("--pc", help="очередь другого ПК из «Моих ПК» владельца (только чтение)")
     sp.set_defaults(fn=cmd_queue)
+
+    sp = sub.add_parser("priority", help="поменять приоритет своей задачи; high — только с кодовым словом владельца")
+    sp.add_argument("id", type=int)
+    sp.add_argument("priority", choices=["low", "normal", "high"])
+    sp.add_argument("--code", metavar="СЛОВО", help="кодовое слово владельца для высокого приоритета")
+    sp.set_defaults(fn=cmd_priority)
 
     sp = sub.add_parser("retime", help="поправить заявку времени задачи на ходу (видно владельцу в журнале)")
     sp.add_argument("id", type=int)

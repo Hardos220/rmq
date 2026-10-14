@@ -243,7 +243,8 @@ def test_over_share_agent_cannot_backfill_contested_resource():
 
 
 def test_reservation_blocks_long_backfill_but_allows_short():
-    ending = task(1, agent=1, state="running", cpu=2, ram=12, time_s=2 * 3600, run_s=3600)  # ends in ~1 h
+    ending = task(1, agent=1, state="running", cpu=2, ram=12, time_s=2 * 3600, run_s=3600,  # ends in ~1 h
+                  priority=2)  # high too: the top cannot make room by freezing it
     top = task(2, agent=2, ram=15, queued_since=NOW - 30 * MIN, priority=2)
     long_bf = task(3, agent=3, ram=2, time_s=5 * 3600, queued_since=NOW)
     short_bf = task(4, agent=3, ram=2, time_s=20 * MIN, queued_since=NOW + 1)
@@ -463,3 +464,31 @@ def test_a_task_waits_for_its_series_and_for_the_task_it_goes_after():
     p = run([task(1), task(2, hold=("series", {"series": "s", "for": 1})), task(3, hold=("after", {"for": 1}))])
     assert {a.task_id for a in p.actions if a.kind == "start"} == {1}
     assert p.waiting[2].reason == "series" and p.waiting[3].reason == "after"
+
+
+# ---------------------------------------------------------------- high priority: room at once
+def test_a_high_priority_task_freezes_lower_ones_at_once():
+    a = task(1, agent=1, state="running", cpu=6, ram=10, last_start_at=NOW - 60)   # just started: still "protected"
+    b = task(2, agent=2, state="running", cpu=6, ram=10, last_start_at=NOW - 60)
+    urgent = task(3, agent=3, cpu=4, ram=6, time_s=4 * MIN, priority=2, queued_since=NOW)   # has not waited at all
+    p = run([a, b, urgent], pools=Pools(18, 22, 11))
+    froze = [x for x in acts(p) if x[0] == "suspend"]
+    assert len(froze) == 1 and froze[0][2] == "prio:3"           # one is enough: 22 - 10 = 12 GB >= 6
+    assert ("start", 3, "") in acts(p)
+
+
+def test_high_priority_does_not_push_out_high_priority_or_break_its_series():
+    owner = task(1, agent=1, state="running", cpu=6, ram=18, priority=2)
+    urgent = task(2, agent=2, cpu=2, ram=8, priority=2)
+    p = run([owner, urgent], pools=Pools(18, 22, 11))
+    assert not [x for x in acts(p) if x[0] == "suspend"] and p.waiting[2].reason == "no_fit"
+    held = task(3, agent=2, cpu=2, ram=8, priority=2, hold=("series", {"series": "s", "for": 9}))
+    low = task(4, agent=1, state="running", cpu=6, ram=18)
+    p = run([low, held], pools=Pools(18, 22, 11))
+    assert not [x for x in acts(p) if x[0] == "suspend"]           # its series still comes first
+
+
+def test_a_task_frozen_for_a_high_priority_one_resumes_later():
+    frozen = task(1, agent=1, state="suspended", cpu=4, ram=6, suspend_reason="prio:3", started_before=True)
+    p = run([frozen], pools=Pools(18, 22, 11))
+    assert ("resume", 1, "") in acts(p)

@@ -245,7 +245,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("POST", r"/api/tasks/(\d+)/priority")
     def priority(self, ident, body, q, tid):
-        return self.manager.set_priority(ident, int(tid), body.get("priority"))
+        return self.manager.set_priority(ident, int(tid), body.get("priority"), body.get("code"))
 
     @route("POST", "/api/mode")
     def mode(self, ident, body, q):
@@ -254,7 +254,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", "/api/settings")
     def settings_get(self, ident, body, q):
-        return self.manager.settings_view()
+        return self.manager.settings_view(reveal=ident.admin)  # agents never see the owner's code word
 
     @route("POST", "/api/settings/preset")
     def settings_preset(self, ident, body, q):

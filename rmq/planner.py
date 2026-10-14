@@ -47,7 +47,7 @@ from dataclasses import dataclass, field, replace
 RESOURCES = ("cpu", "ram", "vram")
 EPS = 1e-6
 RESUMABLE = {"paused", "game", "gpu_user", "ram", "vram", "resume", "shutdown", "heat", "disk",
-             "net_closed"}  # plus "fair:<id>"
+             "net_closed"}  # plus "fair:<id>" and "prio:<id>"
 
 
 # ---------------------------------------------------------------- smoothing
@@ -547,7 +547,7 @@ def plan(inp: PlanInput) -> Plan:
 
     def candidates() -> list[TaskView]:
         c = [t for t in suspended.values()
-             if t.suspend_reason in RESUMABLE or (t.suspend_reason or "").startswith("fair:")]
+             if t.suspend_reason in RESUMABLE or (t.suspend_reason or "").startswith(("fair:", "prio:"))]
         c += list(queued.values())
         return sorted(c, key=lambda t: (-score[t.id], t.queued_since, t.id))
 
@@ -585,7 +585,7 @@ def plan(inp: PlanInput) -> Plan:
             lacking.append("commit")
         if lacking:
             return False, "no_fit", {"lacking": lacking, "need": need, "free": dict(free)}
-        if top is not None:
+        if top is not None and t.priority < 2:  # a high-priority task does not wait behind anyone
             # EASY backfill: once the top task has waited long enough, only tasks that are
             # expected to finish before it can start may jump ahead of it.
             if reservation and shadow is not None and now + expected_remaining(t) > shadow:
@@ -608,6 +608,40 @@ def plan(inp: PlanInput) -> Plan:
         run_task(t)
 
     waits: dict[int, tuple[str, dict]] = {}
+
+    def make_room(w: TaskView, lacking: list[str]) -> bool:
+        """A high-priority task (the owner's own, or an agent's the owner allowed it to) does not wait for room: the
+        tasks of lower priority make it at once - frozen (they go on later from where they stopped), or stopped and
+        queued again when only a stopped process gives back the VRAM it needs. Its series and --after still count.
+        True if it started, or waits only for its victims to save a checkpoint."""
+        if w.priority < 2 or "commit" in lacking:
+            return False
+        need = need_of(w)
+        victims = urgent_victims(need, free, [t for t in running.values() if not t.stopping and t.priority < 2
+                                              and t.last_start_at != now], score, lacking)
+        if victims is None:
+            return False
+        needs_vram = need["vram"] > free["vram"] + EPS
+        pending = []
+        for v in victims:
+            held = reserved(v)
+            if needs_vram and v.preempt == "requeue":  # only a stopped process gives VRAM back
+                if not evict(v, f"prio:{w.id}", urgent=False):
+                    pending.append(v.id)
+                    continue
+                gain = held
+            else:
+                move(v, "suspend", f"prio:{w.id}")
+                gain = {"cpu": held["cpu"], "ram": held["ram"], "vram": max(0.0, v.vram - v.used_vram)}
+            for r in RESOURCES:
+                free[r] += gain[r]
+        P.shed = True
+        if pending:
+            waits[w.id] = ("stopping", {"for": pending})
+        else:
+            admit(w)
+        return True
+
     for t in candidates():
         if t.id in touched or (t.state == "suspended" and t.suspend_reason == "user"):
             continue
@@ -617,6 +651,8 @@ def plan(inp: PlanInput) -> Plan:
         ok, reason, detail = start_ok(t)
         if ok:
             admit(t)
+            continue
+        if reason == "no_fit" and make_room(t, detail["lacking"]):
             continue
         waits[t.id] = (reason, detail)
         if reason == "no_fit":
@@ -781,6 +817,27 @@ def shadow_time(need: dict, free: dict, running: list[TaskView], now: float,
             f[r] += v
         if not short():
             return now + expected_remaining(t)
+    return None
+
+
+def urgent_victims(need: dict, free: dict, running, score: dict, lacking: list[str]) -> list[TaskView] | None:
+    """The running tasks of lower priority that make room for a high-priority one at once: lowest priority and
+    score first, only those that give something it lacks; None if even all of them would not do."""
+    deficit = {r: (need[r] - free[r]) if r in lacking else 0.0 for r in RESOURCES}
+    chosen = []
+    for r in sorted(running, key=lambda t: (t.priority, score[t.id], -(t.last_start_at or 0.0))):
+        if all(d <= EPS for d in deficit.values()):
+            break
+        held = reserved(r)
+        gain = {"cpu": held["cpu"], "ram": held["ram"],
+                "vram": held["vram"] if r.preempt == "requeue" else max(0.0, r.vram - r.used_vram)}
+        if not any(deficit[k] > EPS and gain[k] > EPS for k in RESOURCES):
+            continue
+        chosen.append(r)
+        for k in RESOURCES:
+            deficit[k] -= gain[k]
+    if chosen and all(d <= EPS for d in deficit.values()):
+        return chosen
     return None
 
 

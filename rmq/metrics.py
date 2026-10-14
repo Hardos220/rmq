@@ -175,12 +175,13 @@ class Metrics:
                 self._long.extend(rows + rest)
         return len(rows)
 
-    def extent(self, columns: tuple[str, ...]) -> tuple[float, float] | None:
-        """The lowest and highest value of these columns anywhere in the history (all its tiers)."""
+    def extent(self, columns: tuple[str, ...], averaged: bool = False) -> tuple[float, float] | None:
+        """The lowest and highest value of these columns anywhere in the history; `averaged`: only in its 15-second
+        and 5-minute averages, where a single bogus reading of a sensor cannot stretch it."""
         idx = [COLUMNS.index(c) + 1 for c in columns]
         lo = hi = None
         with self._lock:
-            for src in (self._fine, self._coarse, self._long):
+            for src in ((self._coarse, self._long) if averaged else (self._fine, self._coarse, self._long)):
                 for r in src:
                     for i in idx:
                         v = r[i]

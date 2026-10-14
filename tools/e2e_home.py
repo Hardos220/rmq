@@ -267,6 +267,24 @@ def order_checks(a: Instance, b: Instance, project: Path) -> None:
     check("paused_s" in (task(a, x).get("conditions") or {}), "условия счёта в статусе задачи")
     a.ok("POST", f"/api/tasks/{x}/cancel", {})
 
+    # high priority for an agent: only with the owner's code word (a test word here), which agents cannot read
+    a.ok("PATCH", "/api/settings", {"agents": {"priority_code": "e2e-слово"}})
+    def submit_high(code: str) -> tuple[int, str]:
+        r = a.cli("submit", "--cpu", "0.1", "--ram", "0.1", "--time", "1m", "--priority", "high", "--code", code,
+                  "--name", f"код-{code}", "--", "python", "-c", "print(1)")
+        return int(r.stdout.strip() or 0), r.stderr
+    bad, err_text = submit_high("не-то")
+    check(bad and task(a, bad)["priority"] == "normal" and "кодовое слово неверное" in err_text,
+          "неверное кодовое слово: приоритет обычный", err_text[-200:])
+    good, err_text = submit_high("E2E-Слово")
+    check(good and task(a, good)["priority"] == "high", "кодовое слово владельца: высокий приоритет", err_text[-200:])
+    req = urllib.request.Request(f"http://127.0.0.1:{a.port}/api/settings", headers={"X-RMQ-Agent": "e2e@agent"})
+    with DIRECT.open(req, timeout=20) as resp:
+        seen = json.loads(resp.read().decode("utf-8"))["agents"]["priority_code"]
+    check(seen == "", "агенты не видят кодовое слово в настройках", seen)
+    for x in (bad, good):
+        wait_for(lambda: task(a, x)["state"] in FINAL, 30)
+
     # cancelling a task on another PC brings back what it made so far
     (project / "out" / "partial.txt").unlink(missing_ok=True)
     rid = a.ok("POST", "/api/tasks", {"argv": ["python", "job2.py"], "cpu": 0.2, "ram": 0.2, "time": "10m",

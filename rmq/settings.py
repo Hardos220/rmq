@@ -162,6 +162,9 @@ DEFAULTS: dict = {
         "default_max_running": 4,
         "default_max_queued": 100,
         "default_max_priority": "normal",
+        # the owner's code word: an agent that names it (rmq submit --priority high --code ...) gets high priority.
+        # Empty: no agent can. Each owner sets his own; it stays in data/settings.json on this PC.
+        "priority_code": "",
     },
 }
 

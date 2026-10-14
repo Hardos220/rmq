@@ -5,6 +5,7 @@ object); everything else on the PC is observed read-only and counted as "the use
 """
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import math
@@ -273,17 +274,13 @@ class Manager:
         if self.metrics.long_missing(time.time()):  # the month's charts: what is not in the cache, from data/stats
             self.metrics.seed_long(self.stats.minutes_since(time.time() - self.metrics.long_s), time.time())
         self._metrics_saved = time.time()
-        # the range the CPU and the GPU work in (power, clocks), for the charts' fixed scale: the history's, then
-        # widened by what LibreHardwareMonitor and the GPU's driver report
+        # the range the CPU and the GPU work in (power, clocks), for the charts' fixed scale (_refresh_ranges)
         self._ranges: dict[str, list[float]] = {}
-        for key, cols in (("power", ("cpu_power",)), ("clock", ("clock_p", "clock_e")), ("gpu_power", ("gpu_power",)),
-                          ("gpu_clock", ("gpu_clock",))):
-            ext = self.metrics.extent(cols)
-            if ext:
-                self._ranges[key] = list(ext)
+        self._ranges_at = 0.0
         self._power_mode: dict = {}           # the Windows power mode and plan (winapi.power_mode)
         self._power_mode_at = 0.0
         self._task_watts: dict[int, float] = {}  # the CPU's and GPU's power that falls on each task now (estimate)
+        self._code_fails: dict[int, list[float]] = {}  # agent -> when it named a wrong code word (the last hour)
         # the queue played forward (forecast.py): {task: {"start", "end", "basis"}}, and what it learns from
         self._forecast: dict[int, dict] = {}
         self._forecast_at = 0.0
@@ -806,24 +803,31 @@ class Manager:
         if now - when >= 2.0:
             c_temp = self.lhm.read()
             self._cpu_read = (now, c_temp)
-        self._widen_ranges()
+        self._refresh_ranges(now)
         return thermal.readings_from(tc, cpu, (g_temp, g_thr, self.nv.present), (s_temp, s_warn), c_temp)
 
-    def _widen_ranges(self) -> None:
-        """The range the CPU and the GPU work in, for the charts' fixed scale: it only ever widens."""
-        x, g = self.lhm.extra, self.nv.extra
-        seen = {k: list(v) for k, v in self.lhm.ranges.items()}
-        for key, vals in (("power", [x.get("power")]), ("clock", [x.get("clock_p"), x.get("clock_e")]),
-                          ("gpu_power", [g.get("power")]), ("gpu_clock", [g.get("clock")])):
-            vals = [v for v in vals if v is not None] + (seen.get(key) or [])
-            if vals:
-                seen[key] = [min(vals), max(vals)]
-        for key, (lo, hi) in seen.items():
-            cur = self._ranges.get(key)
-            self._ranges[key] = [min(lo, cur[0]), max(hi, cur[1])] if cur else [lo, hi]
+    RANGE_COLUMNS = (("power", ("cpu_power",)), ("clock", ("clock_p", "clock_e")), ("gpu_power", ("gpu_power",)),
+                     ("gpu_clock", ("gpu_clock",)))
+
+    def _refresh_ranges(self, now: float) -> None:
+        """The range the CPU and the GPU work in, for the charts' fixed scale, once a minute: from this manager's own
+        15-second and 5-minute averages of the last month (a sensor's single bogus reading - LibreHardwareMonitor
+        has shown 567 W for a 100 W laptop CPU - cannot stretch it), a tenth wider so short real peaks fit; the GPU
+        up to the board power and clock its driver allows."""
+        if now - self._ranges_at < 60:
+            return
+        self._ranges_at = now
+        out = {}
+        for key, cols in self.RANGE_COLUMNS:
+            ext = self.metrics.extent(cols, averaged=True)
+            if ext:
+                out[key] = [ext[0] * 0.9, ext[1] * 1.1]
         for key, top in (("gpu_power", self.nv.power_limit), ("gpu_clock", self.nv.max_clock)):
-            if top and key in self._ranges:  # the card's own ceiling, once it has been seen awake at all
-                self._ranges[key][1] = max(self._ranges[key][1], top)
+            if top and key in out:  # the card's own ceiling, once it has been seen awake at all
+                out[key][1] = max(out[key][1], top)
+        if "gpu_clock" in out:  # a GPU just waking up reports its clock near zero: below 0.1 GHz it is not working
+            out["gpu_clock"][0] = max(out["gpu_clock"][0], 0.1)
+        self._ranges = out
 
     # ---------------------------------------------------------------- the forecast of the queue
     FORECAST_EVERY_S = 15
@@ -1872,7 +1876,7 @@ class Manager:
             self.db.event("resume", f"Возобновлена после паузы {texts.fmt_minutes(stood)}" if stood >= 60
                           else "Возобновлена", task_id=tid, agent_id=row["agent_id"])
         elif a.kind == "suspend" and rt:
-            rt.suspend(trim=a.reason in ("ram", "commit") or a.reason.startswith("fair:"))
+            rt.suspend(trim=a.reason in ("ram", "commit") or a.reason.startswith(("fair:", "prio:")))
             resume_ram = max(u.ws / GB if u else 0.0, row["resume_ram_gb"] if row["state"] == "suspended" else 0.0)
             self.db.task_update(tid, state="suspended", state_reason=a.reason, queued_since=now,
                                 resume_ram_gb=resume_ram, suspended_pids=json.dumps(sorted(rt.suspended_pids)),
@@ -2281,9 +2285,15 @@ class Manager:
         if time_s <= 0:
             raise ApiError(400, "time должно быть больше нуля")
         warnings = []
+        by_code = False
         if prio > agent["max_priority"]:
-            warnings.append(f"приоритет понижен до {PRIORITY_NAMES[agent['max_priority']]} (лимит агента)")
-            prio = agent["max_priority"]
+            ok, why = self._code_ok(agent, body.get("priority_code")) if body.get("priority_code") else (False, "")
+            if ok:
+                by_code = True
+            else:
+                warnings.append(f"приоритет понижен до {PRIORITY_NAMES[agent['max_priority']]} ({why or 'лимит агента'}; "
+                                f"высокий приоритет — по кодовому слову владельца: --code)")
+                prio = agent["max_priority"]
         warnings += self._claim_hints(agent, argv, command, cpu, ram, time_s)
         series = str(body.get("series") or "").strip()[:60] or None
         after_id = body.get("after")
@@ -2321,6 +2331,9 @@ class Manager:
                 submitted_at=now, queued_since=now, series=series, after_id=after_id)
             self.db.event("submit", f"Поставлена в очередь: {_request_text(dict(cpu=cpu, ram_gb=ram, vram_gb=vram, time_s=time_s))}{order}",
                           task_id=tid, agent_id=agent["id"])
+            if by_code:
+                self.db.event("priority", f"Приоритет {PRIORITY_NAMES[prio]} — по кодовому слову владельца",
+                              task_id=tid, agent_id=agent["id"])
         self.wake.set()
         return {"id": tid, "state": "queued", "warnings": warnings}
 
@@ -2374,18 +2387,49 @@ class Manager:
         self.wake.set()
         return {"id": tid, "state": "suspended", "note": "возобновится, как только хватит ресурсов"}
 
-    def set_priority(self, ident: Identity, tid: int, value) -> dict:
+    def set_priority(self, ident: Identity, tid: int, value, code=None) -> dict:
         try:
             prio = parse_priority(value)
         except ValueError as e:
             raise ApiError(400, str(e)) from e
         with self.lock:
             row = self._task_for(ident, tid, write=True)
+            by_code = False
             if not ident.admin and prio > ident.agent["max_priority"]:
-                raise ApiError(403, "выше лимита приоритета агента")
-            self.db.task_update(tid, priority=prio)
+                ok, why = self._code_ok(ident.agent, code) if code else (False, "")
+                if not ok:
+                    raise ApiError(403, f"выше лимита приоритета агента{f' ({why})' if why else ''}: высокий приоритет — "
+                                        f"по кодовому слову владельца (--code)")
+                by_code = True
+            if prio != row["priority"]:
+                self.db.task_update(tid, priority=prio)
+                self.db.event("priority", f"Приоритет: {PRIORITY_NAMES[row['priority']]} → {PRIORITY_NAMES[prio]} ("
+                              + ("вручную" if ident.admin else "по кодовому слову владельца" if by_code else "агентом") + ")",
+                              task_id=tid, agent_id=row["agent_id"])
         self.wake.set()
         return {"id": tid, "priority": PRIORITY_NAMES[prio]}
+
+    CODE_TRIES = 5  # wrong code words an agent may name in an hour
+
+    def _code_ok(self, agent: dict, code) -> tuple[bool, str]:
+        """Whether the code word an agent named is the owner's (agents.priority_code): (yes, why not). A few wrong
+        ones in an hour close it for that agent until the hour is over, so it cannot be guessed; each is written to
+        the journal."""
+        word = str(self.settings.section("agents").get("priority_code") or "").strip()
+        if not word:
+            return False, "владелец не задал кодовое слово"
+        now = time.time()
+        fails = [t for t in self._code_fails.get(agent["id"], []) if now - t < 3600]
+        self._code_fails[agent["id"]] = fails
+        if len(fails) >= self.CODE_TRIES:
+            return False, "много неверных кодовых слов: высокий приоритет закрыт для этого агента на час"
+        if hmac.compare_digest(str(code or "").strip().casefold().encode("utf-8"), word.casefold().encode("utf-8")):
+            return True, ""
+        fails.append(now)
+        self.db.event("priority", f"Агент {agent['name']} назвал неверное кодовое слово для высокого приоритета"
+                      + (" — высокий приоритет закрыт для него на час" if len(fails) >= self.CODE_TRIES else ""),
+                      agent_id=agent["id"])
+        return False, "кодовое слово неверное"
 
     def retime(self, ident: Identity, tid: int, value) -> dict:
         """The expected duration corrected while the task waits or runs (it learns its real length only then).
@@ -2508,10 +2552,13 @@ class Manager:
         self.wake.set()
         return self.settings_view(data)
 
-    def settings_view(self, data: dict | None = None) -> dict:
-        """The settings plus the presets and which of them they match (None: the owner's own values)."""
+    def settings_view(self, data: dict | None = None, reveal: bool = True) -> dict:
+        """The settings plus the presets and which of them they match (None: the owner's own values). Without
+        `reveal` (an agent asks) the owner's code word for high priority is left out."""
         from .settings import PRESETS, active_preset
         data = data if data is not None else self.settings.snapshot()
+        if not reveal and isinstance(data.get("agents"), dict):
+            data["agents"] = dict(data["agents"], priority_code="")
         data["_presets"] = {"list": [{"id": k, "title": t, "text": d} for k, (t, d, _o) in PRESETS.items()],
                             "active": active_preset(data)}
         return data
