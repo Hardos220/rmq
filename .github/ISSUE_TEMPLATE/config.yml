@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Уязвимость / Security vulnerability
+    url: https://github.com/Hardos220/rmq/security/advisories/new
+    about: Сообщите приватно, не в открытом issue / Report privately, not in a public issue
+  - name: Частые вопросы / FAQ
+    url: https://github.com/Hardos220/rmq#частые-вопросы
+    about: Linux, видеокарты, агенты, удаление

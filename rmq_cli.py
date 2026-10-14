@@ -4,6 +4,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rmq.cli import main  # noqa: E402
+from rmq.cli import run  # noqa: E402
 
-sys.exit(main())
+sys.exit(run())

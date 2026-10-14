@@ -1,5 +1,5 @@
 import sys
 
-from rmq.cli import main
+from rmq.cli import run
 
-sys.exit(main())
+sys.exit(run())

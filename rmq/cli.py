@@ -1072,6 +1072,8 @@ def build_parser() -> argparse.ArgumentParser:
                                 "Полное руководство для ИИ-агентов: rmq guide",
                                 epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--url", default=default_url(), help=argparse.SUPPRESS)
+    from . import __version__
+    p.add_argument("--version", action="version", version=f"rmq {__version__}", help="версия менеджера")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="команда")
 
     def task_opts(sp):
@@ -1217,6 +1219,25 @@ def build_parser() -> argparse.ArgumentParser:
     hidden = {"launch", "dashboard", "install-shortcut", "install-agents", "uninstall-agents", "stop", "serve", "net"}
     sub._choices_actions = [a for a in sub._choices_actions if a.dest not in hidden]
     return p
+
+
+def run() -> int:
+    """main() for the command line: a reader that stops early (rmq guide | head, | more) is not an error."""
+    def quiet() -> None:  # the interpreter's last flush would complain about the closed pipe otherwise
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+    try:
+        code = main()
+    except BrokenPipeError:
+        quiet()
+        return 0
+    try:
+        sys.stdout.flush()
+    except OSError:  # Windows says EINVAL for a pipe closed by its reader
+        quiet()
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:

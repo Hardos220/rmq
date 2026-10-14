@@ -1,0 +1,7 @@
+# Windows batch files need CRLF line endings: git keeps them (and the checksums list) byte for byte
+*.cmd -text
+*.bat -text
+*.ps1 -text
+tools/SHA256SUMS.txt -text
+# the shell wrapper for Git Bash needs LF
+bin/rmq text eol=lf

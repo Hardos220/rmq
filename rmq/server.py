@@ -105,7 +105,7 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path.rstrip("/") or "/"
         if method == "GET" and not path.startswith("/api/"):
             return self._static(path)
-        api_path = unquote(path)  # a PC's name may come percent-encoded (rmq queue --pc Пароварка)
+        api_path = unquote(path)  # a PC's name may come percent-encoded (rmq queue --pc Стационар)
         for m, rx, name in ROUTES:
             match = rx.match(api_path)
             if m == method and match:

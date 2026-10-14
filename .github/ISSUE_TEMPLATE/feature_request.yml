@@ -1,0 +1,14 @@
+name: Предложение / Feature request
+description: Идея, как сделать менеджер удобнее
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу это решает / What problem does it solve
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Как это могло бы выглядеть / How it could work

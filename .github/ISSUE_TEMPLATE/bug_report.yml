@@ -1,0 +1,44 @@
+name: Ошибка / Bug report
+description: Что-то работает не так, как описано
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо! Не прикладывайте папку `data` целиком и не вставляйте токены и коды приглашений в сеть: в них ключи.
+        Please do not attach the whole `data` folder or paste tokens and invitation codes.
+  - type: input
+    id: version
+    attributes:
+      label: Версия RMQ / RMQ version
+      description: "`rmq --version` или внизу дашборда"
+      placeholder: rmq 1.8.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows и Python / Windows and Python
+      placeholder: Windows 11 23H2, Python 3.12.4
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: Что случилось / What happened
+      description: И что вы ожидали увидеть
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как повторить / Steps to reproduce
+      placeholder: |
+        1. rmq submit --cpu 4 --ram 2 --time 10m -- python job.py
+        2. ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Логи / Logs
+      description: Нужные строки из `data\manager.log` и вывод `rmq status <номер> --events`
+      render: text
