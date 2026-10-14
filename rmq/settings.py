@@ -116,6 +116,7 @@ DEFAULTS: dict = {
     "power": {
         "keep_awake_while_running": True,   # no idle sleep while tasks run (the display may still turn off)
         "keep_awake_on_battery": False,     # on battery the PC may sleep so the computation does not drain it
+        "tariff_rub_kwh": 8.90,             # the price of electricity, for the statistics' energy in rubles
     },
     "scheduler": {
         "tick_s": 0.5,

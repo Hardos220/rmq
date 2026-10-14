@@ -318,3 +318,15 @@ def test_parse_lhm_cpu_power_and_clocks():
         s("Core #2", "4200 MHz", "/amdcpu/0/clock/2")]}
     assert parse_lhm_cpu(amd) == {"power": 88.2, "clock_p": 4.3}      # no E-cores: all of them in clock_p
     assert parse_lhm_cpu({"Text": "Sensor", "Children": []}) == {}
+
+
+def test_parse_lhm_the_range_the_cpu_works_in():
+    from rmq.thermal import parse_lhm_ranges
+    s = lambda text, lo, hi, sid: {"Text": text, "Value": "1", "Min": lo, "Max": hi, "SensorId": sid}
+    tree = {"Text": "Sensor", "Children": [
+        s("CPU Package", "8,4 W", "108,4 W", "/intelcpu/0/power/0"), s("CPU Cores", "2,0 W", "100,2 W", "/intelcpu/0/power/1"),
+        s("Bus Speed", "100,1 MHz", "100,1 MHz", "/intelcpu/0/clock/0"),
+        s("P-Core #1", "800,9 MHz", "4905,6 MHz", "/intelcpu/0/clock/1"),
+        s("E-Core #1", "799,0 MHz", "3604,5 MHz", "/intelcpu/0/clock/7")]}
+    assert parse_lhm_ranges(tree) == {"power": [8.4, 108.4], "clock": [0.8, 4.91]}
+    assert parse_lhm_ranges({"Text": "Sensor", "Children": []}) == {}

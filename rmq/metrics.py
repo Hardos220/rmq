@@ -30,6 +30,7 @@ COLUMNS = (
     "cpu_factor",                                  # % of their CPU the temperature regulator leaves tasks
     "cpu_power",                                   # W, the CPU package (LibreHardwareMonitor), None = not measured
     "clock_p", "clock_e",                          # GHz, the P- and E-cores' average clock (no E-cores: all in clock_p)
+    "gpu_power", "gpu_clock",                      # W, GHz: the GPU (NVML), only while it is awake anyway
 )
 
 
@@ -173,6 +174,20 @@ class Metrics:
                 self._long.clear()
                 self._long.extend(rows + rest)
         return len(rows)
+
+    def extent(self, columns: tuple[str, ...]) -> tuple[float, float] | None:
+        """The lowest and highest value of these columns anywhere in the history (all its tiers)."""
+        idx = [COLUMNS.index(c) + 1 for c in columns]
+        lo = hi = None
+        with self._lock:
+            for src in (self._fine, self._coarse, self._long):
+                for r in src:
+                    for i in idx:
+                        v = r[i]
+                        if v is not None:
+                            lo = v if lo is None or v < lo else lo
+                            hi = v if hi is None or v > hi else hi
+        return (lo, hi) if lo is not None else None
 
     def series(self, range_s: float, since: float = 0.0) -> dict:
         with self._lock:

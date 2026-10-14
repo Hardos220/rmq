@@ -272,6 +272,39 @@ def parse_lhm_cpu(tree: dict) -> dict:
     return out
 
 
+def parse_lhm_ranges(tree: dict) -> dict:
+    """The lowest and highest package power (W) and core clock (GHz) LibreHardwareMonitor has seen since it
+    started - the range this CPU really works in: {"power": [lo, hi], "clock": [lo, hi]}, what it shows."""
+    power: dict[str, tuple] = {}
+    lo_clock = hi_clock = None
+
+    def walk(node: dict) -> None:
+        nonlocal lo_clock, hi_clock
+        sid = node.get("SensorId", "")
+        if "cpu/" in sid:
+            name = node.get("Text", "")
+            lo, hi = _number(node.get("Min", "")), _number(node.get("Max", ""))
+            if "/power/" in sid and lo is not None and hi is not None:
+                power.setdefault(name, (lo, hi))
+            elif "/clock/" in sid and _CORE_CLOCK.fullmatch(name):
+                if lo is not None and lo > 0:
+                    lo_clock = lo if lo_clock is None else min(lo_clock, lo)
+                if hi is not None and hi > 0:
+                    hi_clock = hi if hi_clock is None else max(hi_clock, hi)
+        for child in node.get("Children", []):
+            walk(child)
+
+    walk(tree)
+    out = {}
+    for name in ("CPU Package", "Package"):
+        if name in power and power[name][1] > 0:
+            out["power"] = [round(power[name][0], 1), round(power[name][1], 1)]
+            break
+    if lo_clock is not None and hi_clock is not None:
+        out["clock"] = [round(lo_clock / 1000, 2), round(hi_clock / 1000, 2)]
+    return out
+
+
 class LhmCpu:
     """Reads the CPU temperature from LibreHardwareMonitor's local web server, and with it the CPU's package power
     and core clocks (`extra`, see parse_lhm_cpu; empty while it cannot be read).
@@ -297,6 +330,7 @@ class LhmCpu:
         self._open = True                # someone listens on its port
         self._found_at = -1e9
         self.extra: dict = {}
+        self.ranges: dict = {}           # parse_lhm_ranges: the range the CPU works in
 
     @staticmethod
     def _process() -> tuple[bool, Path | None]:
@@ -386,6 +420,7 @@ class LhmCpu:
             return None
         self.status = "работает"
         self.extra = parse_lhm_cpu(tree)
+        self.ranges = parse_lhm_ranges(tree)
         return parse_lhm(tree)
 
 
@@ -401,10 +436,17 @@ class NvidiaGpu:
             self._nv = None
         self.present = self._nv is not None and self._open()
         self.max_operating: int | None = None
+        self.power_limit: float | None = None   # W, the board power the driver enforces
+        self.max_clock: float | None = None     # GHz, the graphics clock's ceiling
+        self.extra: dict = {}                   # {"power": W, "clock": GHz} while it is watched
         if self.present:
             v = ctypes.c_uint(0)
             if self._nv.nvmlDeviceGetTemperatureThreshold(self._h, 3, ctypes.byref(v)) == 0:  # GPU_MAX
                 self.max_operating = v.value
+            if self._nv.nvmlDeviceGetEnforcedPowerLimit(self._h, ctypes.byref(v)) == 0 and v.value:
+                self.power_limit = round(v.value / 1000, 1)
+            if self._nv.nvmlDeviceGetMaxClockInfo(self._h, 0, ctypes.byref(v)) == 0 and v.value:  # graphics
+                self.max_clock = round(v.value / 1000, 2)
             self._close()
 
     def _open(self) -> bool:
@@ -425,7 +467,9 @@ class NvidiaGpu:
             self.open = False
 
     def read(self, watch: bool) -> tuple[float | None, bool]:
-        """Temperature and thermal throttling while `watch`; otherwise the library is released."""
+        """Temperature and thermal throttling while `watch` (and its power and clock in `extra`); otherwise the
+        library is released."""
+        self.extra = {}
         if not self.present:
             return None, False
         if not watch:
@@ -438,6 +482,11 @@ class NvidiaGpu:
             return None, False
         r = ctypes.c_ulonglong(0)
         throttling = self._reasons_fn(self._h, ctypes.byref(r)) == 0 and bool(r.value & self.THERMAL_REASONS)
+        v = ctypes.c_uint(0)
+        if self._nv.nvmlDeviceGetPowerUsage(self._h, ctypes.byref(v)) == 0:
+            self.extra["power"] = round(v.value / 1000, 1)
+        if self._nv.nvmlDeviceGetClockInfo(self._h, 0, ctypes.byref(v)) == 0 and v.value:
+            self.extra["clock"] = round(v.value / 1000, 2)
         return float(t.value), throttling
 
     def close(self) -> None:

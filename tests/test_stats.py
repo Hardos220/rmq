@@ -238,8 +238,51 @@ def test_a_task_keeps_the_cpu_power_and_clocks_it_ran_at():
     from rmq.manager import Manager
     m = object.__new__(Manager)
     c = m._cond_of({"cond": None})
-    assert c["sense"] == {} and Manager._sensed(c) == {"cpu_power_w": None, "clock_p_ghz": None, "clock_e_ghz": None}
+    assert c["sense"] == {} and Manager._sensed(c) == {"cpu_power_w": None, "clock_p_ghz": None, "clock_e_ghz": None,
+                                                        "energy_wh": None}
     c["sense"]["power"] = [40.0 * 10 + 80.0 * 30, 40.0]       # 10 s at 40 W, 30 s at 80 W
     c["sense"]["clock_p"] = [3.5 * 40, 40.0]
+    c["energy_j"] = 70.0 * 40                                 # 40 s at 70 W fell on it
     again = m._cond_of({"cond": json.dumps(c)})               # saved with the task and read back
-    assert Manager._sensed(again) == {"cpu_power_w": 70.0, "clock_p_ghz": 3.5, "clock_e_ghz": None}
+    assert Manager._sensed(again) == {"cpu_power_w": 70.0, "clock_p_ghz": 3.5, "clock_e_ghz": None,
+                                      "energy_wh": round(2800 / 3600, 2)}
+
+
+def test_the_history_knows_the_range_of_a_column():
+    from rmq.metrics import Metrics
+    m = Metrics(coarse_step=3)
+    assert m.extent(("cpu_power",)) is None
+    for i, (p, ck) in enumerate([(None, None), (12.0, 0.9), (95.5, 4.7), (40.0, None)]):
+        m.add(1000.0 + i, {"cpu_power": p, "clock_p": ck, "clock_e": 2.5 if ck else None})
+    assert m.extent(("cpu_power",)) == (12.0, 95.5) and m.extent(("clock_p", "clock_e")) == (0.9, 4.7)
+
+
+def test_energy_by_the_hour_and_by_agent(tmp_path):
+    book = StatsBook(tmp_path, now=H14)
+    for t in range(0, 1800):                                # half an hour: CPU 60 W, GPU 100 W, tasks get 50 W
+        s = sample()
+        s["metrics"].update(cpu_power=60.0, gpu_power=100.0)
+        s["tasks_power"] = 50.0
+        s["agents"]["claude@x"]["power"] = 50.0
+        book.add(H14 + t, 1.0, s)
+    book.add(H14 + 3600, 1.0, sample())
+    r = rows(tmp_path / "hourly.csv")[0]
+    assert float(r["cpu_energy_wh"]) == pytest.approx(30, abs=0.1) and float(r["gpu_energy_wh"]) == pytest.approx(50, abs=0.1)
+    assert float(r["tasks_energy_wh"]) == pytest.approx(25, abs=0.1) and float(r["gpu_power_max_w"]) == 100
+    a = rows(tmp_path / "agents_hourly.csv")[0]
+    assert float(a["energy_wh"]) == pytest.approx(25, abs=0.1)
+    rep = book.report("24h", now=H14 + 3600)
+    assert rep["total"]["tasks_energy_wh"] == pytest.approx(25, abs=0.1) and rep["agents"][0]["energy_wh"] == pytest.approx(25, abs=0.1)
+
+
+def test_power_falls_on_tasks_by_their_share():
+    from types import SimpleNamespace
+    from rmq.manager import Manager
+    m = object.__new__(Manager)
+    m.lhm = SimpleNamespace(extra={"power": 80.0})
+    m.nv = SimpleNamespace(extra={"power": 120.0})
+    usage = {1: SimpleNamespace(cpu=6.0), 2: SimpleNamespace(cpu=2.0)}
+    w = m._watts_of(usage, {1: 0.0, 2: 90.0}, cpu_user=2.0, tasks_cpu=8.0, gpu_user=10.0, gpu_tasks=90.0)
+    assert w[1] == pytest.approx(80 * 6 / 10) and w[2] == pytest.approx(80 * 2 / 10 + 120 * 0.9)
+    m.lhm.extra, m.nv.extra = {}, {}                       # nothing measured: nothing counted
+    assert m._watts_of(usage, {}, 2.0, 8.0, 0.0, 0.0) == {1: 0.0, 2: 0.0}

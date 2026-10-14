@@ -28,6 +28,8 @@
 
   const nf1 = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
   const nf2 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 });
+  const nfTenth = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 });  // 57,3 — or 57 when it is whole
+  const nfRub = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });  // 8,90
   const n1 = (v) => nf1.format(v || 0);
   const gb = (v) => (v == null ? '–' : v > 0 && v < 0.95 ? `${Math.round(v * 1024)} МБ` : `${n1(v)} ГБ`);
   const pct = (v) => `${Math.round(v || 0)}%`;
@@ -913,8 +915,8 @@
   const HEAT_NAMES = ['норма', 'регулятор урезает процессор задачам', 'перегрев — задачи агентов заморожены'];
   class LevelChart {
     // o: { title, series, color, min, max, step, values(), fmt(v), tick(v), refs() -> [{ v, color, dash, cls, label, text }],
-    //      sub(), hidden(), empty(), wide, more() -> [{ series, color, values() }] (further lines) }
-    // max may be a function (a scale that follows the data); step then a function of max
+    //      sub(), hidden(), empty(), wide, more() -> [{ series, color, values() }] (further lines),
+    //      scale() -> { min, max, step } (instead of min, max, step; min need not be a multiple of step) }
     constructor(o, src = MAIN_SRC) {
       this.o = o;
       this.src = src;
@@ -967,8 +969,7 @@
     more() { return this.o.more ? this.o.more() : []; }
 
     scale() {
-      const max = typeof this.o.max === 'function' ? this.o.max() : this.o.max;
-      return { min: this.o.min, max, step: typeof this.o.step === 'function' ? this.o.step(max) : this.o.step };
+      return this.o.scale ? this.o.scale() : { min: this.o.min, max: this.o.max, step: this.o.step };
     }
 
     renderTable() {
@@ -1044,7 +1045,9 @@
       c.textAlign = 'right';
       c.textBaseline = 'middle';
       const sc = this.scale();
-      for (let t = sc.min; t <= sc.max + 1e-9; t += sc.step) {
+      const ticks = [sc.min];  // the axis, then round values above it (not crowding it)
+      for (let t = Math.ceil(sc.min / sc.step - 1e-9) * sc.step; t <= sc.max + 1e-9; t += sc.step) if (t > sc.min + sc.step / 4) ticks.push(t);
+      for (const t of ticks) {
         const y = Math.round(g.Y(t)) + 0.5;
         c.strokeStyle = t === sc.min ? col.axis : col.grid;
         c.beginPath(); c.moveTo(g.pad.l, y); c.lineTo(g.w - g.pad.r, y); c.stroke();
@@ -1124,7 +1127,7 @@
   const tempChart = (key, title, src) => new LevelChart({
     title, series: 'температура', color: '--s-temp', min: 20, max: 110, step: 20,
     values: () => (chartData(src) || {})[`temp_${key}`] || [],
-    fmt: (v) => `${Math.round(v)}°C`, tick: (v) => `${v}°`,
+    fmt: (v) => `${nfTenth.format(v)}°C`, tick: (v) => `${v}°`,
     hidden: () => !reading(src, key),
     sub: () => { const r = reading(src, key); return r.temp == null ? (r.note || 'нет данных') : `сейчас ${Math.round(r.temp)}°C`; },
     refs: () => {
@@ -1151,42 +1154,251 @@
     refs: () => [{ v: src.state.thermal.min_cpu_factor * 100, color: '--muted', dash: [2, 3], cls: 'thr', label: 'не меньше', text: `${Math.round(src.state.thermal.min_cpu_factor * 100)}%` }],
     empty: () => 'Данные появятся через пару секунд',
   }, src);
-  // a scale that follows the data: the highest value seen, rounded up to `unit`, but never below `floor`
-  const peakOf = (arrays, floor, unit) => {
-    let hi = floor;
-    for (const a of arrays) for (const x of a || []) if (x != null && x > hi) hi = x;
-    return Math.ceil(hi / unit) * unit;
+  // the range this CPU really works in (the lowest and highest values LibreHardwareMonitor and the charts' history
+  // have seen): a fixed scale that does not jump with the data and does not start at a zero the CPU never reaches.
+  // It only widens if the CPU ever goes beyond it. An older manager on another PC does not say: `fallback`.
+  const cpuScale = (range, loUnit, hiUnit, fallback) => {
+    const [lo0, hi0] = range && range[1] > range[0] ? range : fallback;
+    const lo = Math.max(0, Math.floor(lo0 / loUnit + 1e-9) * loUnit);
+    const hi = Math.max(lo + hiUnit, Math.ceil(hi0 / hiUnit - 1e-9) * hiUnit);
+    return { min: lo, max: hi, step: niceStep((hi - lo) / 5) };
   };
   const thermalOf = (src) => (src.state && src.state.thermal) || {};
+  const rangesOf = (src) => thermalOf(src).ranges || {};
+  // the CPU's power and clocks come from LibreHardwareMonitor; the GPU's from its driver, while it is awake
+  const hasCpuPower = (src) => thermalOf(src).cpu_power != null || !!rangesOf(src).power;
+  const hasCpuClock = (src) => thermalOf(src).clock_p != null || !!rangesOf(src).clock;
+  const hasGpu = (src) => !!reading(src, 'gpu');
+  const joinRange = (...rs) => {
+    const ok = rs.filter((r) => r && r[1] > r[0]);
+    return ok.length ? [Math.min(...ok.map((r) => r[0])), Math.max(...ok.map((r) => r[1]))] : null;
+  };
+  const GPU_SLEEPS = 'Видеокарта спит: опрашивается, только когда работает';
   const powerChart = (src) => new LevelChart({
-    title: 'Мощность процессора, Вт', series: 'пакет процессора', color: '--s-temp', min: 0,
-    max: () => { const hi = peakOf([(chartData(src) || {}).cpu_power], 40, 1); const st = niceStep(hi / 4); return Math.ceil(hi / st) * st; },
-    step: (mx) => niceStep(mx / 4),
-    values: () => (chartData(src) || {}).cpu_power || [],
-    fmt: (v) => `${Math.round(v)} Вт`, tick: (v) => `${v}`,
-    hidden: () => thermalOf(src).cpu_power == null,
-    sub: () => `сейчас ${Math.round(thermalOf(src).cpu_power)} Вт · по LibreHardwareMonitor`,
-    refs: () => [],
-    empty: () => 'Данные появятся через пару секунд',
-  }, src);
-  const clockChart = (src) => new LevelChart({
-    title: 'Частота ядер процессора, ГГц', color: '--c1', min: 0,
-    get series() { return thermalOf(src).clock_e != null ? 'P-ядра' : 'ядра'; },
-    max: () => { const m = chartData(src) || {}; return peakOf([m.clock_p, m.clock_e], 3, 1); }, step: () => 1,
-    values: () => (chartData(src) || {}).clock_p || [],
-    more: () => (thermalOf(src).clock_e != null
-      ? [{ series: 'E-ядра', color: '--c2', values: () => (chartData(src) || {}).clock_e || [] }] : []),
-    fmt: (v) => `${nf2.format(v)} ГГц`, tick: (v) => `${v}`,
-    hidden: () => thermalOf(src).clock_p == null,
+    title: 'Мощность, Вт',
+    get series() { return hasCpuPower(src) ? 'процессор' : 'видеокарта'; },
+    get color() { return hasCpuPower(src) ? '--c1' : '--c3'; },
+    scale: () => cpuScale(joinRange(hasCpuPower(src) ? rangesOf(src).power : null, hasGpu(src) ? rangesOf(src).gpu_power : null), 1, 5, [0, 100]),
+    values: () => (chartData(src) || {})[hasCpuPower(src) ? 'cpu_power' : 'gpu_power'] || [],
+    more: () => (hasCpuPower(src) && hasGpu(src)
+      ? [{ series: 'видеокарта', color: '--c3', values: () => (chartData(src) || {}).gpu_power || [] }] : []),
+    fmt: (v) => `${nfTenth.format(v)} Вт`, tick: (v) => nf2.format(v),
+    hidden: () => !hasCpuPower(src) && !hasGpu(src),
     sub: () => {
       const th = thermalOf(src);
-      return `сейчас ${th.clock_e != null ? `P ${nf2.format(th.clock_p)} · E ${nf2.format(th.clock_e)}` : nf2.format(th.clock_p)} ГГц · в среднем по ядрам`;
+      const parts = [th.cpu_power != null ? `процессор ${Math.round(th.cpu_power)} Вт` : null,
+        hasGpu(src) ? (th.gpu_power != null ? `видеокарта ${Math.round(th.gpu_power)} Вт` : 'видеокарта спит') : null].filter(Boolean);
+      return `сейчас ${parts.join(' · ')}`;
     },
     refs: () => [],
-    empty: () => 'Данные появятся через пару секунд',
+    empty: () => (hasCpuPower(src) ? 'Данные появятся через пару секунд' : GPU_SLEEPS),
   }, src);
+  const clockChart = (src) => new LevelChart({
+    title: 'Частоты, ГГц',
+    get series() { return !hasCpuClock(src) ? 'видеокарта' : thermalOf(src).clock_e != null ? 'P-ядра' : 'ядра процессора'; },
+    get color() { return hasCpuClock(src) ? '--c1' : '--c3'; },
+    scale: () => cpuScale(joinRange(hasCpuClock(src) ? rangesOf(src).clock : null, hasGpu(src) ? rangesOf(src).gpu_clock : null), 0.1, 0.1, [0, 5]),
+    values: () => (chartData(src) || {})[hasCpuClock(src) ? 'clock_p' : 'gpu_clock'] || [],
+    more: () => (hasCpuClock(src) ? [
+      thermalOf(src).clock_e != null ? { series: 'E-ядра', color: '--c2', values: () => (chartData(src) || {}).clock_e || [] } : null,
+      hasGpu(src) ? { series: 'видеокарта', color: '--c3', values: () => (chartData(src) || {}).gpu_clock || [] } : null,
+    ].filter(Boolean) : []),
+    fmt: (v) => `${nf2.format(v)} ГГц`, tick: (v) => nf2.format(v),
+    hidden: () => !hasCpuClock(src) && !hasGpu(src),
+    sub: () => {
+      const th = thermalOf(src);
+      const parts = [th.clock_p != null ? `${th.clock_e != null ? 'P-ядра' : 'ядра'} ${nf2.format(th.clock_p)} ГГц` : null,
+        th.clock_e != null ? `E-ядра ${nf2.format(th.clock_e)} ГГц` : null,
+        hasGpu(src) ? (th.gpu_clock != null ? `видеокарта ${nf2.format(th.gpu_clock)} ГГц` : 'видеокарта спит') : null].filter(Boolean);
+      return `сейчас ${parts.join(' · ')}${th.clock_p != null ? ' · у ядер — средняя' : ''}`;
+    },
+    refs: () => [],
+    empty: () => (hasCpuClock(src) ? 'Данные появятся через пару секунд' : GPU_SLEEPS),
+  }, src);
+
+  // ================================================================ power → temperature: every moment as a dot
+  // The CPU's power explains its temperature best (a laptop in its 45 W and in its 100 W mode makes two clouds).
+  // The same fixed scales as the charts above; older moments are paler.
+  class ScatterChart {
+    constructor(src = MAIN_SRC) {
+      this.src = src;
+      this.hover = null;
+      this.showTable = false;
+      this._pts = [];
+      this.tbtn = h('button', { class: 'btn tbtn', type: 'button', 'aria-pressed': 'false', onclick: () => this.toggleTable() }, 'Таблица');
+      this.sub = h('span', { class: 'sub' });
+      const key = h('span', { class: 'key dot' });
+      key.style.background = 'var(--c1)';
+      this.legend = h('div', { class: 'legend' }, h('span', null, key, 'момент времени: мощность и температура процессора'),
+        h('span', null, 'бледнее — раньше'));
+      this.canvas = h('canvas', { role: 'img', 'aria-label': 'Мощность и температура процессора: точечный график' });
+      this.plot = h('div', { class: 'plot' }, this.canvas);
+      this.overlay = overlayOf(this.plot);
+      this.tableEl = h('div', { class: 'table-view', hidden: true });
+      this.root = h('section', { class: 'chart wide scatter', 'aria-label': 'Мощность и температура процессора' },
+        h('header', null, h('span', { class: 'title' }, 'Мощность → температура процессора'), this.sub, this.tbtn),
+        this.legend, this.plot, this.tableEl);
+      this.canvas.addEventListener('pointermove', perFrame((e) => this.onMove(e)));
+      this.canvas.addEventListener('pointerleave', () => { this.hover = null; tooltip.hidden = true; this.drawHover(); });
+      new ResizeObserver(() => this.draw()).observe(this.plot);
+    }
+
+    toggleTable() {
+      this.showTable = !this.showTable;
+      this.tbtn.setAttribute('aria-pressed', String(this.showTable));
+      setText(this.tbtn, this.showTable ? 'График' : 'Таблица');
+      this.update();
+    }
+
+    points() {
+      const m = chartData(this.src);
+      if (!m) return [];
+      const x = m.cpu_power || []; const y = m.temp_cpu || [];
+      const out = [];
+      for (let i = 0; i < m.t.length; i += 1) if (x[i] != null && y[i] != null) out.push(i);
+      return out;
+    }
+
+    update() {
+      const off = !this.src.state || !hasCpuPower(this.src) || !reading(this.src, 'cpu');
+      this.root.hidden = off;
+      if (off) return;
+      const m = chartData(this.src);
+      setText(this.sub, `${this.points().length} ${m && m.step > 1 ? `точек по ${dur(m.step)}` : 'точек, по секунде'} за выбранный период`);
+      this.plot.hidden = this.showTable;
+      this.tableEl.hidden = !this.showTable;
+      if (this.showTable) this.renderTable(); else this.draw();
+    }
+
+    geometry() {
+      const w = this.plot.clientWidth; const ht = this.plot.clientHeight;
+      const pad = { l: 40, r: 12, t: 8, b: 24 };
+      const xs = cpuScale(rangesOf(this.src).power, 1, 5, [0, 100]);
+      const ys = { min: 20, max: 110, step: 20 };
+      const pw = Math.max(10, w - pad.l - pad.r); const ph = Math.max(10, ht - pad.t - pad.b);
+      const clamp = (v, s) => Math.max(s.min, Math.min(s.max, v));
+      return {
+        w, ht, pad, pw, ph, xs, ys,
+        X: (v) => pad.l + ((clamp(v, xs) - xs.min) / (xs.max - xs.min)) * pw,
+        Y: (v) => pad.t + ph - ((clamp(v, ys) - ys.min) / (ys.max - ys.min)) * ph,
+      };
+    }
+
+    draw() {
+      if (this.plot.hidden || this.root.hidden || !this.src.state) return;
+      const dpr = window.devicePixelRatio || 1;
+      const g = this.geometry();
+      this.canvas.width = Math.round(g.w * dpr);
+      this.canvas.height = Math.round(g.ht * dpr);
+      const c = this.canvas.getContext('2d');
+      c.setTransform(dpr, 0, 0, dpr, 0, 0);
+      c.clearRect(0, 0, g.w, g.ht);
+      c.font = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
+      const muted = cssVar('--muted');
+      c.lineWidth = 1;
+      c.textAlign = 'right'; c.textBaseline = 'middle';
+      for (let t = g.ys.min; t <= g.ys.max; t += g.ys.step) {
+        const y = Math.round(g.Y(t)) + 0.5;
+        c.strokeStyle = t === g.ys.min ? cssVar('--axis') : cssVar('--grid');
+        c.beginPath(); c.moveTo(g.pad.l, y); c.lineTo(g.w - g.pad.r, y); c.stroke();
+        c.fillStyle = muted; c.fillText(`${t}°`, g.pad.l - 6, y);
+      }
+      c.textAlign = 'center'; c.textBaseline = 'top';
+      const xt = [g.xs.min];
+      for (let v = Math.ceil(g.xs.min / g.xs.step - 1e-9) * g.xs.step; v <= g.xs.max + 1e-9; v += g.xs.step) if (v > g.xs.min + g.xs.step / 4) xt.push(v);
+      for (const v of xt) {
+        const x = Math.round(g.X(v)) + 0.5;
+        c.strokeStyle = v === g.xs.min ? cssVar('--axis') : cssVar('--grid');
+        c.beginPath(); c.moveTo(x, g.pad.t); c.lineTo(x, g.pad.t + g.ph); c.stroke();
+        c.fillStyle = muted; c.fillText(v === xt[xt.length - 1] ? `${nf2.format(v)} Вт` : nf2.format(v), x, g.pad.t + g.ph + 6);
+      }
+      const r = reading(this.src, 'cpu');
+      for (const [v, color] of [[r && r.hot, '--critical'], [r && r.target, '--warning']]) {
+        if (v == null) continue;
+        const y = Math.round(g.Y(v)) + 0.5;
+        c.strokeStyle = cssVar(color); c.lineWidth = 1.5; c.setLineDash([5, 4]);
+        c.beginPath(); c.moveTo(g.pad.l, y); c.lineTo(g.w - g.pad.r, y); c.stroke();
+      }
+      c.setLineDash([]);
+      const m = chartData(this.src);
+      const idx = this.points();
+      this._g = g; this._m = m;
+      this._pts = idx.map((i) => [g.X(m.cpu_power[i]), g.Y(m.temp_cpu[i]), i]);
+      if (!this._pts.length) {
+        c.fillStyle = muted; c.textBaseline = 'middle';
+        c.fillText('Данные появятся через пару секунд', g.pad.l + g.pw / 2, g.pad.t + g.ph / 2);
+        this.drawHover();
+        return;
+      }
+      const base = cssVar('--c1');
+      const n = this._pts.length;
+      this._pts.forEach(([x, y], k) => {
+        c.fillStyle = rgba(base, 0.12 + 0.5 * (n > 1 ? k / (n - 1) : 1));
+        c.beginPath(); c.arc(x, y, 2.5, 0, Math.PI * 2); c.fill();
+      });
+      const [lx, ly] = this._pts[n - 1];
+      ringDot(c, lx, ly, base);
+      this.drawHover();
+    }
+
+    drawHover() {
+      const g = this._g;
+      if (!g) return;
+      const c = overlayCtx(this.overlay, g);
+      if (this.hover == null || !this._pts[this.hover]) return;
+      const [x, y] = this._pts[this.hover];
+      ringDot(c, x, y, cssVar('--c1'));
+    }
+
+    onMove(e) {
+      if (!this._pts.length) return;
+      const rect = this.canvas.getBoundingClientRect();
+      const px = e.clientX - rect.left; const py = e.clientY - rect.top;
+      let best = -1; let bd = 14 * 14;
+      for (let k = 0; k < this._pts.length; k += 1) {
+        const dx = this._pts[k][0] - px; const dy = this._pts[k][1] - py;
+        const d = dx * dx + dy * dy;
+        if (d <= bd) { bd = d; best = k; }
+      }
+      if (best < 0) { this.hover = null; tooltip.hidden = true; this.drawHover(); return; }
+      if (best === this.hover && !tooltip.hidden) { placeTooltip(e); return; }
+      this.hover = best;
+      this.drawHover();
+      const i = this._pts[best][2]; const m = this._m;
+      tooltip.replaceChildren(
+        h('div', { class: 't' }, tipTime(m.t[i]) + smoothNote()),
+        h('div', { class: 'r' }, h('span', null, 'мощность'), h('b', null, `${nfTenth.format(m.cpu_power[i])} Вт`)),
+        h('div', { class: 'r' }, h('span', null, 'температура'), h('b', null, `${nfTenth.format(m.temp_cpu[i])}°C`)));
+      placeTooltip(e);
+    }
+
+    renderTable() {
+      // the same dots, summed up: by every 10 W, the average and the highest temperature and how long it was so
+      const m = chartData(this.src);
+      const idx = this.points();
+      if (!idx.length) { this.tableEl.replaceChildren(h('p', { class: 'muted' }, 'Нет данных')); return; }
+      const bins = new Map();
+      for (const i of idx) {
+        const k = Math.floor(m.cpu_power[i] / 10) * 10;
+        const b = bins.get(k) || { n: 0, sum: 0, max: -Infinity };
+        b.n += 1; b.sum += m.temp_cpu[i]; b.max = Math.max(b.max, m.temp_cpu[i]);
+        bins.set(k, b);
+      }
+      const step = m.step || 1;
+      this.tableEl.replaceChildren(h('table', null,
+        h('thead', null, h('tr', null, h('th', null, 'Мощность'), h('th', { class: 'num' }, 'Температура в среднем'),
+          h('th', { class: 'num' }, 'Максимум'), h('th', { class: 'num' }, 'Сколько времени'))),
+        h('tbody', null, [...bins.keys()].sort((a, b) => a - b).map((k) => {
+          const b = bins.get(k);
+          return h('tr', null, h('td', { class: 'num' }, `${k}–${k + 10} Вт`), h('td', { class: 'num' }, `${nfTenth.format(b.sum / b.n)}°C`),
+            h('td', { class: 'num' }, `${nfTenth.format(b.max)}°C`), h('td', { class: 'num' }, dur(b.n * step)));
+        }))));
+    }
+  }
+
   const thermalCharts = (src) => [tempChart('cpu', 'Процессор', src), tempChart('gpu', 'Видеокарта', src),
-    tempChart('board', 'Плата (ACPI)', src), tempChart('ssd', 'SSD', src), powerChart(src), clockChart(src), shareChart(src)];
+    tempChart('board', 'Плата (ACPI)', src), tempChart('ssd', 'SSD', src), powerChart(src), clockChart(src),
+    new ScatterChart(src), shareChart(src)];
   const tempCharts = thermalCharts(MAIN_SRC);
   $('#thermal-charts').append(...tempCharts.map((c) => c.root));
 
@@ -1221,9 +1433,17 @@
     }
     box.className = `card thermal-status ${th.enabled ? th.state : 'normal'}`;
     fill(box, h('span', { class: 'icon', 'aria-hidden': 'true' }, icon),
-      h('div', null, h('div', { class: 'head' }, head), h('div', { class: 'ink2' }, body)));
+      h('div', null, h('div', { class: 'head' }, head), h('div', { class: 'ink2' }, body),
+        powerLine(s.power) ? h('div', { class: 'small ink2', title: 'Режимы производителя ноутбука (например, кнопкой Fn+Q или в его фирменной программе) Windows не показывает: их здесь не видно.' }, powerLine(s.power)) : null));
     $('#thermal-tiles').replaceChildren(...thermalTiles(th));
     tempCharts.forEach((c) => c.update());
+  }
+
+  // "Питание: от сети · режим Windows «сбалансированный» · схема «Сбалансированная»"
+  function powerLine(p) {
+    if (!p || (!p.mode && !p.plan)) return '';
+    const source = p.on_battery ? `от батареи${p.battery_pct != null ? ` (${p.battery_pct}%)` : ''}` : 'от сети';
+    return [`Питание: ${source}`, p.mode ? `режим Windows «${p.mode}»` : null, p.plan ? `схема «${p.plan}»` : null].filter(Boolean).join(' · ');
   }
 
   // why there is no CPU temperature: LibreHardwareMonitor gives it, through its local web server
@@ -1602,6 +1822,24 @@
     fill(td, h('div', null, t.score != null ? String(Math.round(t.score)) : '–'), why ? h('div', { class: 'why' }, why) : null);
   };
 
+  // The forecast: the queue played forward over the run times expected of each task (its earlier runs of the
+  // same command, its progress, or its request). "~15:40", with the day when it is not today.
+  const etaAt = (ts) => `${new Date(ts * 1000).toDateString() === new Date().toDateString() ? '' : `${dayLabel(ts)} `}${clock(ts)}`;
+  const FORECAST_BASIS = { 'прошлые запуски': 'по прошлым запускам этой команды', 'заявка': 'по заявленному времени', 'прогресс': 'по прогрессу задачи' };
+  const forecastNote = (f) => `Прогноз ${FORECAST_BASIS[f.basis] || ''}: примерный — считает, что вы пользуетесь ПК как сейчас, а задачи идут в порядке очереди.`;
+  function forecastText(t) {
+    const f = t.forecast;
+    if (!f) return '';
+    if (t.state === 'running') return `до ~${etaAt(f.end)}`;
+    return f.start - STATE.now < 60 ? `конец ~${etaAt(f.end)}` : `старт ~${etaAt(f.start)} · конец ~${etaAt(f.end)}`;
+  }
+  const timeCell = (td, t) => {
+    const main = `${dur(t.run_s)} / ${dur(t.time_s)}`;
+    const eta = forecastText(t);
+    td.title = t.forecast ? forecastNote(t.forecast) : '';
+    fill(td, h('div', null, main), eta ? h('div', { class: 'why' }, eta) : null);
+  };
+
   const activeCols = [
     ['num', textCell((t) => String(t.id))],
     [null, nameCell],
@@ -1611,7 +1849,7 @@
       ? `${n1(used(t, 'cpu'))} / ${num(t.cpu)}${t.cap_cores != null ? ` (кап ${n1(t.cap_cores)})` : ''}` : `– / ${num(t.cpu)}`))],
     ['num', textCell((t) => `${t.used ? n1(t.used.ram) : '–'} / ${num(t.ram)}`)],
     ['num', textCell((t) => (t.vram || (t.used && t.used.vram > 0.05) ? `${t.used ? n1(t.used.vram) : '–'} / ${num(t.vram)}` : '–'))],
-    ['num', textCell((t) => `${dur(t.run_s)} / ${dur(t.time_s)}`)],
+    ['num', timeCell],
     ['num score-cell', scoreCell],
     [null, progressCell],
     ['actions', actionsCell],
@@ -1623,10 +1861,13 @@
     const why = paused
       ? `${t.reason_text || 'на паузе'}${t.wait_text && t.wait === 'no_fit' ? `. ${t.wait_text}` : ''}${t.position ? '' : '. Продолжится по кнопке «Продолжить»'}`
       : t.wait_text || (t.reason && t.reason.startsWith('requeued:') ? t.reason_text : 'Запустится на следующем шаге');
-    const sig = `${t.state}|${t.reason}|${why}`;
+    const eta = forecastText(t);
+    const sig = `${t.state}|${t.reason}|${why}|${eta}`;
     if (td._sig === sig) return;
     td._sig = sig;
-    fill(td, paused ? stateBadge(t) : null, paused ? h('div', { class: 'why' }, why) : why);
+    td.title = t.forecast ? forecastNote(t.forecast) : '';
+    fill(td, paused ? stateBadge(t) : null, paused ? h('div', { class: 'why' }, why) : why,
+      eta ? h('div', { class: 'why' }, `прогноз: ${eta}`) : null);
   };
   const queueColsFor = (nowOf) => [
     ['num', textCell((t) => (t.position != null ? String(t.position) : '–'))],
@@ -1888,9 +2129,10 @@
       enabled: 'Замораживать задачи, когда на диске мало места',
       min_free_gb: 'Минимум свободного места, ГБ (системный диск — для всех задач, другой диск — для задач, работающих на нём)',
     }],
-    power: ['Сон', {
+    power: ['Сон и электричество', {
       keep_awake_while_running: 'Не давать ПК уходить в сон по таймеру, пока выполняются задачи (экран гаснет как обычно)',
       keep_awake_on_battery: '…и при работе от батареи (иначе на батарее сон разрешён, чтобы не разрядить её)',
+      tariff_rub_kwh: 'Тариф на электричество, ₽ за кВт·ч (для статистики энергии задач)',
     }],
     scheduler: ['Очередь и честное деление', {
       tick_s: 'Шаг планировщика, сек', cpu_squeeze_pct: 'На сколько % можно ужать процессор работающих задач, чтобы запустить новую', settle_s: 'Пауза после вытеснения, сек',
@@ -2152,6 +2394,7 @@
         ['Состояние', `${t.state_text}${t.reason_text ? ` — ${t.reason_text}` : ''}`],
         t.wait_text ? ['Почему ждёт', t.wait_text] : null,
         t.position ? ['Место в очереди', `${t.position} (очки ${Math.round(t.score)})`] : null,
+        t.forecast ? ['Прогноз', `${forecastText(t)}. ${forecastNote(t.forecast)}`] : null,
         ['Агент', t.agent],
         t.where ? ['Где выполняется', `на ПК ${t.where} (вычислительная сеть); результаты вернутся в папку задачи`] : null,
         t.from ? ['Откуда', `с ПК ${t.from} (вычислительная сеть); работает с пониженным уровнем доступа`] : null,
@@ -2168,6 +2411,7 @@
         ['Время работы', `${dur(t.run_s)}${t.overtime ? ' — дольше заявленного' : ''}${(t.held_s || 0) >= 60 ? `; из них ${dur(t.held_s)} с урезанным процессором — в сверхурочные не идёт` : ''}`],
         t.series || t.after_id ? ['Порядок', [t.series ? `серия «${t.series}» — задачи серии идут по одной, по порядку` : '', t.after_id ? `после успешного окончания #${t.after_id}` : ''].filter(Boolean).join('; ')] : null,
         t.conditions && t.state !== 'queued' ? ['Условия счёта', conditionsText(t.conditions)] : null,
+        t.conditions && t.conditions.energy_wh != null ? ['Энергия', `${energyText(t.conditions.energy_wh, STATE.power && STATE.power.tariff)} — оценка: доля мощности процессора и видеокарты по времени, которое задача их занимала`] : null,
         t.swing ? ['Нагрузка', `${swingText(t.swing)} — похоже на фазы ожидания (проверка, синхронизация, диск или сеть): задача идёт дольше, чем могла бы`] : null,
         ['Поставлена', stamp(t.submitted_at)],
         t.started_at ? ['Запущена', stamp(t.started_at)] : null,
@@ -2216,6 +2460,7 @@
     return v >= 60 ? `${Math.floor(v / 60)} ч ${String(v % 60).padStart(2, '0')} мин` : `${v} мин`;
   };
   const deg = (v) => (v == null ? '–' : `${Math.round(v)}°C`);
+  const degTenth = (v) => (v == null ? '–' : `${nfTenth.format(v)}°C`);  // in tooltips: to a tenth
   const fsize = (b) => (b >= 1048576 ? `${n1(b / 1048576)} МБ` : `${Math.max(1, Math.round(b / 1024))} КБ`);
   const times = (n) => (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? 'раза' : 'раз');
   const tipRow = (label, value, color) => h('div', { class: 'r' },
@@ -2430,9 +2675,9 @@
     tick: (v) => `${v}°`,
     sub: () => `${COMP_NAMES[STAT_COMP]}, ${REPORT.bucket === 'hour' ? 'по часам' : 'по дням'}`,
     tip: (b) => [
-      tipRow('максимум', deg(b[`${STAT_COMP}_max_c`]), '--s-tasks'),
-      tipRow('в среднем во время расчётов', deg(b[`${STAT_COMP}_load_avg_c`]), '--s-user'),
-      tipRow('в среднем за всё время', deg(b[`${STAT_COMP}_avg_c`])),
+      tipRow('максимум', degTenth(b[`${STAT_COMP}_max_c`]), '--s-tasks'),
+      tipRow('в среднем во время расчётов', degTenth(b[`${STAT_COMP}_load_avg_c`]), '--s-user'),
+      tipRow('в среднем за всё время', degTenth(b[`${STAT_COMP}_avg_c`])),
       tipRow('выше цели', mins(b[`${STAT_COMP}_over_target_min`])),
     ],
   });
@@ -2440,6 +2685,21 @@
   $('#stats-charts').append(...statCharts.map((c) => c.root));
 
   const watts = (v) => (v == null ? '–' : `${Math.round(v)} Вт`);
+  // "85 Вт·ч ≈ 0,76 ₽" or "3,2 кВт·ч ≈ 28 ₽"
+  function energyText(wh, tariff) {
+    const amount = wh >= 1000 ? `${nf2.format(wh / 1000)} кВт·ч` : `${nfTenth.format(wh)} Вт·ч`;
+    return tariff ? `${amount} ≈ ${nfRub.format((wh / 1000) * tariff)} ₽` : amount;
+  }
+  // for scale: a smartphone's charge takes ~15 Wh, boiling a full kettle (1,7 l) ~160 Wh
+  function energyLike(wh) {
+    const phones = Math.round(wh / 15); const kettles = Math.round(wh / 160);
+    if (kettles >= 1) return `≈ ${kettles} ${plural(kettles, 'чайник', 'чайника', 'чайников')} (1,7 л) или ${phones} ${plural(phones, 'зарядка', 'зарядки', 'зарядок')} смартфона`;
+    return phones >= 1 ? `≈ ${phones} ${plural(phones, 'зарядка', 'зарядки', 'зарядок')} смартфона` : 'меньше одной зарядки смартфона';
+  }
+  function plural(n, one, few, many) {
+    const a = Math.abs(n) % 100; const b = a % 10;
+    return a > 10 && a < 20 ? many : b === 1 ? one : b >= 2 && b <= 4 ? few : many;
+  }
   const ghz = (v) => (v == null ? '–' : `${nf2.format(v)} ГГц`);
 
   function renderStatsTiles(rep) {
@@ -2467,6 +2727,12 @@
         kv(null, 'Расчёты стояли из-за перегрева', mins(t.heat_frozen_min)),
         kv(null, 'Максимум', others.map((c) => `${COMP_SHORT[c]} ${deg(t[`${c}_max_c`])}`).join(' · ')),
         kv(null, 'Выше цели', others.map((c) => `${COMP_SHORT[c]} ${mins(t[`${c}_over_target_min`])}`).join(' · ')),
+      ]),
+      tile('Энергия задач', t.tasks_energy_wh >= 1000 ? nf2.format(t.tasks_energy_wh / 1000) : nfTenth.format(t.tasks_energy_wh || 0), t.tasks_energy_wh >= 1000 ? 'кВт·ч' : 'Вт·ч', null, [
+        rep.tariff ? `≈ ${nfRub.format(((t.tasks_energy_wh || 0) / 1000) * rep.tariff)} ₽ по тарифу ${nfRub.format(rep.tariff)} ₽ за кВт·ч` : '',
+        kv(null, 'Это как', energyLike(t.tasks_energy_wh || 0)),
+        kv(null, 'Процессор всего', t.cpu_energy_wh ? energyText(t.cpu_energy_wh, rep.tariff) : '– (нет датчика)'),
+        kv(null, 'Видеокарта, пока не спала', t.gpu_energy_wh ? energyText(t.gpu_energy_wh, rep.tariff) : '–'),
       ]),
       tile('Задачи записали', n1(t.disk_write_gb), 'ГБ', null, [
         kv(null, 'Прочитали', `${n1(t.disk_read_gb)} ГБ`),
@@ -2496,13 +2762,13 @@
   function renderStatsAgents(rep) {
     const tbody = $('#t-stats-agents tbody');
     if (!rep.agents.length) {
-      tbody.replaceChildren(h('tr', { class: 'empty' }, h('td', { colspan: 9 }, 'За этот период задач не было')));
+      tbody.replaceChildren(h('tr', { class: 'empty' }, h('td', { colspan: 10 }, 'За этот период задач не было')));
       return;
     }
     const num = (x) => h('td', { class: 'num' }, x);
     tbody.replaceChildren(...rep.agents.map((a) => h('tr', null,
       h('td', null, a.agent === 'user' ? 'Вы (дашборд)' : a.agent), num(`${n1(a.task_h)} ч`), num(n1(a.cpu_core_h)),
-      num(nf2.format(a.gpu_h)), num(n1(a.ram_gb_h)), num(n1(a.disk_write_gb)), num(String(a.started)),
+      num(nf2.format(a.gpu_h)), num(n1(a.ram_gb_h)), num(a.energy_wh ? energyText(a.energy_wh, rep.tariff) : '–'), num(n1(a.disk_write_gb)), num(String(a.started)),
       num(`${a.done} / ${a.failed}`), num(`${a.cancelled} / ${a.requeued}`))));
   }
 
@@ -3270,7 +3536,8 @@
       'ПК «не в сети» — на нём выключен сам ПК, менеджер или Tailscale. В Tailscale (Machines) нужные ПК должны быть видны и подключены.',
       'В таблице написано, что ПК не может связаться с другим, — на том ПК брандмауэр не пускает Python или ПК не поделился в Tailscale.',
       'Если Python в брандмауэре случайно запретили: Панель управления → Брандмауэр Защитника Windows → Разрешение взаимодействия с приложением → «Изменить параметры» → у Python (pythonw.exe) отметить «Частная».',
-      'Включённый VPN может мешать Tailscale. Если связь пропадает только с VPN, исключите Tailscale из VPN или выключите VPN.',
+      'Включённый VPN может мешать Tailscale. Если связь пропадает только с VPN, исключите Tailscale из VPN (раздельное туннелирование: адреса 100.64.0.0/10 и, если VPN умеет исключать программы, tailscaled.exe) или выключите VPN.',
+      'Tailscale видит ПК, а связи нет — переподключите Tailscale на обоих ПК: значок в трее → Disconnect → Connect. Причину, которую нашёл менеджер, видно у ПК в списке.',
       '«Часы расходятся больше чем на 5 минут» — включите в Windows «Установить время автоматически» (Параметры → Время и язык).',
     ];
     const body = [
@@ -3284,19 +3551,50 @@
       h('summary', null, h('b', null, 'Как подключить ещё ПК и что делать, если нет связи')), body);
   }
 
-  function netNotes(m) {
-    // only for a member that is alive (its hellos arrive): then a failure in one direction is a setting, not an outage
-    if (m.self || m.left || !m.online) return [];
+  // full: with what to do (a PC's own page); otherwise the reason only (tables), the advice in its tooltip
+  function netNotes(m, full) {
+    if (m.self || m.left) return [];
     const out = [];
-    if (m.error && m.reaches === false) out.push(['Этот ПК не может связаться с ним. Скорее всего, там брандмауэр Windows не пускает Python или ПК не поделился с вами в Tailscale.', m.error]);
-    if (m.they_reach === false) out.push(['Он не может связаться с этим ПК. Разрешите Python в брандмауэре Windows (частные сети) и проверьте, что этот ПК виден ему в Tailscale.', null]);
-    return out.map(([t, why]) => h('div', { class: 'net-note', title: why }, t));
+    if (m.why) {  // what Tailscale and Windows on this PC say about the link (asked while it does not work)
+      out.push(full ? h('div', { class: 'net-note' }, h('b', null, `${m.why.title}. `), m.why.hint)
+        : h('div', { class: 'net-note', title: m.why.hint }, m.why.title));
+    }
+    // a member that is alive (its hellos arrive): a failure in one direction is a setting, not an outage
+    if (!m.online) return out;
+    if (m.error && m.reaches === false && !m.why) out.push(h('div', { class: 'net-note', title: m.error }, 'Этот ПК не может связаться с ним. Скорее всего, там брандмауэр Windows не пускает Python или ПК не поделился с вами в Tailscale.'));
+    if (m.they_reach === false) out.push(h('div', { class: 'net-note' }, 'Он не может связаться с этим ПК. Разрешите Python в брандмауэре Windows (частные сети) и проверьте, что этот ПК виден ему в Tailscale. Если на одном из ПК включён VPN, он может мешать Tailscale: исключите из него адреса 100.64.0.0/10.'));
+    return out;
+  }
+
+  // Tailscale's relay servers (DERP), by their codes
+  const DERP_NAMES = {
+    waw: 'Варшава', hel: 'Хельсинки', fra: 'Франкфурт', ams: 'Амстердам', nue: 'Нюрнберг', par: 'Париж', lhr: 'Лондон',
+    mad: 'Мадрид', nyc: 'Нью-Йорк', iad: 'Эшберн', tor: 'Торонто', dbi: 'Дубай', ord: 'Чикаго', dfw: 'Даллас',
+    sea: 'Сиэтл', sfo: 'Сан-Франциско', lax: 'Лос-Анджелес', mia: 'Майами', den: 'Денвер', hkg: 'Гонконг',
+    sin: 'Сингапур', tok: 'Токио', syd: 'Сидней', blr: 'Бангалор', sao: 'Сан-Паулу', jnb: 'Йоханнесбург',
+    nai: 'Найроби', hnl: 'Гонолулу',
+  };
+  // how many times longer the same commands run on that PC than here (from the tasks sent there)
+  function speedNote(m) {
+    const s = m.speed;
+    if (!s || m.self) return null;
+    const r = s.ratio;
+    const text = Math.abs(r - 1) < 0.1 ? 'те же команды идут там примерно так же быстро, как здесь'
+      : r > 1 ? `те же команды идут там в ${nf1.format(r)} раза дольше, чем здесь` : `те же команды идут там в ${nf1.format(1 / r)} раза быстрее, чем здесь`;
+    return h('div', { class: 'small ink2', title: 'По задачам, которые выполнялись и здесь, и там (одна и та же команда, числа в аргументах не в счёт). «--where auto» учитывает это: на более медленный ПК задача уходит, только если там она закончится раньше.' },
+      `Скорость: ${text} (по ${s.runs} ${plural(s.runs, 'запуску', 'запускам', 'запускам')})`);
   }
 
   function linkCell(m) {
     if (m.self) return h('span', { class: 'net-status self' }, h('i'), 'этот ПК');
     if (m.left) return h('span', { class: 'net-status' }, h('i'), `вышел из сети ${ago(m.left_at)}`);
-    if (m.online) return h('span', { class: 'net-status on' }, h('i'), `на связи${m.rtt_ms != null ? ` · ${m.rtt_ms} мс` : ''}`);
+    if (m.online) {
+      const p = m.path;
+      const how = !p ? '' : p.direct ? ' · напрямую' : p.relay ? ` · через ретранслятор (${DERP_NAMES[p.relay] || p.relay})` : '';
+      const tip = !p ? '' : p.direct ? 'Tailscale соединил ПК напрямую — так быстрее всего.'
+        : 'Tailscale не смог соединить ПК напрямую и пересылает данные через свой сервер-ретранслятор: связь работает, но медленнее. Так бывает из-за VPN или роутера. Менеджеру это не страшно — данных мало, а проект задачи уезжает чуть дольше.';
+      return h('span', { class: 'net-status on', title: tip }, h('i'), `на связи${m.rtt_ms != null ? ` · ${m.rtt_ms} мс` : ''}${how}`);
+    }
     return h('span', { class: 'net-status' }, h('i'), `не в сети${m.seen ? ` · был ${ago(m.seen)}` : ''}`);
   }
 
@@ -3593,7 +3891,7 @@
             if (confirm(`Сделать основным ПК «${m.name}»? Этот ПК станет обычным и больше не сможет управлять остальными.`)) netCall('/api/network/home/main', { node: m.node_id });
           } }, 'Сделать основным'));
         }
-        fill(this.head, pcHeadRow(m), netNotes(m),
+        fill(this.head, pcHeadRow(m), netNotes(m, true), speedNote(m),
           h('div', { class: 'small ink2' }, hwLine(info)),
           h('div', { class: 'small ink2' }, `Версия ${info.version || '?'}${(() => {
             const gap = versionGap(v);
@@ -3661,7 +3959,7 @@
     const sig = JSON.stringify([m.name, m.own, m.online, m.rtt_ms, m.reaches, m.they_reach, info.version, info.mode, info.busy, free, t, info.hosted]);
     if (head.dataset.sig !== sig) {
       head.dataset.sig = sig;
-      fill(head, pcHeadRow(m), netNotes(m),
+      fill(head, pcHeadRow(m), netNotes(m, true), speedNote(m),
         h('div', { class: 'small ink2' }, hwLine(info)),
         h('div', { class: 'small ink2' }, m.online || info.mode
           ? `${(MODE_INFO[info.mode] || ['?'])[0]} · свободно сейчас: CPU ${n1(free.cpu)}, ОЗУ ${n1(free.ram)} ГБ, VRAM ${n1(free.vram)} ГБ · задачи: ▶ ${t.running || 0} ◷ ${t.queued || 0} · версия ${info.version || '?'}`

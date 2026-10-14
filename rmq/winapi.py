@@ -323,6 +323,46 @@ def on_battery() -> tuple[bool, int | None]:
     return st.ACLineStatus == 0, pct
 
 
+# the "Power mode" slider of Windows (an overlay over the power plan); none set means the balanced middle
+POWER_MODES = {"961cc777-2547-4f9d-8174-7d86181b8a7a": "экономия энергии",
+               "3af9b8d9-7c97-431d-ad78-34a8bfea439f": "экономия энергии",
+               "00000000-0000-0000-0000-000000000000": "сбалансированный",
+               "381b4222-f694-41f0-9685-ff5bb260df2e": "сбалансированный",
+               "ded574b5-45a0-4f42-8737-46345c09c238": "максимальная производительность"}
+
+
+def power_mode(battery: bool) -> dict:
+    """{"mode": the Windows power mode for the current power source, "plan": the power plan's name}; what cannot
+    be read is left out. Laptop makers' own modes (a key like Fn+Q) are not visible here."""
+    out: dict = {}
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes") as k:
+            try:
+                overlay = str(winreg.QueryValueEx(k, "ActiveOverlayDcPowerScheme" if battery
+                                                  else "ActiveOverlayAcPowerScheme")[0] or "").lower()
+            except OSError:
+                overlay = ""
+        out["mode"] = POWER_MODES.get(overlay or "00000000-0000-0000-0000-000000000000", "свой")
+    except OSError:
+        pass
+    try:
+        pp = ctypes.WinDLL("powrprof.dll")
+        scheme = ctypes.c_void_p()
+        if pp.PowerGetActiveScheme(None, ctypes.byref(scheme)) == 0 and scheme.value:
+            try:
+                size = wt.DWORD(0)
+                pp.PowerReadFriendlyName(None, scheme, None, None, None, ctypes.byref(size))
+                buf = ctypes.create_string_buffer(size.value or 2)
+                if pp.PowerReadFriendlyName(None, scheme, None, None, buf, ctypes.byref(size)) == 0:
+                    out["plan"] = buf.raw.decode("utf-16-le", errors="replace").rstrip("\0")
+            finally:
+                ctypes.windll.kernel32.LocalFree(scheme)
+    except (OSError, AttributeError):
+        pass
+    return out
+
+
 def unbiased_seconds() -> float:
     """Time since boot that does not advance while the PC sleeps or hibernates."""
     v = ctypes.c_ulonglong(0)

@@ -223,6 +223,12 @@ def order_checks(a: Instance, b: Instance, project: Path) -> None:
                                      "series": "e2e", "cwd": str(project)})["id"]
     ok = wait_for(lambda: task(a, s1)["state"] == "running" and task(a, s2)["wait"] == "series", 20)
     check(ok, "серия: вторая задача ждёт первую", task(a, s2).get("wait_text", ""))
+    fc = wait_for(lambda: task(a, s2).get("forecast") and task(a, s1).get("forecast"), 25)
+    f1, f2 = task(a, s1).get("forecast") or {}, task(a, s2).get("forecast") or {}
+    check(fc and abs(f2.get("start", 0) - f1.get("end", -99)) < 20 and f2["end"] - f2["start"] > 800,
+          "прогноз: вторая задача серии стартует, когда кончится первая", f"{f1} {f2}")
+    r = a.cli("status", str(s2))
+    check(r.returncode == 0 and "прогноз: старт ~" in r.stdout, "rmq status показывает прогноз", r.stdout[-300:])
     a.ok("POST", f"/api/tasks/{s1}/cancel", {})
     check(wait_for(lambda: task(a, s2)["state"] == "running", 20), "серия: после первой запускается вторая")
     a.ok("POST", f"/api/tasks/{s2}/cancel", {})
@@ -327,8 +333,10 @@ def dashboard_checks(a: Instance, base: Path) -> None:
         if name == "stats":
             check('id="stats-pc"' in dom and "Все мои ПК" in dom, "в статистике выбор ПК")
         if name == "thermal" and power:
-            tag = re.search(r'<section[^>]*aria-label="Мощность процессора, Вт"[^>]*>', dom)
+            tag = re.search(r'<section[^>]*aria-label="Мощность, Вт"[^>]*>', dom)
             check(bool(tag) and "hidden" not in tag.group(0), "на вкладке «Температура» мощность процессора")
+            tag = re.search(r'<section[^>]*aria-label="Мощность и температура процессора"[^>]*>', dom)
+            check(bool(tag) and "hidden" not in tag.group(0), "на вкладке «Температура» график «мощность → температура»")
     print(f"  снимки страниц: {shots}")
 
 

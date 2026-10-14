@@ -479,9 +479,18 @@ def cmd_nodes(args) -> int:
         hw, free, busy = n.get("hw") or {}, n.get("free") or {}, n.get("busy") or {}
         head = f"{n['name']}{' (этот ПК)' if n['self'] else ' (мой ПК)' if n.get('own') else ''}"
         if not n["online"]:
-            print(f"{head}: не в сети")
+            print(f"{head}: не в сети" + (f" — {n['why']}" if n.get("why") else ""))
             continue
         state = "принимает задачи" if n["accepting"] else ("только для себя" if n.get("mode") == "one_way" else "закрыт")
+        p, sp = n.get("path") or {}, n.get("speed")
+        if p.get("direct"):
+            state += ", связь напрямую"
+        elif p.get("relay"):
+            state += f", связь через ретранслятор Tailscale ({p['relay']})"
+        if sp:
+            r = sp["ratio"]
+            state += (f", те же команды идут там в {r:.1f} раза дольше, чем здесь" if r >= 1.1 else
+                      f", те же команды идут там в {1 / r:.1f} раза быстрее" if r <= 0.9 else ", по скорости как этот ПК")
         flags = ", ".join(x for x, on in (("игра", busy.get("game")), ("пауза", busy.get("paused")),
                                           ("перегрев", busy.get("heat") == "hot"), ("мало места", busy.get("disk_low")))
                           if on)
@@ -580,9 +589,16 @@ def cmd_status(args) -> int:
     print(f"  время работы: {fmt_dur(t['run_s'])}" + (" (дольше заявленного)" if t.get("overtime") else "")
           + (f", из них {fmt_dur(held)} с урезанным процессором (в сверхурочные не идёт)" if held >= 60 else "")
           + (f", перезапусков: {t['restarts']}" if t.get("restarts") else ""))
+    fc = t.get("forecast")
+    if fc and t["state"] not in FINAL:
+        print(f"  прогноз: {forecast_text(t)} ({FORECAST_BASIS.get(fc.get('basis'), '')}; примерный — считает, что "
+              f"владелец пользуется ПК как сейчас)")
     cond = t.get("conditions") or (t.get("remote") or {}).get("conditions")
     if cond:
         print(f"  условия счёта: {conditions_text(cond)}")
+        if cond.get("energy_wh") is not None:
+            print(f"  энергия: ~{energy_text(cond['energy_wh'])} (оценка: доля мощности процессора и видеокарты по "
+                  f"занятому времени)")
     if getattr(args, "events", False):
         print("  события:")
         for e in reversed(t.get("events") or []):
@@ -590,6 +606,31 @@ def cmd_status(args) -> int:
     if t["state"] in FINAL:
         print(f"  итог: {summary(t)}")
     return 0
+
+
+FORECAST_BASIS = {"прошлые запуски": "по прошлым запускам этой команды", "заявка": "по заявленному времени",
+                  "прогресс": "по прогрессу задачи"}
+
+
+def eta_at(ts: float) -> str:
+    """"15:40", with the date when it is not today."""
+    same_day = time.strftime("%Y%m%d", time.localtime(ts)) == time.strftime("%Y%m%d")
+    return time.strftime("%H:%M" if same_day else "%d.%m %H:%M", time.localtime(ts))
+
+
+def forecast_text(t: dict) -> str:
+    f = t.get("forecast")
+    if not f:
+        return ""
+    if t["state"] == "running":
+        return f"закончится ~{eta_at(f['end'])}"
+    if f["start"] - time.time() < 60:
+        return f"стартует сейчас, закончится ~{eta_at(f['end'])}"
+    return f"старт ~{eta_at(f['start'])}, конец ~{eta_at(f['end'])}"
+
+
+def energy_text(wh: float) -> str:
+    return f"{wh / 1000:.2f} кВт·ч" if wh >= 1000 else f"{wh:.1f} Вт·ч"
 
 
 def cpu_text(power, clock_p, clock_e) -> str:
@@ -716,7 +757,8 @@ def cmd_queue(args) -> int:
                  + (f" · {pr['pct']:g}%" if pr else "")
                  + (" · сохраняется перед остановкой" if t.get("stopping") else "")
                  + (f" · {swing_text(t['swing'])}" if t.get("swing") else "")
-                 if t["state"] == "running" else describe_wait(t))
+                 + (f" · {forecast_text(t)}" if t.get("forecast") else "")
+                 if t["state"] == "running" else describe_wait(t) + (f" · {forecast_text(t)}" if t.get("forecast") else ""))
         print(f"#{t['id']:<5} {t['state_text']:<12} {t['agent'][:24]:<24} {t['name'][:28]:<28} {extra}")
     return 0
 
@@ -835,6 +877,11 @@ def cmd_stats(args) -> int:
             temps.append(f"{name} до {t[f'{c}_max_c']:.0f}°C" + (f" (при расчётах в среднем {load:.0f}°C)" if load else ""))
     if temps:
         print("температура: " + "; ".join(temps))
+    if t.get("tasks_energy_wh") or t.get("cpu_energy_wh"):
+        tariff = r.get("tariff")
+        rub = lambda wh: f" ≈ {wh / 1000 * tariff:.2f} ₽" if tariff else ""
+        print(f"энергия (оценка): задачи {energy_text(t.get('tasks_energy_wh') or 0)}{rub(t.get('tasks_energy_wh') or 0)}; "
+              f"весь процессор {energy_text(t.get('cpu_energy_wh') or 0)}, видеокарта {energy_text(t.get('gpu_energy_wh') or 0)}")
     if t.get("cpu_power_max_w") is not None:
         cpu = cpu_text(t.get("cpu_power_load_avg_w"), t.get("clock_p_load_ghz"), t.get("clock_e_load_ghz"))
         print(f"процессор: мощность до {t['cpu_power_max_w']:.0f} Вт" + (f"; во время расчётов в среднем {cpu}" if cpu else ""))
@@ -893,8 +940,15 @@ def cmd_top(args) -> int:
     th = st.get("thermal") or {}
     temps = [f"{r['label']} {r['temp']:.0f}°C" for r in th.get("readings") or [] if r.get("temp") is not None]
     cpu = cpu_text(th.get("cpu_power"), th.get("clock_p"), th.get("clock_e"))
+    gpu = ", ".join(x for x in (f"{th['gpu_power']:.0f} Вт" if th.get("gpu_power") is not None else "",
+                                f"{th['gpu_clock']:.2f} ГГц" if th.get("gpu_clock") is not None else "") if x)
     if temps or cpu:
-        print("датчики: " + ", ".join(temps) + (f"; процессор: {cpu}" if cpu else ""))
+        print("датчики: " + ", ".join(temps) + (f"; процессор: {cpu}" if cpu else "") + (f"; видеокарта: {gpu}" if gpu else ""))
+    pw = st.get("power") or {}
+    if pw.get("mode") or pw.get("plan"):
+        print(f"питание: {'от батареи' if pw.get('on_battery') else 'от сети'}"
+              + (f", режим Windows «{pw['mode']}»" if pw.get("mode") else "")
+              + (f", схема «{pw['plan']}»" if pw.get("plan") else ""))
     if th.get("enabled") and th.get("state") == "hot":
         print(f"ТЕМПЕРАТУРА: перегрев — {th['trigger']}; все задачи заморожены до остывания")
     elif th.get("enabled") and th.get("factor", 1) < 0.995:

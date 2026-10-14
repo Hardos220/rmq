@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from . import __version__, firewall
+from . import __version__, firewall, linkcheck
 from .netbase import (KINDS, MODES, PROTOCOL, NetError, NetStore, NonceCache, body_hash, collect_files, file_sha256,
                       make_invite, make_zip, member_record, parse_invite, safe_extract, sign_headers,
                       tailscale_address, verify)
@@ -62,6 +62,7 @@ HOME_HELLO_EVERY_S = 10  # one's own PCs: their running tasks show on each other
 SYNC_EVERY_S = 3
 ONLINE_S = 95          # a member is "in the network" if it answered within this time
 REACH_S = 150          # "this PC gets through to that one" if one of its own requests got there within this time
+LINKCHECK_EVERY_S = 60  # while some PC cannot be reached: ask Tailscale and Windows why
 MAX_JSON = 1 << 20
 # how the main PC lets one of its PCs into the network with other people ("hidden": not there at all)
 EXT_STATES = {"open": "two_way", "use": "one_way"}
@@ -113,6 +114,11 @@ class NetService:
         self._last_sync = 0.0
         self.firewall: dict = {"state": "unknown"}  # can other PCs get through Windows Firewall to the listener
         self._fw_at = 0.0
+        self.links: dict[str, dict] = {}      # node id -> why this PC does not get through to it (linkcheck)
+        self.vpn: list[str] = []              # VPNs on this PC, as the last such check found them
+        self._link_at = time.time() - LINKCHECK_EVERY_S + 30  # the first check once the hellos had their chance
+        self.paths: dict[str, dict] = {}      # Tailscale IP -> how Tailscale connects to it (linkcheck.paths_from)
+        self._paths_at = 0.0
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -165,6 +171,58 @@ class NetService:
         if self.server and now - self._fw_at >= 300:
             self._fw_at = now
             self.pool.submit(self.check_firewall)
+        if self.server and now - self._link_at >= LINKCHECK_EVERY_S:
+            self._link_at = now
+            bad = self._unreachable()
+            if bad:
+                self.pool.submit(self._check_links, bad)
+            else:
+                self.links = {}
+        if self.server and now - self._paths_at >= LINKCHECK_EVERY_S and (st.active_members("home")
+                                                                          or st.active_members("ext")):
+            self._paths_at = now
+            self.pool.submit(self._read_paths)
+
+    def _read_paths(self) -> None:
+        """Directly or through a relay: how Tailscale connects this PC to the others (for the "Сеть" tab)."""
+        try:
+            self.paths = linkcheck.paths_from(linkcheck.tailscale_status())
+        except Exception:
+            log.exception("reading Tailscale's paths failed")
+
+    # ------------------------------------------------------------ why a PC cannot be reached
+    def _unreachable(self) -> dict[str, str]:
+        """{node id: its Tailscale IP} of the members this PC tries and fails to get through to."""
+        out = {}
+        for kind in KINDS:
+            if not self.store.net(kind):
+                continue
+            for nid, rec in self.store.active_members(kind).items():
+                ip = (rec.get("address") or "").rsplit(":", 1)[0]
+                if ip and self.reaches(nid) is False:
+                    out[nid] = ip
+        return out
+
+    def _check_links(self, bad: dict[str, str]) -> None:
+        try:
+            found, vpn = linkcheck.check(sorted(set(bad.values())))
+        except Exception:
+            log.exception("link check failed")
+            return
+        links = {nid: found[ip] for nid, ip in bad.items() if ip in found}
+        for nid, d in links.items():
+            if (self.links.get(nid) or {}).get("code") != d["code"]:
+                log.info("no link to %s: %s", self.node_name(nid), d["title"])
+        self.links, self.vpn = links, vpn
+
+    def _speed(self, nid: str) -> dict | None:
+        """How many times longer the same commands run on that PC than here, from tasks sent there."""
+        s = getattr(self.m, "speeds", {}).get(nid)
+        return {"ratio": round(s[0], 2), "runs": s[1]} if s else None
+
+    def why(self, nid: str) -> dict | None:
+        """Why this PC does not get through to that one, while it does not (see linkcheck.diagnose)."""
+        return self.links.get(nid) if self.reaches(nid) is False else None
 
     # ------------------------------------------------------------ the listener
     def bind_ip(self, cfg: dict) -> str | None:
@@ -768,7 +826,9 @@ class NetService:
                      "left": bool(rec.get("left_at")), "left_at": rec.get("left_at"),
                      "online": not rec.get("left_at") and time.time() - lv.get("seen", 0) <= ONLINE_S,
                      "seen": lv.get("seen"), "rtt_ms": lv.get("rtt_ms"), "error": lv.get("error"),
-                     "reaches": self.reaches(nid), "they_reach": lv.get("they_reach"),
+                     "reaches": self.reaches(nid), "they_reach": lv.get("they_reach"), "why": self.why(nid),
+                     "speed": self._speed(nid),
+                     "path": self.paths.get((rec.get("address") or "").rsplit(":", 1)[0]),
                      "info": (lv.get("info_by") or {}).get(kind) or lv.get("info"), "joined_at": rec.get("joined_at")}
             if kind == "home":
                 d["main"] = nid == main
@@ -785,7 +845,7 @@ class NetService:
         main = (home or {}).get("main")
         return {"node_id": st.node_id, "node_name": st.node_name, "mode": st.mode, "status": self.status,
                 "error": self.error, "address": self.address, "tailscale": tailscale_address(),
-                "firewall": self.firewall if self.server else None,
+                "firewall": self.firewall if self.server else None, "vpn": self.vpn,
                 "home": {"id": home["id"], "name": home["name"], "main": main, "is_main": st.is_main,
                          "main_name": (st.node_name if main == st.node_id else self.node_name(main)) if main else None,
                          "main_left": bool(main and main != st.node_id
@@ -805,8 +865,9 @@ class NetService:
             out += [(nid, "ext") for nid in st.active_members("ext") if nid not in mine]
         return out
 
-    def best_node(self, need: dict) -> str | None:
-        """The online PC that can start this task right now: one's own PCs first, then the most CPU to spare."""
+    def best_node(self, need: dict, slower: dict[str, float] | None = None) -> str | None:
+        """The online PC that can start this task right now: one's own PCs first, then the one where it runs
+        fastest - the CPU it can get, over how many times longer the same commands run there (`slower`)."""
         best, best_key = None, None
         with self._lock:
             live = {k: dict(v) for k, v in self.live.items()}
@@ -826,7 +887,7 @@ class NetService:
             cpu = free.get("cpu", 0)
             if cpu < min(need["cpu"], 1.0):
                 continue
-            key = (kind == "home", cpu)
+            key = (kind == "home", min(cpu, max(need["cpu"], 1.0)) / max(0.05, (slower or {}).get(nid, 1.0)), cpu)
             if best_key is None or key > best_key:
                 best, best_key = nid, key
         return best

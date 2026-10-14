@@ -131,6 +131,7 @@ code, .mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; f
 .chip.net-part .dot { background: var(--warning); }
 .chip.net-off .dot { background: var(--muted); }
 .tiles.tiles-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 12px; }
+.tiles.tiles-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .charts.charts-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .thermal-status { display: flex; gap: 12px; align-items: flex-start; }
 .thermal-status .icon { font-size: 18px; line-height: 1.2; font-weight: 700; }
@@ -240,6 +241,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 16px 24px 60px; }
 .chart.wide { grid-column: 1 / -1; }
 .chart.wide .plot { height: 150px; }
 .chart.taskchart .plot { height: 230px; }
+.chart.scatter .plot { height: 300px; }
 .foot { margin: 28px 0 8px; text-align: center; }
 .foot a { color: inherit; }
 .chart.taskchart .table-view { max-height: 230px; }
@@ -449,7 +451,7 @@ pre.snippet {
 @media (max-width: 1100px) {
   .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .charts.charts-3 { grid-template-columns: minmax(0, 1fr); }
-  .tiles.tiles-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tiles.tiles-3, .tiles.tiles-5 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 860px) {
   .charts { grid-template-columns: minmax(0, 1fr); }
@@ -457,7 +459,7 @@ pre.snippet {
   main { padding: 12px 16px 48px; }
 }
 @media (max-width: 560px) {
-  .tiles, .tiles.tiles-3 { grid-template-columns: minmax(0, 1fr); }
+  .tiles, .tiles.tiles-3, .tiles.tiles-5 { grid-template-columns: minmax(0, 1fr); }
   .seg button { padding: 5px 9px; }
   .kv { grid-template-columns: 1fr; }
 }

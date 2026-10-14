@@ -23,7 +23,7 @@ from pathlib import Path
 
 import psutil
 
-from . import __version__, chronicle, planner, progress, swing, texts, thermal, winapi
+from . import __version__, chronicle, forecast, planner, progress, swing, texts, thermal, winapi
 from .db import DB, FINAL_STATES
 from .games import GameDetector
 from .jobs import GB, TaskRuntime, Usage
@@ -273,6 +273,24 @@ class Manager:
         if self.metrics.long_missing(time.time()):  # the month's charts: what is not in the cache, from data/stats
             self.metrics.seed_long(self.stats.minutes_since(time.time() - self.metrics.long_s), time.time())
         self._metrics_saved = time.time()
+        # the range the CPU and the GPU work in (power, clocks), for the charts' fixed scale: the history's, then
+        # widened by what LibreHardwareMonitor and the GPU's driver report
+        self._ranges: dict[str, list[float]] = {}
+        for key, cols in (("power", ("cpu_power",)), ("clock", ("clock_p", "clock_e")), ("gpu_power", ("gpu_power",)),
+                          ("gpu_clock", ("gpu_clock",))):
+            ext = self.metrics.extent(cols)
+            if ext:
+                self._ranges[key] = list(ext)
+        self._power_mode: dict = {}           # the Windows power mode and plan (winapi.power_mode)
+        self._power_mode_at = 0.0
+        self._task_watts: dict[int, float] = {}  # the CPU's and GPU's power that falls on each task now (estimate)
+        # the queue played forward (forecast.py): {task: {"start", "end", "basis"}}, and what it learns from
+        self._forecast: dict[int, dict] = {}
+        self._forecast_at = 0.0
+        self._forecast_in: tuple | None = None  # (now, pools, jobs, agents' limits) of the last forecast
+        self._runs_here: dict[tuple[int, str], list[float]] = {}  # (agent, command key) -> run times here
+        self.speeds: dict[str, tuple[float, int]] = {}  # one's other PCs: (how many times longer there, runs)
+        self._hist_at = 0.0
         # the compute network: tasks other PCs run here live under LocalLow (they may write nowhere else)
         self.netstore = NetStore(home / "network.json")
         self.net_root = Path(winapi.local_low()) / "RMQ" / self.instance
@@ -573,6 +591,13 @@ class Manager:
                 vram_deficit=max(0.0, vram_deficit), commit_total=commit_total, commit_limit=commit_limit,
                 commit_excess=max(0.0, commit_excess), last_shed_at=self.last_shed_at))
             self.plan = plan
+            if now - self._forecast_at >= self.FORECAST_EVERY_S:
+                self._forecast_at = now
+                try:
+                    self._forecast = self._make_forecast(now, rows, views, plan, (pool_cpu, pool_ram, pool_vram),
+                                                         agents)
+                except Exception:
+                    log.exception("forecast failed")
 
             held = dict.fromkeys(planner.RESOURCES, 0.0)
             for v in views.values():
@@ -610,6 +635,16 @@ class Manager:
                         rt.set_cpu_cap(plan.cpu_caps[tid], N)
                 except OSError:
                     log.exception("cannot apply limits to task #%d", tid)
+
+            self._task_watts = self._watts_of(usage, task_gpu, cpu_user, tasks_cpu, gpu_user, gpu_tasks)
+            if now - self._power_mode_at >= 30:
+                self._power_mode_at = now
+                pm = winapi.power_mode(bool(battery))
+                old = self._power_mode
+                if old.get("mode") and pm.get("mode") and (old.get("mode"), old.get("plan")) != (pm.get("mode"), pm.get("plan")):
+                    self.db.event("power", f"Режим питания Windows: {old['mode']} → {pm['mode']}"
+                                  + (f" (схема «{pm['plan']}»)" if pm.get("plan") else ""))
+                self._power_mode = pm
 
             # 8. fair-share accounting
             if dt > 0:
@@ -652,6 +687,7 @@ class Manager:
                         c["shared_s"] += dt
                         c["max_neighbours"] = max(c["max_neighbours"], n_running - 1)
                     c["owner_core_s"] += cpu_user * dt
+                    c["energy_j"] += self._task_watts.get(tid, 0.0) * dt
                     for k, x in self.lhm.extra.items():  # the CPU's power and clocks meanwhile
                         acc = c["sense"].setdefault(k, [0.0, 0.0])
                         acc[0] += x * dt
@@ -689,7 +725,8 @@ class Manager:
                 "heat": {"normal": 0.0, "warm": 1.0, "hot": 2.0}[heat],
                 "cpu_factor": factor * 100,
                 "cpu_power": self.lhm.extra.get("power"), "clock_p": self.lhm.extra.get("clock_p"),
-                "clock_e": self.lhm.extra.get("clock_e"),
+                "clock_e": self.lhm.extra.get("clock_e"), "gpu_power": self.nv.extra.get("power"),
+                "gpu_clock": self.nv.extra.get("clock"),
                 "tasks": {tid: (u.cpu / N * 100, u.ws / GB, task_vram.get(tid, 0.0), task_gpu.get(tid, 0.0))
                           for tid, u in usage.items()},
             }
@@ -705,7 +742,8 @@ class Manager:
                          "forced": self.mode == "game", "reserve_ram": extra_ram, "reserve_vram": extra_vram,
                          "learned": bool(learned and learned["ram"] > 0.3)},
                 "gpu_busy": gpu_busy,
-                "power": {"keep_awake": self.keep_awake.active, "on_battery": battery, "battery_pct": battery_pct},
+                "power": {"keep_awake": self.keep_awake.active, "on_battery": battery, "battery_pct": battery_pct,
+                          **self._power_mode, "tariff": self.settings.section("power").get("tariff_rub_kwh")},
                 "thermal": {"enabled": tc["enabled"], "regulate": tc["regulate"], "state": heat,
                             "trigger": self.guard.trigger, "cool_left": self.guard.cool_left,
                             "cool_confirm_s": tc["cool_confirm_s"], "factor": factor,
@@ -713,7 +751,9 @@ class Manager:
                             "limiting": {"label": lim.label, "temp": lim.temp, "target": lim.target} if lim else None,
                             "cpu_source": self.lhm.status, "readings": [vars(r) for r in readings],
                             "cpu_power": self.lhm.extra.get("power"), "clock_p": self.lhm.extra.get("clock_p"),
-                            "clock_e": self.lhm.extra.get("clock_e")},
+                            "clock_e": self.lhm.extra.get("clock_e"), "gpu_power": self.nv.extra.get("power"),
+                            "gpu_clock": self.nv.extra.get("clock"),
+                            "ranges": {k: [round(v[0], 2), round(v[1], 2)] for k, v in self._ranges.items()}},
                 "disk": {"enabled": S["disk"]["enabled"], "min_free_gb": S["disk"]["min_free_gb"],
                          "drives": self._disk_info, "held": len(disk_hold)},
                 "network": self.net_summary(),
@@ -766,7 +806,118 @@ class Manager:
         if now - when >= 2.0:
             c_temp = self.lhm.read()
             self._cpu_read = (now, c_temp)
+        self._widen_ranges()
         return thermal.readings_from(tc, cpu, (g_temp, g_thr, self.nv.present), (s_temp, s_warn), c_temp)
+
+    def _widen_ranges(self) -> None:
+        """The range the CPU and the GPU work in, for the charts' fixed scale: it only ever widens."""
+        x, g = self.lhm.extra, self.nv.extra
+        seen = {k: list(v) for k, v in self.lhm.ranges.items()}
+        for key, vals in (("power", [x.get("power")]), ("clock", [x.get("clock_p"), x.get("clock_e")]),
+                          ("gpu_power", [g.get("power")]), ("gpu_clock", [g.get("clock")])):
+            vals = [v for v in vals if v is not None] + (seen.get(key) or [])
+            if vals:
+                seen[key] = [min(vals), max(vals)]
+        for key, (lo, hi) in seen.items():
+            cur = self._ranges.get(key)
+            self._ranges[key] = [min(lo, cur[0]), max(hi, cur[1])] if cur else [lo, hi]
+        for key, top in (("gpu_power", self.nv.power_limit), ("gpu_clock", self.nv.max_clock)):
+            if top and key in self._ranges:  # the card's own ceiling, once it has been seen awake at all
+                self._ranges[key][1] = max(self._ranges[key][1], top)
+
+    # ---------------------------------------------------------------- the forecast of the queue
+    FORECAST_EVERY_S = 15
+
+    def _learn_runs(self, now: float) -> None:
+        """Earlier successful runs of each agent's commands (numbers aside) here, and how much longer the same
+        commands run on one's other PCs; refreshed every 10 minutes and whenever a task ends."""
+        if now - self._hist_at < 600:
+            return
+        self._hist_at = now
+        here: dict[tuple[int, str], list[float]] = {}
+        mine: dict[str, list[float]] = {}
+        there: dict[str, dict[str, list[float]]] = {}
+        for r in self.db.tasks_recent(5000):
+            if r["state"] != "done" or (r["run_s"] or 0) < 30:
+                continue
+            key = command_key(command_text(r))
+            if r["remote_node"]:
+                there.setdefault(r["remote_node"], {}).setdefault(key, []).append(r["run_s"])
+            else:
+                here.setdefault((r["agent_id"], key), []).append(r["run_s"])
+                mine.setdefault(key, []).append(r["run_s"])
+        self._runs_here = here
+        self.speeds = {nid: s for nid, runs in there.items() if (s := forecast.speed_ratio(mine, runs))}
+
+    def expected_s(self, agent_id: int, command: str, declared: float) -> tuple[float, str]:
+        """How long a task will run here: as its earlier runs did, else as declared."""
+        med = forecast.median(self._runs_here.get((agent_id, command_key(command))) or [])
+        return (med, "прошлые запуски") if med else (float(declared), "заявка")
+
+    def _left_s(self, row: dict, now: float) -> tuple[float, str]:
+        """How long a started task has yet to run: by its progress if it reports one, else by its earlier runs or
+        its request; a task past that is given a little more."""
+        run_s = self.run_time(row, now)
+        prog = self._progress(row["id"], run_s)
+        if prog and prog.get("pct", 0) >= 3 and (prog.get("eta_pace_s") or prog.get("eta_s")) is not None:
+            return float(prog.get("eta_pace_s") or prog["eta_s"]), "прогресс"
+        full, basis = self.expected_s(row["agent_id"], command_text(row), row["time_s"])
+        left = full - run_s
+        return (left, basis) if left >= 60 else (max(60.0, 0.15 * run_s), basis)
+
+    def _make_forecast(self, now: float, rows: dict, views: dict, plan, pools: tuple, agents: dict) -> dict:
+        if self.mode == "paused":
+            self._forecast_in = None
+            return {}
+        self._learn_runs(now)
+        jobs, basis = [], {}
+        for tid, row in rows.items():
+            v = views.get(tid)
+            if v is not None and row["state"] == "running":
+                left, basis[tid] = self._left_s(row, now)
+                res = planner.reserved(v)
+                jobs.append(forecast.Job(tid, row["agent_id"], res["cpu"], res["ram"], res["vram"], left, True,
+                                         row.get("series"), row.get("after_id")))
+        waiting = sorted((tid for tid in rows if tid in views and rows[tid]["state"] != "running"
+                          and plan.waiting.get(tid) and plan.waiting[tid].position),
+                         key=lambda t: plan.waiting[t].position)
+        for tid in waiting:
+            row = rows[tid]
+            if row["started_at"]:
+                left, basis[tid] = self._left_s(row, now)
+            else:
+                left, basis[tid] = self.expected_s(row["agent_id"], command_text(row), row["time_s"])
+            need = planner.need_of(views[tid])
+            jobs.append(forecast.Job(tid, row["agent_id"], need["cpu"], need["ram"], need["vram"], left, False,
+                                     row.get("series"), row.get("after_id")))
+        limits = {aid: a.max_running for aid, a in agents.items()}
+        self._forecast_in = (now, pools, jobs, limits)
+        sim = forecast.simulate(now, *pools, jobs, limits)
+        return {tid: {"start": round(s), "end": round(e), "basis": basis[tid]} for tid, (s, e) in sim.items()}
+
+    def _start_here(self, need: dict) -> float | None:
+        """When a new task with this need could start here, behind the queue as it is (the last forecast's view)."""
+        if not self._forecast_in:
+            return None
+        now, pools, jobs, limits = self._forecast_in
+        probe = forecast.Job(-1, need.get("agent", -1), need["cpu"], need["ram"], need["vram"], need.get("time_s", 3600))
+        got = forecast.simulate(now, *pools, jobs + [probe], limits).get(-1)
+        return got[0] if got else None
+
+    def _watts_of(self, usage: dict, task_gpu: dict, cpu_user: float, tasks_cpu: float, gpu_user: float,
+                  gpu_tasks: float) -> dict[int, float]:
+        """The CPU's and the GPU's power that falls on each task: split by the share of the processor time and of
+        the GPU's load it takes. An estimate: the idle draw is split too, and power that is not measured (no
+        LibreHardwareMonitor, a sleeping or absent GPU) counts as none."""
+        pc, pg = self.lhm.extra.get("power"), self.nv.extra.get("power")
+        busy, gbusy = cpu_user + tasks_cpu, gpu_user + gpu_tasks
+        out = {}
+        for tid, u in usage.items():
+            w = pc * u.cpu / busy if pc is not None and busy > 0.05 else 0.0
+            if pg is not None and gbusy > 0.5:
+                w += pg * task_gpu.get(tid, 0.0) / gbusy
+            out[tid] = w
+        return out
 
     def _regulating(self, now: float, factor: float) -> bool:
         """Whether the regulator noticeably holds the tasks back (released after a minute at full CPU)."""
@@ -917,7 +1068,9 @@ class Manager:
             io_r += dr
             io_w += dw
             g = per_agent.setdefault(self._agent_name(rows[tid]["agent_id"]),
-                                     {"tasks": 0, "cpu": 0.0, "gpu": 0.0, "ram": 0.0, "io_read": 0, "io_write": 0})
+                                     {"tasks": 0, "cpu": 0.0, "gpu": 0.0, "ram": 0.0, "io_read": 0, "io_write": 0,
+                                      "power": 0.0})
+            g["power"] += self._task_watts.get(tid, 0.0)
             g["tasks"] += rows[tid]["state"] == "running"
             g["cpu"] += u.cpu
             g["gpu"] += task_gpu.get(tid, 0.0)
@@ -932,6 +1085,7 @@ class Manager:
             "regulating": heat == "warm", "heat_frozen": heat == "hot", "disk_frozen": bool(disk_hold),
             "disk_free": next((d["free"] for d in self._disk_info if d["system"]), None),
             "game": game, "paused": self.mode == "paused", "battery": battery,
+            "tasks_power": sum(self._task_watts.get(tid, 0.0) for tid in usage),
             "agents": per_agent, "metrics": mvals})
 
     def get_chronicle(self, days: float) -> dict:
@@ -1006,7 +1160,9 @@ class Manager:
                             "main": bool(mbr.get("main")), "online": mbr["online"],
                             "mode": info.get("mode"), "accepting": bool(info.get("accepting")) and mbr["online"],
                             "hw": info.get("hw"), "free": info.get("free"), "busy": info.get("busy"),
-                            "tasks": info.get("tasks"), "version": info.get("version"), "seen": mbr.get("seen")})
+                            "tasks": info.get("tasks"), "version": info.get("version"), "seen": mbr.get("seen"),
+                            "why": (mbr.get("why") or {}).get("title"), "speed": mbr.get("speed"),
+                            "path": mbr.get("path")})
         return out
 
     def _fits_here(self, need: dict) -> bool:
@@ -1039,7 +1195,15 @@ class Manager:
                 return None
             raise ApiError(409, "сеть выключена или этот ПК не в сети: задачу можно поставить только сюда")
         if where.lower() == "auto":
-            return None if self._fits_here(need) else self.net.best_node(need)
+            if self._fits_here(need):
+                return None
+            nid = self.net.best_node(need, {k: v[0] for k, v in self.speeds.items()})
+            if nid and need.get("time_s"):  # a much slower PC only if the task would still end there sooner
+                ratio = self.speeds.get(nid, (1.0, 0))[0]
+                start = self._start_here(need)
+                if start is not None and start - time.time() + need["time_s"] <= need["time_s"] * ratio:
+                    return None
+            return nid
         if where.lower() == st.node_name.lower() or where == st.node_id:
             return None
         nid = self._node_by_name(where)
@@ -1495,6 +1659,7 @@ class Manager:
         tc = self.settings.section("thermal")
         out["targets"] = {c: tc[f"{c}_target_c"] for c in ("cpu", "board", "gpu", "ssd")}
         out["hot"] = {c: tc[f"{c}_hot_c"] for c in ("cpu", "board", "gpu", "ssd")}
+        out["tariff"] = self.settings.section("power").get("tariff_rub_kwh")
         return out
 
     def _account_sleep(self, now: float) -> None:
@@ -1564,6 +1729,7 @@ class Manager:
         for k in self.COND_KEYS:
             c[k] = float(c.get(k) or 0.0)
         c["max_neighbours"] = int(c.get("max_neighbours") or 0)
+        c["energy_j"] = float(c.get("energy_j") or 0.0)  # the CPU's and GPU's energy that fell on it (_watts_of)
         sense = c.get("sense")  # {"power" | "clock_p" | "clock_e": [value x seconds, seconds measured]}
         c["sense"] = ({k: [float(v[0]), float(v[1])] for k, v in sense.items() if isinstance(v, list) and len(v) == 2}
                       if isinstance(sense, dict) else {})
@@ -1575,7 +1741,8 @@ class Manager:
         they were not measured."""
         s = c.get("sense") or {}
         avg = lambda k, d: round(s[k][0] / s[k][1], d) if k in s and s[k][1] > 0 else None
-        return {"cpu_power_w": avg("power", 1), "clock_p_ghz": avg("clock_p", 2), "clock_e_ghz": avg("clock_e", 2)}
+        return {"cpu_power_w": avg("power", 1), "clock_p_ghz": avg("clock_p", 2), "clock_e_ghz": avg("clock_e", 2),
+                "energy_wh": round(c["energy_j"] / 3600, 2) if c.get("energy_j") else None}
 
     def conditions(self, row: dict, now: float | None = None) -> dict:
         """What the task ran under since it first started: the time it was frozen, the PC slept, it got less CPU
@@ -1928,6 +2095,7 @@ class Manager:
         final = self.db.task(tid)
         if final:
             self.stats.task_finished([self._task_record(final)])
+        self._hist_at = 0.0  # its run time is something to learn from
 
     def _task_record(self, r: dict) -> dict:
         """The line of tasks.csv for a finished task."""
@@ -2133,7 +2301,8 @@ class Manager:
                 raise ApiError(400, f"after: задача #{after_id} уже завершилась без успеха "
                                     f"({texts.STATE_NAMES.get(prev['state'], prev['state'])})")
         order = (f" · серия «{series}»" if series else "") + (f" · после #{after_id}" if after_id else "")
-        node = self._place(body.get("where"), {"cpu": cpu, "ram": ram, "vram": vram})
+        node = self._place(body.get("where"), {"cpu": cpu, "ram": ram, "vram": vram, "agent": agent["id"],
+                                               "time_s": self.expected_s(agent["id"], command_text({"command": command, "argv": json.dumps(argv or [])}), time_s)[0]})
         if node:
             return self._submit_remote(agent, body, node, argv, command, cwd, cpu, ram, vram, time_s, time_limit_s,
                                        prio, preempt, warnings, series, after_id)
@@ -2432,6 +2601,7 @@ class Manager:
             "wait_text": texts.describe(wait.reason, wait.detail) if wait else "",
             "cap_cores": plan.cpu_caps.get(tid) if plan and row["state"] == "running" else None,
             "progress": self._progress(tid, run_s) if row["state"] in ("running", "suspended") else None,
+            "forecast": self._forecast.get(tid) if row["state"] in ("running", "queued", "suspended") else None,
             "used": None,
         }
         if wait and wait.reason == "no_fit" and "cpu" in (wait.detail or {}).get("lacking", []) \
@@ -2445,7 +2615,9 @@ class Manager:
             d["where"] = where
             d["remote"] = {k: remote.get(k) for k in ("state", "state_text", "reason_text", "wait_text", "position",
                                                        "run_s", "progress", "used", "exit_code", "cap_cores", "hung",
-                                                       "started_at", "swing", "conditions")}
+                                                       "started_at", "swing", "conditions", "forecast")}
+            if row["state"] == "remote":
+                d["forecast"] = remote.get("forecast")
             if remote.get("started_at"):  # when it really started there, not when it was sent
                 d["started_at"] = remote["started_at"]
             if row["state"] == "remote":
