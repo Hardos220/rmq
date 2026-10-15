@@ -319,3 +319,52 @@ def test_parse_lhm_cpu_power_and_clocks():
     assert parse_lhm_cpu(amd) == {"power": 88.2, "clock_p": 4.3}      # no E-cores: all of them in clock_p
     assert parse_lhm_cpu({"Text": "Sensor", "Children": []}) == {}
 
+
+
+# ---------------------------------------------------------------- a sensor that jitters
+def jittery(sigma, true_at, seed=3):
+    """A sensor read every 2 s, in whole degrees, with gaussian jitter around the true temperature."""
+    import random
+    rng = random.Random(seed)
+    cache = {}
+
+    def at(t):
+        slot = int(t // 2)
+        if slot not in cache:
+            cache[slot] = round(true_at(slot * 2) + rng.gauss(0, sigma))
+        return cache[slot]
+    return at
+
+
+def test_sensor_noise_is_the_jitter_not_a_heat_up_or_a_step():
+    noisy = jittery(7, lambda t: 66)
+    assert 5 < HeatRegulator.sensor_noise([(t / 2, noisy(t / 2)) for t in range(240)]) < 9
+    assert HeatRegulator.sensor_noise([(t / 2, 60 + 0.25 * t / 2) for t in range(240)]) < 1    # a steady heat-up
+    assert HeatRegulator.sensor_noise([(t / 2, 60 if t < 120 else 85) for t in range(240)]) == 0  # one real step
+
+
+def test_a_jittery_sensor_does_not_hold_the_tasks_back_for_nothing():
+    noisy = jittery(7, lambda t: 66)                                  # really 66 °C, below its 70 °C target
+    cfg = dict(CFG, cpu_target_c=70.0)
+    reg = HeatRegulator()
+    seen, t = [], 0.0
+    while t < 1800:
+        reg.update(t, [Reading("cpu", "Процессор", noisy(t), 70.0, 95.0, 70.0)], cfg)
+        seen.append(reg.factor)
+        t += 0.5
+    assert sum(f < 0.99 for f in seen[240:]) / len(seen[240:]) < 0.02   # hardly ever (5 s averaging: ~14%)
+    noted = reg.smoothing()
+    assert noted and noted[0]["key"] == "cpu" and noted[0]["avg_s"] == HeatRegulator.AVG_MAX
+
+
+def test_a_quiet_sensor_still_notices_a_real_heat_up_at_once():
+    quiet = jittery(1.0, lambda t: 60 if t < 300 else min(85, 60 + (t - 300) * 0.25))
+    reg = HeatRegulator()
+    t, noticed = 0.0, None
+    while t < 600 and noticed is None:
+        reg.update(t, [Reading("cpu", "Процессор", quiet(t), 70.0, 95.0, 70.0)], CFG)
+        if reg.factor < 0.99:
+            noticed = t
+        t += 0.5
+    assert noticed is not None and noticed - 340 < 12                 # 70 °C is crossed at 340 s
+    assert reg.smoothing() == []                                      # a quiet sensor: the usual short averaging

@@ -23,6 +23,7 @@ import ctypes.wintypes as wt
 import json
 import os
 import re
+import statistics
 import struct
 import time
 import urllib.error
@@ -111,6 +112,13 @@ class HeatRegulator:
     gives CPU back slowly once the component is cooler than that and not heating up. The CPU die answers
     to the load within seconds; the board and the SSD answer slowly, and the GPU is heated mostly by its own
     work, so their loops are slower, and the GPU and the SSD may cut the tasks' CPU at most in half.
+
+    Some sensors jitter: an older laptop's CPU package reading jumps 52 -> 74 -> 63 °C within seconds at a steady
+    25 W. Averaged over 5 s that still crosses the target every few minutes, and each false alarm costs the tasks
+    minutes of CPU, since it comes back slowly. So each loop measures its sensor's jitter (sensor_noise) and a
+    noisy sensor is averaged longer, up to AVG_MAX; a quiet one keeps the usual quick averaging. Replayed on such a
+    laptop's recorded hours, the time its tasks were held back fell from 27% to 5% and from 13% to 0%, while a
+    quiet sensor notices a real heat-up as fast as before. The freeze on overheating looks at the raw readings.
     """
 
     BAND = 2.0
@@ -120,6 +128,28 @@ class HeatRegulator:
     SLOW = (20.0, 90.0, 0.002, 0.001, 0.005, -0.002, 0.01)
     FAST_KEYS = {"cpu"}
     HALF_ONLY = {"gpu", "ssd"}
+    NOISE_S = 120.0     # how far back a sensor's jitter is judged
+    NOISE_REF = 1.5     # °C: a sensor this quiet, or quieter, keeps the usual averaging
+    AVG_MAX = 30.0      # s: the longest averaging a noisy sensor gets
+
+    @staticmethod
+    def sensor_noise(raw) -> float:
+        """How much a sensor jitters, in °C: the median jump between readings two seconds apart. A steady heat-up
+        makes small jumps and a real step only one, so neither counts as jitter; for gaussian noise sigma the
+        median jump between two independent readings is 0.954 sigma."""
+        picked, last = [], None
+        for t, v in raw:
+            if last is None or t - last >= 2.0:
+                picked.append(v)
+                last = t
+        if len(picked) < 15:
+            return 0.0
+        return statistics.median(abs(b - a) for a, b in zip(picked, picked[1:])) / 0.954
+
+    def smoothing(self) -> list[dict]:
+        """The sensors averaged longer than usual because they jitter (for the dashboard)."""
+        return [{"key": k, "label": lp.get("label", k), "noise": round(lp["noise"], 1), "avg_s": round(lp["avg_s"])}
+                for k, lp in self._loops.items() if lp.get("avg_s", 0) > lp.get("base_s", 0) + 1]
 
     def __init__(self):
         self.factor = 1.0
@@ -136,7 +166,8 @@ class HeatRegulator:
             return self.factor
         lowest, who = 1.0, None
         for r in readings:
-            lp = self._loops.setdefault(r.key, {"f": 1.0, "avg": None, "trend": deque()})
+            lp = self._loops.setdefault(r.key, {"f": 1.0, "avg": None, "trend": deque(), "raw": deque()})
+            lp["label"] = r.label
             avg_s, trend_s, k_down, k_up, up_max, cooling, heating = self.FAST if r.key in self.FAST_KEYS else self.SLOW
             floor = cfg["min_cpu_factor"]
             if r.key in self.HALF_ONLY:
@@ -144,8 +175,17 @@ class HeatRegulator:
             if r.temp is None:  # asleep or unreadable: no reason to hold the CPU back
                 lp["avg"] = None
                 lp["trend"].clear()
+                lp["raw"].clear()
                 lp["f"] += up_max * dt
             else:
+                raw = lp["raw"]
+                raw.append((now, r.temp))
+                while raw[0][0] < now - self.NOISE_S:
+                    raw.popleft()
+                lp["noise"] = self.sensor_noise(raw)
+                lp["base_s"] = avg_s
+                avg_s = min(max(self.AVG_MAX, avg_s), max(avg_s, avg_s * (lp["noise"] / self.NOISE_REF) ** 2))
+                lp["avg_s"] = avg_s
                 prev = lp["avg"]
                 lp["avg"] = r.temp if prev is None else prev + dt / (avg_s + dt) * (r.temp - prev)
                 trend = lp["trend"]

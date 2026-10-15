@@ -1434,6 +1434,8 @@
     box.className = `card thermal-status ${th.enabled ? th.state : 'normal'}`;
     fill(box, h('span', { class: 'icon', 'aria-hidden': 'true' }, icon),
       h('div', null, h('div', { class: 'head' }, head), h('div', { class: 'ink2' }, body),
+        ...(th.smoothing || []).map((x) => h('div', { class: 'small ink2', title: 'Регулятор сам меряет, насколько скачут показания датчика, и шумный усредняет дольше. Защита от перегрева смотрит на сами показания, без усреднения.' },
+          `Датчик «${x.label}» скачет примерно на ±${nf1.format(x.noise)}°: регулятор усредняет его за ${x.avg_s} с вместо обычных, чтобы не урезать задачи из-за случайных скачков.`)),
         powerLine(s.power) ? h('div', { class: 'small ink2', title: 'Режимы производителя ноутбука (например, кнопкой Fn+Q или в его фирменной программе) Windows не показывает: их здесь не видно.' }, powerLine(s.power)) : null));
     $('#thermal-tiles').replaceChildren(...thermalTiles(th));
     tempCharts.forEach((c) => c.update());

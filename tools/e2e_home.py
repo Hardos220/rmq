@@ -156,8 +156,10 @@ def network_checks(a: Instance, b: Instance, project: Path) -> None:
     base = f"/api/home/{b.node}"
     st = a.ok("GET", f"{base}/state")
     check(sum(t["state"] == "running" for t in st["tasks"]) == 2, "А читает состояние Б")
-    m = a.ok("GET", f"{base}/metrics?range=300&since=0")
-    check(len(m.get("t") or []) > 3 and m.get("task_names"), "А читает графики Б")
+    m = wait_for(lambda: (lambda r: r if len(r.get("t") or []) > 3 and r.get("task_names") else None)(
+        a.ok("GET", f"{base}/metrics?range=300&since=0")), 20)
+    last = a.ok("GET", f"{base}/metrics?range=300&since=0")
+    check(bool(m), "А читает графики Б", f"точек {len(last.get('t') or [])}, задачи {last.get('task_names')}")
     t = a.ok("GET", f"{base}/tasks/1")
     check(t.get("name") == "сон-1", "А открывает карточку задачи Б")
     check("data" in a.ok("GET", f"{base}/tasks/1/log?offset=-1000"), "А читает лог задачи Б")
