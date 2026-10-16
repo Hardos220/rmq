@@ -142,7 +142,7 @@ Issues and pull requests are welcome: [CONTRIBUTING.md](CONTRIBUTING.md). Change
 
 Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE): free for any noncommercial purpose — personal
 projects, research, study, hobbies, noncommercial and educational organizations. **Commercial use requires a separate
-license** — contact the author via [GitHub](https://github.com/Hardos220) (for example, an issue in this repository).
+license** — write to the author: [maksimelisov2003@gmail.com](mailto:maksimelisov2003@gmail.com).
 When you pass the software on, include the license terms and the "Required Notice" line from [NOTICE](NOTICE).
 Versions up to and including 1.8.2 were released under the Apache License 2.0 and stay under it for those copies.
 Third-party components of the release archive: [THIRD_PARTY.md](THIRD_PARTY.md).
