@@ -56,9 +56,12 @@ def _fill(text: str) -> str:
     """Put this installation's real paths, address and hardware into a template."""
     sh = "/" + str(ROOT).replace("\\", "/").replace(":", "", 1)  # C:\x\y -> /C/x/y (Git Bash)
     sh = sh[:2].lower() + sh[2:] + "/bin/rmq"
+    cmd = str(ROOT / "bin" / "rmq.cmd")
+    if " " in sh:  # a folder with spaces: agents copy the command as is, so it has to be quoted already
+        sh, cmd = f'"{sh}"', f'"{cmd}"'
     if "{HARDWARE}" in text:
         text = text.replace("{HARDWARE}", hardware_line())
-    return (text.replace("{RMQ_SH}", sh).replace("{RMQ_CMD}", str(ROOT / "bin" / "rmq.cmd"))
+    return (text.replace("{RMQ_SH}", sh).replace("{RMQ_CMD}", cmd)
             .replace("{URL}", server_url())).strip() + "\n"
 
 

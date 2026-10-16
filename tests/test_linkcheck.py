@@ -1,7 +1,7 @@
 from rmq.linkcheck import _when, diagnose, is_tailscale
 
 NOW = 1791963432.0                                   # 2026-10-14 10:37:12 MSK
-PEER = "100.97.11.75"
+PEER = "100.64.0.2"
 
 
 def ts(peer=None, state="Running", online=True):
@@ -48,9 +48,9 @@ def test_only_tailscale_addresses_are_diagnosed():
 
 def test_how_tailscale_connects_to_each_pc():
     from rmq.linkcheck import paths_from
-    ts = {"Peer": {"a": {"TailscaleIPs": ["100.97.11.75", "fd7a::1"], "CurAddr": "", "Relay": "waw"},
+    ts = {"Peer": {"a": {"TailscaleIPs": ["100.64.0.2", "fd7a::1"], "CurAddr": "", "Relay": "waw"},
                    "b": {"TailscaleIPs": ["100.80.1.2"], "CurAddr": "192.168.3.5:41641", "Relay": "hel"}}}
     p = paths_from(ts)
-    assert p["100.97.11.75"] == {"direct": False, "relay": "waw"} and p["fd7a::1"]["relay"] == "waw"
+    assert p["100.64.0.2"] == {"direct": False, "relay": "waw"} and p["fd7a::1"]["relay"] == "waw"
     assert p["100.80.1.2"]["direct"] is True
     assert paths_from(None) == {} and paths_from({}) == {}

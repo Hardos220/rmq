@@ -40,6 +40,14 @@ def test_guide_has_real_paths():
     assert "/bin/rmq" in guide and "rmq.cmd" in guide
 
 
+def test_paths_with_spaces_are_quoted(monkeypatch):
+    monkeypatch.setattr(install, "ROOT", install.Path(r"C:\Users\Иван Петров\rmq"))
+    text = install._fill("`{RMQ_SH}` и `{RMQ_CMD}`")
+    assert text.strip() == r'`"/c/Users/Иван Петров/rmq/bin/rmq"` и `"C:\Users\Иван Петров\rmq\bin\rmq.cmd"`'
+    monkeypatch.setattr(install, "ROOT", install.Path(r"C:\rmq"))
+    assert install._fill("`{RMQ_SH}` и `{RMQ_CMD}`").strip() == r"`/c/rmq/bin/rmq` и `C:\rmq\bin\rmq.cmd`"
+
+
 def test_dashboard_files_have_their_own_types_whatever_the_registry_says():
     # on some PCs the registry maps .js to text/plain, and the browser then refuses to run the dashboard
     assert content_type("app.js") == "text/javascript; charset=utf-8"

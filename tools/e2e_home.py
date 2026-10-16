@@ -361,6 +361,11 @@ def dashboard_checks(a: Instance, base: Path) -> None:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):  # check names have «→» and the like: a cp1251 console must not fail them
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--keep", action="store_true", help="не останавливать тестовые менеджеры")
     ap.add_argument("--port", type=int, default=8790, help="порт дашборда А (Б — следующий)")
