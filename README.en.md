@@ -41,22 +41,38 @@ resources, and keeps the hardware cool.
 
 ## Quick start
 
-**You need** Windows 10 or 11 (64-bit) and [Python 3.10+](https://www.python.org/downloads/) — tick
-"Add python.exe to PATH" when installing it. No administrator rights are needed.
+You need Windows 10 or 11 and Python 3.10 or newer ([no Python?](#if-python-is-not-installed)).
 
-1. Download `rmq-<version>.zip` from [Releases](https://github.com/Hardos220/rmq/releases/latest), unpack it into
-   `C:\` and rename the folder `rmq-<version>` to `RMQ`. Any other permanent folder works too (not Downloads or a
-   temporary one: the manager runs from there); the examples below use `C:\RMQ`.
-2. Run `install.cmd`. It prepares a private Python environment, creates a desktop shortcut, adds the rules for your
-   agents, starts the manager and opens the dashboard.
-3. Ask your agent to do something heavy in any project — it reads the rules and submits the task through `rmq`. Or try
-   it by hand:
+1. **Download.** Open the [latest release](https://github.com/Hardos220/rmq/releases/latest) and under **Assets**
+   click **`rmq-<version>.zip`** (not "Source code").
+2. **Unpack.** Right-click the downloaded archive → "Extract All…" → type `C:\` as the destination → "Extract".
+   You get the folder `C:\rmq-<version>`.
+3. **Run.** In that folder double-click `install.cmd`. If Windows asks whether to run the file, click "Run"; if it
+   shows "Windows protected your PC", click "More info" → "Run anyway". In a minute the dashboard opens.
 
-   ```bat
-   C:\RMQ\bin\rmq.cmd run --cpu 1 --ram 0.5 --time 1m -- python -c "print('hello from the queue')"
-   ```
+Done. Agents (Claude Code, Codex CLI, Gemini CLI, Windsurf) learn about the manager in their next session and put
+heavy computations into the queue themselves. Later, open the manager with the "Менеджер ресурсов" desktop shortcut.
 
-**What the installer changes on your PC** — only this:
+## Installation details
+
+### If Python is not installed
+
+1. Open [python.org/downloads](https://www.python.org/downloads/) and click **Download Python 3.x**.
+2. Run the installer and **tick "Add python.exe to PATH" on its first screen** — otherwise the manager cannot find
+   Python. Then click "Install Now".
+3. Run `install.cmd` again.
+
+To check: Win+R → `cmd` → `python --version`. If `install.cmd` cannot find Python, it says so.
+
+### The manager's folder
+
+The manager runs from the folder you unpacked it to, so do not leave it in Downloads or a temporary folder. You may
+rename the folder (e.g. to `C:\RMQ`) before running `install.cmd`; if you move or rename it later, run `install.cmd`
+again. Updates install into the same folder by themselves.
+
+### What the installer changes on your PC
+
+Only this:
 
 - a `.venv` folder with a Python environment inside the manager's folder (one package: psutil);
 - a desktop shortcut;
@@ -65,8 +81,16 @@ resources, and keeps the hardware cool.
   `.gemini\GEMINI.md` (Gemini CLI), `.codeium\windsurf\memories\global_rules.md` (Windsurf). Your own text there is
   left as it is. For Cursor, copy the rules from the "Агенты" (Agents) tab into Cursor Settings → Rules.
 
-No services, drivers, autostart or registry changes. Settings, the task database, logs and statistics live in the
-`data` folder inside the manager's folder.
+No services, drivers, autostart or registry changes, and no administrator rights. Settings, the task database, logs
+and statistics live in the `data` folder inside the manager's folder.
+
+### Try it by hand
+
+Put a test task into the queue (the path is your manager's folder):
+
+```bat
+C:\rmq-<version>\bin\rmq.cmd run --cpu 1 --ram 0.5 --time 1m -- python -c "print('hello from the queue')"
+```
 
 Optional: the CPU temperature sensor ([tools/README.md](tools/README.md), one UAC prompt), autostart (copy the shortcut
 into `shell:startup`), a network of several PCs (the "Сеть" tab has step-by-step instructions).
@@ -86,7 +110,7 @@ rmq guide                                                    :: the full guide f
 ## Uninstall
 
 1. In the dashboard: "Выключить" (Shut down) → cancel the tasks.
-2. Remove the agents' rules: `C:\RMQ\bin\rmq.cmd uninstall-agents`.
+2. Remove the agents' rules: in the manager's folder run `bin\rmq.cmd uninstall-agents`.
 3. If you installed the CPU temperature sensor: `tools\uninstall_cpu_sensors.ps1` as administrator.
 4. If you pressed "Разрешить в брандмауэре" (allow in the firewall): delete the inbound rule
    "RMQ resource manager (network)" in Windows Defender Firewall → Advanced settings.
