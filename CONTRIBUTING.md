@@ -3,6 +3,16 @@
 Ошибки и предложения — в [Issues](https://github.com/Hardos220/rmq/issues), исправления — пулл-реквестами.
 Issues and pull requests in English are welcome too.
 
+## Лицензия вклада
+
+Проект распространяется по лицензии PolyForm Noncommercial 1.0.0, а для коммерческого использования автор выдаёт
+отдельные лицензии. Присылая изменения (пулл-реквест, патч), вы соглашаетесь, что они распространяются на условиях
+лицензии проекта и что автор может включать их и в коммерческие лицензии. Если вы с этим не согласны, напишите об этом
+в пулл-реквесте до его принятия.
+
+By sending a contribution you agree that it is distributed under the project's license and that the author may also
+include it in commercial licenses.
+
 ## Как устроен проект
 
 Менеджер написан на Python 3.10+ и работает только в Windows. Из сторонних пакетов — только

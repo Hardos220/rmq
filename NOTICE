@@ -1,13 +1,21 @@
 RMQ — менеджер ресурсов ПК и очередь вычислений для ИИ-агентов
-Copyright 2026 Hardos220 (https://github.com/Hardos220)
+Required Notice: Copyright 2026 Hardos220 (https://github.com/Hardos220/rmq)
 
 Автор: Hardos220. Исходный код: https://github.com/Hardos220/rmq
 
-Программа распространяется по лицензии Apache License 2.0 (файл LICENSE). Распространяя её или работы на её основе,
-сохраняйте этот файл NOTICE и указывайте автора и ссылку на исходный репозиторий: в документации, в файле NOTICE
-вашей работы или там, где ваша программа показывает сведения об авторах (раздел 4(d) лицензии).
+Программа распространяется по лицензии PolyForm Noncommercial 1.0.0 (файл LICENSE,
+https://polyformproject.org/licenses/noncommercial/1.0.0). Она разрешает любое некоммерческое использование: личные
+проекты, исследования, учёбу, хобби, некоммерческие и образовательные организации. Для коммерческого использования
+нужна отдельная лицензия от автора: свяжитесь с ним через https://github.com/Hardos220 (например, issue в репозитории).
 
-This product includes software developed by Hardos220 (https://github.com/Hardos220/rmq).
-Licensed under the Apache License, Version 2.0.
+Передавая программу или работы на её основе, передавайте вместе с ними условия лицензии (или ссылку на них) и строку
+«Required Notice» выше.
+
+Код, опубликованный до смены лицензии (версии до 1.8.2 включительно), был выпущен под Apache License 2.0 и для тех
+копий остаётся доступным на её условиях.
+
+This software is licensed under the PolyForm Noncommercial License 1.0.0. Commercial use requires a separate license
+from the author: https://github.com/Hardos220. Versions up to and including 1.8.2 were released under the Apache
+License 2.0.
 
 Сторонние компоненты в архиве релиза и их лицензии перечислены в THIRD_PARTY.md.

@@ -1,7 +1,7 @@
 # RMQ — a PC resource manager for AI agents
 
 [![Release](https://img.shields.io/github/v/release/Hardos220/rmq)](https://github.com/Hardos220/rmq/releases/latest)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue)](LICENSE)
 ![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB)
 
@@ -138,5 +138,11 @@ rmq guide                                                    :: the full guide f
 ## Contributing and license
 
 Issues and pull requests are welcome: [CONTRIBUTING.md](CONTRIBUTING.md). Changes in each version:
-[CHANGELOG.md](CHANGELOG.md). Licensed under the [Apache License 2.0](LICENSE); keep the [NOTICE](NOTICE) when you
-redistribute. Third-party components of the release archive: [THIRD_PARTY.md](THIRD_PARTY.md).
+[CHANGELOG.md](CHANGELOG.md).
+
+Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE): free for any noncommercial purpose — personal
+projects, research, study, hobbies, noncommercial and educational organizations. **Commercial use requires a separate
+license** — contact the author via [GitHub](https://github.com/Hardos220) (for example, an issue in this repository).
+When you pass the software on, include the license terms and the "Required Notice" line from [NOTICE](NOTICE).
+Versions up to and including 1.8.2 were released under the Apache License 2.0 and stay under it for those copies.
+Third-party components of the release archive: [THIRD_PARTY.md](THIRD_PARTY.md).
