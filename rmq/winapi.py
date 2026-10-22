@@ -323,6 +323,25 @@ def on_battery() -> tuple[bool, int | None]:
     return st.ACLineStatus == 0, pct
 
 
+def power_caps() -> dict:
+    """What Windows knows about the PC's power supply (GetPwrCapabilities, read only): a lid (a laptop), a UPS,
+    batteries, and whether they are short-term ones, as in a UPS. Empty if it cannot be read."""
+    buf = ctypes.create_string_buffer(128)  # SYSTEM_POWER_CAPABILITIES is 76 bytes
+    try:
+        if not ctypes.WinDLL("powrprof").GetPwrCapabilities(buf):
+            return {}
+    except (OSError, AttributeError):
+        return {}
+    b = buf.raw
+    return {"lid": bool(b[2]), "ups": bool(b[12]), "batteries": bool(b[30]), "short_term": bool(b[31])}
+
+
+def is_ups(caps: dict) -> bool:
+    """The PC's battery is a UPS, not a laptop's own: Windows marks a UPS's batteries short-term, and a PC without
+    a lid (a desktop) that has a battery at all has it in a UPS."""
+    return bool(caps.get("ups") or caps.get("short_term") or (caps.get("batteries") and not caps.get("lid")))
+
+
 # the "Power mode" slider of Windows (an overlay over the power plan); none set means the balanced middle
 POWER_MODES = {"961cc777-2547-4f9d-8174-7d86181b8a7a": "экономия энергии",
                "3af9b8d9-7c97-431d-ad78-34a8bfea439f": "экономия энергии",
@@ -632,6 +651,14 @@ DRIVE_REMOVABLE, DRIVE_FIXED = 2, 3
 def local_drive(root: str) -> bool:
     """A local disk (not a network share or an optical drive): asking it for free space never hangs."""
     return GetDriveTypeW(root) in (DRIVE_REMOVABLE, DRIVE_FIXED)
+
+
+def fixed_drives() -> list[str]:
+    """The roots of the PC's own disks ("C:\\", "D:\\"): fixed drives only, no USB sticks, optical drives or network
+    shares."""
+    mask = kernel32.GetLogicalDrives()
+    roots = [f"{chr(65 + i)}:\\" for i in range(26) if mask >> i & 1]
+    return [r for r in roots if GetDriveTypeW(r) == DRIVE_FIXED]
 
 
 # ---------------------------------------------------------------- PDH counters

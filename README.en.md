@@ -32,7 +32,8 @@ resources, and keeps the hardware cool.
 - **Agents set themselves up.** A short block of rules goes into the agents' global instructions; an agent registers
   on its first command — no keys.
 - **Hardware care.** A smooth temperature regulator for the CPU, the motherboard (ACPI), the GPU and the SSD; freezing
-  on overheating or when the system disk runs out of space.
+  on overheating or when the system disk runs out of space. On a power cut, when a desktop runs on its UPS, tasks save
+  their checkpoints and freeze until the mains are back (a laptop on its own battery is not affected).
 - **Dashboard** at `http://127.0.0.1:8777`: CPU, RAM, VRAM and GPU load split into "you" and "agents", per-task
   resources, temperatures, CPU/GPU power and clocks, a forecast of the queue, statistics and a timeline of tasks.
 - **Compute network.** Several PCs with RMQ join through [Tailscale](https://tailscale.com); agents send tasks where
@@ -138,7 +139,9 @@ rmq guide                                                    :: the full guide f
 ## Contributing and license
 
 Issues and pull requests are welcome: [CONTRIBUTING.md](CONTRIBUTING.md). Changes in each version:
-[CHANGELOG.md](CHANGELOG.md).
+[CHANGELOG.md](CHANGELOG.md). With a bug report, attach the report zip: the "Журнал" (Journal) tab → "Собрать отчёт
+для автора" (or `bin\rmq.cmd report`). It holds the version, hardware, sensors, logs and latest tasks — no tokens,
+network keys, code word, task commands or folders; your folder, names and addresses are replaced. Look it over first.
 
 Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE): free for any noncommercial purpose — personal
 projects, research, study, hobbies, noncommercial and educational organizations. **Commercial use requires a separate

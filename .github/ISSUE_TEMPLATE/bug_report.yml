@@ -40,5 +40,8 @@ body:
     id: logs
     attributes:
       label: Логи / Logs
-      description: Нужные строки из `data\manager.log` и вывод `rmq status <номер> --events`
+      description: >-
+        Лучше всего — отчёт: вкладка «Журнал» → «Собрать отчёт для автора» (или `bin\rmq.cmd report`), архив
+        перетащите сюда; в нём нет токенов и ключей. Или нужные строки из `data\manager.log` и вывод
+        `rmq status <номер> --events`. Best: the report zip (Journal tab → «Собрать отчёт для автора»)
       render: text

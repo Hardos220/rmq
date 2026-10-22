@@ -16,6 +16,7 @@ STATE_NAMES = {
 _REASONS = {
     "paused": "Пауза всех задач (режим «Пауза»)",
     "heat": "Перегрев: задачи агентов заморожены, пока ПК не остынет",
+    "power": "Пропало питание, ПК работает от ИБП: задача ждёт, пока вернётся сеть",
     "user": "Приостановлено вручную",
     "resume": "Ждёт возобновления",
     "game": "Игровой режим: задачи на GPU ждут",
@@ -45,6 +46,11 @@ def _num(x: float) -> str:
     return f"{x:.1f}".rstrip("0").rstrip(".") if abs(x) < 100 else f"{x:.0f}"
 
 
+def _lower_first(text: str) -> str:
+    """A reason inside a sentence: "Пропало питание, ПК…" -> "пропало питание, ПК…" (abbreviations stay)."""
+    return text[:1].lower() + text[1:]
+
+
 def describe(code: str | None, detail: dict | None = None) -> str:
     detail = detail or {}
     if not code:
@@ -54,9 +60,9 @@ def describe(code: str | None, detail: dict | None = None) -> str:
     if code.startswith("prio:"):
         return f"Уступила место задаче #{code[5:]} с высоким приоритетом; продолжит, когда освободится место"
     if code.startswith("requeued:"):
-        return "Перезапущена с начала: " + describe(code[9:]).lower()
+        return "Перезапущена с начала: " + _lower_first(describe(code[9:]))
     if code.startswith("stopping:"):
-        return "Сохраняет чекпоинт и останавливается (её попросили через RMQ_STOP_FILE): " + describe(code[9:]).lower()
+        return "Сохраняет чекпоинт и останавливается (её попросили через RMQ_STOP_FILE): " + _lower_first(describe(code[9:]))
     if code == "stopping":
         ids = detail.get("for", [])
         names = ", ".join(f"#{i}" for i in ids)

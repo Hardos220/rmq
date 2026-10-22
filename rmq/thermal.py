@@ -55,8 +55,9 @@ def readings_from(cfg: dict, board: tuple, gpu: tuple, ssd: tuple, cpu: float | 
         out.append(Reading("board", "Плата (ACPI)", board[0], cfg["board_target_c"], cfg["board_hot_c"],
                            cfg["board_normal_c"], board[1]))
     if gpu[2]:  # an NVIDIA GPU exists
-        out.append(Reading("gpu", "Видеокарта", gpu[0], cfg["gpu_target_c"], cfg["gpu_hot_c"], cfg["gpu_normal_c"],
-                           gpu[1], "" if gpu[0] is not None else "спит"))
+        # a target never above the GPU's own hot limit (its slowdown temperature may be lower than the setting)
+        out.append(Reading("gpu", "Видеокарта", gpu[0], min(cfg["gpu_target_c"], cfg["gpu_hot_c"] - 3), cfg["gpu_hot_c"],
+                           cfg["gpu_normal_c"], gpu[1], "" if gpu[0] is not None else "спит"))
     if ssd[0] is not None:
         hot = min(cfg["ssd_hot_c"], ssd[1] - 3) if ssd[1] else cfg["ssd_hot_c"]
         out.append(Reading("ssd", "SSD", ssd[0], min(cfg["ssd_target_c"], hot - 5), hot, cfg["ssd_normal_c"]))

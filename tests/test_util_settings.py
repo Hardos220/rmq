@@ -34,9 +34,9 @@ def test_settings_roundtrip_and_validation(tmp_path):
     path = tmp_path / "settings.json"
     s = Settings(path)
     assert s.snapshot() == DEFAULTS
-    assert json.loads(path.read_text(encoding="utf-8")) == {"_version": 3}  # only changes are stored
+    assert json.loads(path.read_text(encoding="utf-8")) == {"_version": 4}  # only changes are stored
     s.update({"reserve": {"ram_min_gb": 2}})
-    assert json.loads(path.read_text(encoding="utf-8")) == {"_version": 3, "reserve": {"ram_min_gb": 2.0}}
+    assert json.loads(path.read_text(encoding="utf-8")) == {"_version": 4, "reserve": {"ram_min_gb": 2.0}}
     assert Settings(path).section("reserve")["ram_min_gb"] == 2.0
     for bad in ({"reserve": {"nope": 1}}, {"reserve": {"ram_min_gb": "x"}}, {"reserve": {"ram_min_gb": -1}},
                 {"server": {"port": 80.5}}, {"game_mode": {"process_names": "game.exe"}}):
@@ -55,7 +55,7 @@ def test_old_full_settings_file_gets_new_defaults(tmp_path):
     s = Settings(path)
     assert s.section("game_mode")["extra_ram_reserve_gb"] == DEFAULTS["game_mode"]["extra_ram_reserve_gb"]
     assert s.section("reserve")["ram_min_gb"] == 3.0
-    assert json.loads(path.read_text(encoding="utf-8")) == {"_version": 3, "reserve": {"ram_min_gb": 3.0}}
+    assert json.loads(path.read_text(encoding="utf-8")) == {"_version": 4, "reserve": {"ram_min_gb": 3.0}}
 
 
 def test_warm_limits_become_regulator_targets(tmp_path):
@@ -66,7 +66,16 @@ def test_warm_limits_become_regulator_targets(tmp_path):
     assert t["cpu_target_c"] == 78.0                       # the owner's own limit is kept as the target
     assert t["board_target_c"] == DEFAULTS["thermal"]["board_target_c"]
     assert "warm_cpu_factor" not in t and "cpu_warm_c" not in t
-    assert json.loads(path.read_text(encoding="utf-8")) == {"_version": 3, "thermal": {"cpu_target_c": 78.0}}
+    assert json.loads(path.read_text(encoding="utf-8")) == {"_version": 4, "thermal": {"cpu_target_c": 78.0}}
+
+
+def test_fixed_space_for_members_gives_way_to_a_share_of_the_drives(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"_version": 3, "network": {"max_disk_gb": 50.0, "max_hosted_tasks": 4}}),
+                    encoding="utf-8")
+    n = Settings(path).section("network")
+    assert "max_disk_gb" not in n and n["max_disk_pct"] == 10.0 and n["max_hosted_tasks"] == 4
+    assert json.loads(path.read_text(encoding="utf-8")) == {"_version": 4, "network": {"max_hosted_tasks": 4}}
 
 
 def test_presets_set_the_main_knobs_and_are_recognised(tmp_path):
@@ -81,4 +90,12 @@ def test_presets_set_the_main_knobs_and_are_recognised(tmp_path):
     assert data["reserve"]["cpu_pct_of_free"] == 40.0 and data["thermal"]["cpu_hot_c"] == 97.0  # gentle's are gone
     s.update({"reserve": {"cpu_pct_of_free": 33.0}})
     assert active_preset(s.snapshot()) is None                        # the owner's own values
-    assert set(PRESETS) == {"standard", "gentle", "quiet", "max"}
+    assert set(PRESETS) == {"standard", "gentle", "quiet", "productive"}
+    data = s.apply_preset("productive")
+    assert (data["reserve"]["cpu_pct_of_free"], data["reserve"]["ram_pct_of_free"], data["reserve"]["cpu_min_cores"],
+            data["reserve"]["ram_min_gb"]) == (3.0, 3.0, 1.0, 1.0)
+    assert data["gpu"]["user_busy_pct"] == 40.0 and not data["gpu"]["free_vram_for_user"]
+    assert not data["game_mode"]["pause_gpu_tasks"] and data["thermal"]["cpu_target_c"] == 90.0
+    data = s.apply_preset("standard")                                 # back: every knob the presets touch
+    assert data["gpu"]["free_vram_for_user"] and data["game_mode"]["pause_gpu_tasks"]
+    assert active_preset(data) == "standard"

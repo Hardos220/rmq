@@ -179,6 +179,22 @@ def test_pause_mode_suspends_everything():
     assert p.waiting[2].reason == "paused"
 
 
+def test_power_cut_saves_checkpoints_and_freezes_the_rest():
+    ckpt = task(1, state="running", preempt="requeue")
+    plain = task(2, state="running")
+    p = run([ckpt, plain, task(3)], power_hold=True)
+    assert acts(p) == [("stop", 1, "power"), ("suspend", 2, "power")]  # task 1 saves a checkpoint, 3 does not start
+    assert p.waiting[2].reason == "power" and p.waiting[3].reason == "power"
+    # asked once: the next ticks leave it to save and exit, and after the grace period it is stopped anyway
+    leaving = task(1, state="running", preempt="requeue", stopping=True, stop_reason="power", stop_requested_at=NOW - 5)
+    assert acts(run([leaving], power_hold=True)) == []
+    late = task(1, state="running", preempt="requeue", stopping=True, stop_reason="power", stop_requested_at=NOW - 61)
+    assert acts(run([late], power_hold=True)) == [("requeue", 1, "power")]
+    # power is back: the frozen task goes on by itself
+    back = task(2, state="suspended", suspend_reason="power", queued_since=NOW - 300)
+    assert ("resume", 2, "") in acts(run([back]))
+
+
 def test_time_limit_kills():
     t = task(1, state="running", time_limit_s=600, run_s=601)
     assert acts(run([t])) == [("kill", 1, "time_limit")]
@@ -343,6 +359,8 @@ def test_frozen_gpu_task_is_restarted_when_user_still_needs_vram():
     assert acts(run([held], game_active=True, vram_deficit=3.0)) == [("requeue", 1, "vram")]
     no_kill = Policy(free_vram_for_user=False)
     assert acts(run([held], game_active=True, vram_deficit=3.0, policy=no_kill)) == []
+    ckpt = task(2, state="running", vram=6, used_vram=6, preempt="requeue")  # not stopped either, only frozen
+    assert acts(run([ckpt], vram_deficit=3.0, policy=no_kill)) == [("suspend", 2, "vram")]
 
 
 def test_running_gpu_task_is_frozen_before_being_restarted():

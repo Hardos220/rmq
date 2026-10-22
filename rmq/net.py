@@ -27,7 +27,8 @@ exchanging its live state (free resources, mode, version) and the member list (n
 
 Tasks for another PC ("proxy" tasks here, "hosted" tasks there): the origin packs the project folder, sends the
 task and the archive over the network the host shares with it (one's own PCs first), follows its state, and
-when it ends brings back the files the task created or changed, then tells the host to delete its copy.
+when it ends brings back the files the task created or changed, then tells the host to delete its copy. Big files
+the host already has from this PC's earlier tasks stay out of the archive (rmq/filecache.py).
 """
 from __future__ import annotations
 
@@ -47,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from . import __version__, firewall, linkcheck
+from . import __version__, filecache, firewall, linkcheck
 from .netbase import (KINDS, MODES, PROTOCOL, NetError, NetStore, NonceCache, body_hash, collect_files, file_sha256,
                       make_invite, make_zip, member_record, parse_invite, safe_extract, sign_headers,
                       tailscale_address, verify)
@@ -106,6 +107,8 @@ class NetService:
         self.error = ""
         self.pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="rmq-net")
         self._busy: set[int] = set()
+        self._hashes: dict = {}               # (path, size, mtime) -> SHA-256 of the big files sent (filecache.hash_of)
+        self._no_cache: set[int] = set()      # tasks to send whole: the host lost some cached files meanwhile
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -330,13 +333,13 @@ class NetService:
         th = st.get("thermal") or {}
         info = {
             "node_id": store.node_id, "name": store.node_name, "address": self.address,
-            "version": __version__, "protocol": PROTOCOL, "mode": store.mode,
+            "version": __version__, "protocol": PROTOCOL, "mode": store.mode, "caps": ["files_cache"],
             # one's own PCs always take each other's tasks; other people's only in two_way
             "accepting": self.server is not None and (kind == "home" or (store.mode == "two_way"
                                                                          and store.network is not None)),
             "hw": self.m.hardware(), "free": {k: round(v, 2) for k, v in free.items()},
             "busy": {"game": bool((st.get("game") or {}).get("active")), "paused": st.get("mode") == "paused",
-                     "heat": th.get("state", "normal"),
+                     "heat": th.get("state", "normal"), "power": bool((st.get("power") or {}).get("ups_hold")),
                      "disk_low": any(d.get("low") for d in (st.get("disk") or {}).get("drives", []))},
             "tasks": counts, "hosted": len(self.m.hosted_active()),
         }
@@ -877,7 +880,7 @@ class NetService:
             if time.time() - lv.get("seen", 0) > ONLINE_S or not info.get("accepting"):
                 continue
             busy = info.get("busy") or {}
-            if busy.get("paused") or busy.get("heat") == "hot" or busy.get("disk_low"):
+            if busy.get("paused") or busy.get("heat") == "hot" or busy.get("disk_low") or busy.get("power"):
                 continue
             free = info.get("free") or {}
             if free.get("ram", 0) + 1e-6 < need["ram"] or free.get("vram", 0) + 1e-6 < need["vram"]:
@@ -940,9 +943,13 @@ class NetService:
             return
         out = m.net_dir("out") / f"bundle-{tid}.zip"
         try:
-            files = collect_files(Path(row["cwd"]), spec.get("files"), max_bytes=int(cfg["max_bundle_mb"]) << 20)
-            m.net_remote_update(tid, {"phase_text": f"упаковываем {len(files)} файлов"})
-            sha = make_zip(Path(row["cwd"]), files, out)
+            root = Path(row["cwd"])
+            files = collect_files(root, spec.get("files"), max_bytes=int(cfg["max_bundle_mb"]) << 20)
+            cached, stored = self._cache_plan(node, kind, tid, root, files)
+            packed = [f for f in files if f[0] not in cached]
+            m.net_remote_update(tid, {"phase_text": f"упаковываем {len(packed)} файлов" + (
+                f" ({len(cached)} крупных уже есть на {self.node_name(node)})" if cached else "")})
+            sha = make_zip(root, packed, out)
             size = out.stat().st_size
             if spec.get("requirements") and not any(f[0] == spec["requirements"] for f in files):
                 raise NetError(f"файл зависимостей {spec['requirements']} не попал в отправку")
@@ -951,7 +958,8 @@ class NetService:
                        "cpu": row["cpu"], "ram": row["ram_gb"], "vram": row["vram_gb"], "time_s": row["time_s"],
                        "time_limit_s": row["time_limit_s"], "preempt": row["preempt"], "env": spec.get("env") or {},
                        "requirements": spec.get("requirements"), "results": spec.get("results"),
-                       "bundle": {"size": size, "sha256": sha, "files": len(files)}}
+                       "bundle": {"size": size, "sha256": sha, "files": len(files),
+                                  "bytes": sum(s for _rel, s in files), "cached": cached, "stored": stored}}
             r = self.call(node, "POST", "/net/v1/tasks", payload, kind=kind, timeout=30)
             m.net_remote_update(tid, {"phase_text": f"отправляем {size / 2**20:.1f} МБ"})
             up = self.call(node, "PUT", f"/net/v1/uploads/{r['upload_id']}", None, kind=kind,
@@ -960,14 +968,38 @@ class NetService:
             m.net_proxy_failed(tid, e.message)
             return
         except PeerError as e:
-            if e.status in (400, 403, 404, 409, 413, 507):
+            if e.status == 410:  # the host's cache lost some of the files meanwhile: the next try sends them all
+                self._no_cache.add(tid)
+                m.net_remote_update(tid, {"phase_text": "повторим отправку: проект целиком"})
+            elif e.status in (400, 403, 404, 409, 413, 507):
                 m.net_proxy_failed(tid, e.message)
             else:
                 m.net_remote_update(tid, {"phase_text": f"повторим отправку: {e.message}"})
             return
         finally:
             out.unlink(missing_ok=True)
+        self._no_cache.discard(tid)
         m.net_proxy_sent(tid, int(up["task_id"]))
+
+    def _cache_plan(self, node: str, kind: str, tid: int, root: Path, files: list) -> tuple[dict, dict]:
+        """({path: SHA-256} of the big files the host already has, which stay out of the archive; {path: SHA-256} of
+        the big files that go in it, which the host keeps for the next tasks). Empty when the host cannot cache
+        (an older version) or did not answer: then everything goes in the archive, as before."""
+        with self._lock:
+            info = ((self.live.get(node) or {}).get("info_by") or {}).get(kind) or {}
+        if tid in self._no_cache or "files_cache" not in (info.get("caps") or []):
+            return {}, {}
+        big = [rel for rel, size in files if size >= filecache.MIN_BYTES][:filecache.MAX_FILES]
+        if not big:
+            return {}, {}
+        sums = {rel: filecache.hash_of(root / rel, self._hashes) for rel in big}
+        try:
+            r = self.call(node, "POST", "/net/v1/files/have", {"hashes": sorted(set(sums.values()))}, kind=kind,
+                          timeout=30)
+        except PeerError:
+            return {}, {}
+        have = set(r.get("have") or [])
+        return ({rel: s for rel, s in sums.items() if s in have}, {rel: s for rel, s in sums.items() if s not in have})
 
     def _follow(self, row: dict) -> None:
         m, tid, node, rid = self.m, row["id"], row["remote_node"], row["remote_id"]
@@ -1091,6 +1123,8 @@ class NetHandler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True})
             if method == "POST" and parts == ["tasks"]:
                 return self._json(201, svc.m.net_accept_task(node, body, kind))
+            if method == "POST" and parts == ["files", "have"]:
+                return self._json(200, svc.m.net_files_have(node, body, kind))
             if len(parts) >= 2 and parts[0] == "tasks" and parts[1].isdigit():
                 tid = int(parts[1])
                 rest = parts[2:]

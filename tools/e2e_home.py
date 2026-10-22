@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -265,7 +266,10 @@ def order_checks(a: Instance, b: Instance, project: Path) -> None:
     rr = a.cli("retime", str(x), "--time", "2h")
     check(rr.returncode == 0 and task(a, x)["time_s"] == 7200, "rmq retime", rr.stderr[-200:])
     c = wait_for(lambda: next(a.home.glob(f"tasks/{x}/conditions.json"), None), 25)
-    check(c and "paused_s" in json.loads(c.read_text(encoding="utf-8")), "файл RMQ_CONDITIONS_FILE")
+    cond = json.loads(c.read_text(encoding="utf-8")) if c else {}
+    check("paused_s" in cond, "файл RMQ_CONDITIONS_FILE")
+    check("factor" in (cond.get("heat") or {}) and "gpu_heat_share" in cond["heat"], "нагрев сейчас в файле условий",
+          str(cond.get("heat")))
     check("paused_s" in (task(a, x).get("conditions") or {}), "условия счёта в статусе задачи")
     a.ok("POST", f"/api/tasks/{x}/cancel", {})
 
@@ -302,6 +306,26 @@ def order_checks(a: Instance, b: Instance, project: Path) -> None:
     check(done and (project / "out" / "partial.txt").exists(), "отменённая на Б задача вернула свои файлы",
           task(a, rid).get("reason_text", ""))
 
+    # a big file goes to the other PC once: the next task of a series takes it from that PC's cache
+    (project / "data").mkdir(exist_ok=True)
+    (project / "data" / "big.bin").write_bytes(os.urandom(600_000))
+    (project / "job3.py").write_text("import os\nos.makedirs('out', exist_ok=True)\n"
+                                     "open('out/size.txt', 'w').write(str(os.path.getsize('data/big.bin')))\n",
+                                     encoding="utf-8")
+    for k in range(2):
+        (project / "out" / "size.txt").unlink(missing_ok=True)
+        rid = a.ok("POST", "/api/tasks", {"argv": ["python", "job3.py"], "cpu": 0.1, "ram": 0.1, "time": "1m",
+                                          "where": b.label, "cwd": str(project), "name": f"кэш-{k + 1}",
+                                          "files": ["job3.py", "data/big.bin"]})["id"]
+        ok = wait_for(lambda: task(a, rid)["state"] in FINAL, 90, 2) and task(a, rid)["state"] == "done"
+        size = (project / "out" / "size.txt").read_text() if (project / "out" / "size.txt").exists() else ""
+        check(ok and size == "600000", f"задача {k + 1} серии на Б получила крупный файл целиком",
+              task(a, rid).get("reason_text", ""))
+    events = [e["message"] for e in b.ok("GET", "/api/events?limit=50")["events"]]
+    check(any("кэш-2" in e and "из кэша" in e for e in events) and not any("кэш-1" in e and "из кэша" in e
+                                                                            for e in events),
+          "второй задаче серии крупный файл не пересылался (взят из кэша Б)")
+
     # statistics files and the per-task log, readable by agents
     r = a.cli("stats", "--files")
     check(r.returncode == 0 and "tasks.csv" in r.stdout, "rmq stats --files", r.stderr[-200:])
@@ -313,6 +337,20 @@ def order_checks(a: Instance, b: Instance, project: Path) -> None:
           r.stderr[-200:])
     r = a.cli("status", str(rid), "--events")
     check(r.returncode == 0 and "события:" in r.stdout, "rmq status --events", r.stderr[-200:])
+
+    # the owner's report for the author: everything in one zip, private details scrubbed
+    r = a.cli("report", "--out", str(a.home.parent / "report"))
+    zpath = Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    names, text = [], ""
+    if zpath and zpath.is_file():
+        with zipfile.ZipFile(zpath) as z:
+            names = z.namelist()
+            text = "\n".join(z.read(n).decode("utf-8", errors="replace") for n in names)
+    check({"README.txt", "summary.json", "manager.log", "events.txt", "tasks.txt"} <= set(names), "rmq report: архив",
+          r.stderr[-200:])
+    leaks = [w for w in (a.token, os.environ.get("USERNAME", "-"), b.label, "e2e-слово") if w and w.lower() in text.lower()]
+    check(text and not leaks and "ПК-1" in text, "в отчёте нет токена, имени пользователя, имён ПК и кодового слова",
+          str(leaks))
 
     # agents read the other PC: its queue, and the load over time
     r = a.cli("queue", "--pc", b.label)

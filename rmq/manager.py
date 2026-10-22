@@ -25,6 +25,7 @@ from pathlib import Path
 import psutil
 
 from . import __version__, chronicle, forecast, planner, progress, swing, texts, thermal, winapi
+from .filecache import FileCache
 from .db import DB, FINAL_STATES
 from .games import GameDetector
 from .jobs import GB, TaskRuntime, Usage
@@ -253,6 +254,11 @@ class Manager:
         self.guard = thermal.ThermalGuard()
         self.regulator = thermal.HeatRegulator()
         self._heat_state = "normal"           # normal | warm (the regulator holds tasks back) | hot (frozen)
+        self._readings: list = []             # the latest temperatures (for the tasks' conditions files)
+        self.power_hold = False               # the PC runs on its UPS: the tasks stand still (_ups_tick)
+        self._is_ups, self._caps_at = False, -1e18
+        self._ups_since: float | None = None
+        self._mains_since: float | None = None
         self._reg_on = False
         self._reg_full_since: float | None = None
         self._gpu_read = (0.0, None, False)   # (when, temperature, throttling)
@@ -291,11 +297,14 @@ class Manager:
         # the compute network: tasks other PCs run here live under LocalLow (they may write nowhere else)
         self.netstore = NetStore(home / "network.json")
         self.net_root = Path(winapi.local_low()) / "RMQ" / self.instance
+        # big project files other PCs sent, for their next tasks (out of their tasks' reach: they may not change it)
+        self.files = FileCache(home / "net" / "files")
         # tasks other PCs run here -> the network they came over ("home": one's own PC, "ext": other people)
         self.hosted: dict[int, str] = {r["id"]: (r["origin_net"] or "ext") for r in self.db.tasks_hosted()}
         self.net = NetService(self)
         self._hw: dict | None = None
         self._net_disk = (0.0, 0.0)  # (when, GB used by members' files)
+        self._drives_total = (-1e18, 0.0)  # (when, GB of all this PC's own drives together)
         self.open_dashboard_once = False   # set by the updater: the server opens the dashboard when it starts
         self._dashboard_seen = bool(self.db.kv_get("dashboard_seen"))
         self.updater = Updater(self)
@@ -504,6 +513,7 @@ class Manager:
             if self.nv.max_operating:
                 tc["gpu_hot_c"] = min(tc["gpu_hot_c"], self.nv.max_operating - 2)
             readings = self._read_sensors(now, tc, max(gpu_user, gpu_tasks), bool(usage))
+            self._readings = readings
             was_hot = self.guard.state == "hot"
             hot = self.guard.update(now, readings, tc) == "hot"
             factor = self.regulator.update(now, readings, tc)
@@ -579,7 +589,7 @@ class Manager:
                 now=now, capacity=planner.Capacity(N, ram_total, vram_total),
                 pools=planner.Pools(pool_cpu, pool_ram, pool_vram), tasks=list(views.values()), agents=agents,
                 policy=pol, mode=self.mode, game_active=game_active, gpu_user_busy=gpu_busy,
-                thermal_freeze=heat == "hot", disk_hold=disk_hold,
+                thermal_freeze=heat == "hot", power_hold=self.power_hold, disk_hold=disk_hold,
                 net_hold={tid for tid in rows if self.hosted.get(tid) == "ext"}  # one's own PCs' tasks never wait
                 if self.netstore.mode != "two_way" else set(),
                 hung={tid for tid, a in self._activity.items() if a["hung"] and tid in rows
@@ -612,6 +622,7 @@ class Manager:
                 self.last_shed_at = now
             pw = S["power"]
             battery, battery_pct = winapi.on_battery()
+            self._ups_tick(now, battery, battery_pct, pw["ups_hold"])
             active_rows = self.db.tasks_active()
             running_now = any(r["state"] == "running" for r in active_rows) or (
                 heat == "hot" and any(r["state_reason"] == "heat" for r in active_rows))  # cool down, then go on
@@ -740,6 +751,7 @@ class Manager:
                          "learned": bool(learned and learned["ram"] > 0.3)},
                 "gpu_busy": gpu_busy,
                 "power": {"keep_awake": self.keep_awake.active, "on_battery": battery, "battery_pct": battery_pct,
+                          "ups": self._is_ups, "ups_hold": self.power_hold,
                           **self._power_mode, "tariff": self.settings.section("power").get("tariff_rub_kwh")},
                 "thermal": {"enabled": tc["enabled"], "regulate": tc["regulate"], "state": heat,
                             "trigger": self.guard.trigger, "cool_left": self.guard.cool_left,
@@ -956,6 +968,41 @@ class Manager:
         self.db.event("heat", msg)
         log.info(msg)
 
+    # ---------------------------------------------------------------- power cuts
+    UPS_CONFIRM_S = 5.0      # on the UPS this long before the tasks stop: a flicker of the mains changes nothing
+    MAINS_CONFIRM_S = 60.0   # back on the mains this long before they go on: the power may still be failing
+    CAPS_EVERY_S = 30.0      # a UPS may be plugged in while the manager runs
+
+    def _ups_tick(self, now: float, battery: bool, pct: int | None, enabled: bool) -> None:
+        """Power cut on a PC with a UPS: tasks with checkpoints save them and leave, the rest are frozen, and none
+        starts until the mains have been back for a minute. A laptop on its own battery goes on as usual."""
+        if now - self._caps_at >= self.CAPS_EVERY_S:
+            self._caps_at = now
+            self._is_ups = winapi.is_ups(winapi.power_caps())
+        if battery and self._is_ups and enabled:
+            self._mains_since = None
+            if self._ups_since is None:
+                self._ups_since = now
+            if not self.power_hold and now - self._ups_since >= self.UPS_CONFIRM_S:
+                self.power_hold = True
+                msg = (f"Пропало питание: ПК работает от ИБП{f' (заряд {pct}%)' if pct is not None else ''}. Задачи "
+                       "с чекпоинтами (--preempt requeue) сохраняют их и останавливаются, остальные заморожены, новые "
+                       "не стартуют — пока не вернётся сеть")
+                self.db.event("power", msg)
+                log.warning(msg)
+            return
+        self._ups_since = None
+        if not self.power_hold:
+            return
+        if self._mains_since is None:
+            self._mains_since = now
+        if now - self._mains_since >= self.MAINS_CONFIRM_S or not enabled:
+            self.power_hold, self._mains_since = False, None
+            msg = ("Питание вернулось — расчёты продолжаются" if enabled else
+                   "Реакция на работу от ИБП выключена в настройках — расчёты продолжаются")
+            self.db.event("power", msg)
+            log.info(msg)
+
     # ---------------------------------------------------------------- disk space
     DISK_RESUME_EXTRA_GB = 2.0
 
@@ -1149,7 +1196,8 @@ class Manager:
                 "members": len(members), "online": sum(1 for nid in members if self.net.online(nid)),
                 "home": st.home["name"] if st.home else None, "home_members": len(own),
                 "home_online": sum(1 for nid in own if self.net.online(nid)), "is_main": st.is_main,
-                "hosted": len(self.hosted_active()), "remote": len(self.db.tasks_remote())}
+                "hosted": len(self.hosted_active()), "remote": len(self.db.tasks_remote()),
+                "disk_limit_gb": round(self.net_disk_limit_gb(), 1)}
 
     def nodes(self) -> list[dict]:
         """The PCs agents may send tasks to (rmq nodes): one's own PCs first, then other people's."""
@@ -1418,7 +1466,7 @@ class Manager:
         when, gb = self._net_disk
         if time.time() - when < 60:
             return gb
-        total = 0
+        total = self.files.size()
         for dirpath, _dirs, files in os.walk(self.net_root):
             for f in files:
                 try:
@@ -1427,6 +1475,45 @@ class Manager:
                     pass
         self._net_disk = (time.time(), total / GB)
         return total / GB
+
+    NET_DISK_MIN_GB = 10.0  # the least members' files may take here, however small the drives
+    NET_DISK_SPARE_GB = 5.0  # members' files keep a drive this far above the "little space left" line
+
+    def _net_room(self, need: dict) -> str | None:
+        """The share of the drives (net_disk_limit_gb) is not all: members' files live on particular drives (their
+        tasks' folders under LocalLow on the system drive, the archives and the file cache in data), and those must
+        keep their free space. `need` is {a path on a drive: bytes to put there}; None if every drive keeps more than
+        the disk guard's limit plus NET_DISK_SPARE_GB free afterwards, else why not."""
+        by_root: dict[str, float] = {}
+        for path, n in need.items():
+            root = self._drive_of(str(path)) or str(path)
+            by_root[root] = by_root.get(root, 0.0) + n
+        floor = float(self.settings.section("disk")["min_free_gb"]) + self.NET_DISK_SPARE_GB
+        for root, n in by_root.items():
+            try:
+                free = shutil.disk_usage(root).free / GB
+            except OSError:
+                continue
+            if free - n / GB < floor:
+                drive = root.rstrip("\\")
+                return (f"на диске {drive} этого ПК мало места: свободно {free:.0f} ГБ, а после файлов задачи должно "
+                        f"остаться больше {floor:.0f} ГБ")
+        return None
+
+    def net_disk_limit_gb(self) -> float:
+        """The most all members' files may take on this PC (their code, results, environments and cached project
+        files): max_disk_pct of all its own drives together, but at least NET_DISK_MIN_GB."""
+        when, total = self._drives_total
+        if time.time() - when >= 600:  # drives come and go rarely
+            total = 0.0
+            for root in winapi.fixed_drives():
+                try:
+                    total += shutil.disk_usage(root).total / GB
+                except OSError:
+                    pass
+            self._drives_total = (time.time(), total)
+        pct = min(100.0, max(0.0, float(self.settings.section("network")["max_disk_pct"])))
+        return max(self.NET_DISK_MIN_GB, total * pct / 100)
 
     def _net_agent(self, agent_name, node: str, kind: str = "ext") -> dict:
         cfg = self.settings.section("network")
@@ -1461,8 +1548,22 @@ class Manager:
         size = int(bundle.get("size") or 0)
         if not (0 < size <= int(cfg["max_bundle_mb"]) << 20) or len(str(bundle.get("sha256") or "")) != 64:
             raise NetError(f"проект больше {cfg['max_bundle_mb']} МБ, которые принимает этот ПК", 413)
-        if self._net_disk_gb() + size * 3 / GB > cfg["max_disk_gb"]:
+        # big files this PC already has from the sender's earlier tasks come out of the cache (rmq/filecache.py)
+        cached, stored = bundle.get("cached") or {}, bundle.get("stored") or {}
+        self.files.check_lists(cached, stored)
+        if self.files.missing(node, kind, cached):
+            raise NetError("часть файлов проекта пропала из кэша этого ПК: отправьте проект целиком", 410)
+        try:
+            total = max(size, int(bundle.get("bytes") or 0))
+        except (TypeError, ValueError):
+            raise NetError("неверный размер проекта") from None
+        if total > (int(cfg["max_bundle_mb"]) << 20) * 4:
+            raise NetError(f"проект больше, чем этот ПК принимает ({cfg['max_bundle_mb']} МБ в архиве)", 413)
+        if self._net_disk_gb() + (size + 2 * total) / GB > self.net_disk_limit_gb():
             raise NetError("на этом ПК закончилось место, отведённое задачам из сети", 507)
+        why = self._net_room({self.net_dir("work"): total, self.files.root.parent: size + total})
+        if why:
+            raise NetError(why, 507)
         argv, command = spec.get("argv"), spec.get("command")
         if not ((isinstance(argv, list) and argv and all(isinstance(x, str) for x in argv))
                 or (isinstance(command, str) and command.strip())):
@@ -1479,15 +1580,22 @@ class Manager:
         upload_id = "u" + secrets.token_hex(8)
         with self.net._lock:
             self.net.uploads[upload_id] = {"node": node, "spec": spec, "size": size, "sha256": bundle["sha256"],
-                                           "kind": kind, "expires": time.time() + 3600}
+                                           "kind": kind, "expires": time.time() + 3600, "cached": cached,
+                                           "stored": stored}
         return {"upload_id": upload_id}
 
     def net_finish_upload(self, node: str, upload_id: str, slot: dict, zip_path: Path) -> int:
         cfg = self.settings.section("network")
         spec = slot["spec"]
         work = self.net_dir("work") / upload_id
+        kind = slot.get("kind", "ext")
         try:
             manifest = safe_extract(zip_path, work, max_bytes=(int(cfg["max_bundle_mb"]) << 20) * 4)
+            self.files.fill(node, kind, slot.get("cached") or {}, work, manifest)
+            stored = slot.get("stored") or {}
+            new = sum(manifest[r][0] for r in (safe_name(x) for x in stored) if r in manifest)
+            if stored and self._net_room({self.files.root.parent: new}) is None:  # the cache never fills a drive
+                self.files.keep(node, kind, stored, work, manifest)
         except Exception:
             shutil.rmtree(work, ignore_errors=True)
             raise
@@ -1495,7 +1603,6 @@ class Manager:
         if req and safe_name(req) not in manifest:
             shutil.rmtree(work, ignore_errors=True)
             raise NetError("файл зависимостей не найден в архиве")
-        kind = slot.get("kind", "ext")
         agent = self._net_agent(spec.get("agent"), node, kind)
         tl = spec.get("time_limit_s")
         with self.lock:
@@ -1515,10 +1622,16 @@ class Manager:
             self.task_dir(tid).mkdir(parents=True, exist_ok=True)
             (self.net_dir("manifests") / f"{tid}.json").write_text(json.dumps(manifest), encoding="utf-8")
             self.db.event("submit", (f"Задача с моего ПК {self.net.node_name(node)}" if kind == "home"
-                                     else f"Задача из сети с ПК {self.net.node_name(node)}") + f": {spec.get('name')}",
+                                     else f"Задача из сети с ПК {self.net.node_name(node)}") + f": {spec.get('name')}"
+                          + (f" ({len(slot['cached'])} крупных файлов взяты из кэша, не пересылались)"
+                             if slot.get("cached") else ""),
                           task_id=tid, agent_id=agent["id"])
         self.wake.set()
         return tid
+
+    def net_files_have(self, node: str, body: dict, kind: str = "ext") -> dict:
+        """Which of a sender's big project files this PC already has (rmq/filecache.py)."""
+        return {"have": self.files.have(node, kind, body.get("hashes"))}
 
     def _hosted_row(self, node: str, tid: int, kind: str = "ext") -> dict:
         """A hosted task, asked about by the PC that sent it and over the same network (a member of the network
@@ -1768,8 +1881,25 @@ class Manager:
         out["clean"] = all(out[k] < 1 for k in ("paused_s", "slept_s", "held_s", "ecores_s", "throttled_s", "shared_s"))
         return out
 
+    def heat_hint(self) -> dict:
+        """The heat right now, for the tasks' RMQ_CONDITIONS_FILE ("heat"): the share of their CPU the temperature
+        regulator leaves the tasks, the component it holds at its target, the temperatures, and the CPU's and the GPU's
+        power. A GPU task tells by it whether easing its own pace would cool the PC: the regulator only takes CPU, so
+        when the GPU itself is too warm, or draws most of the power that heats a laptop's shared cooling, only the GPU
+        task can help; when the CPU is warm from other work, slowing down would not."""
+        lim = self.regulator.limiting
+        cpu_w, gpu_w = self.lhm.extra.get("power"), self.nv.extra.get("power")
+        both = cpu_w is not None and gpu_w is not None and cpu_w + gpu_w > 0
+        return {"factor": round(self.regulator.factor, 2), "by": lim.key if lim else None, "state": self._heat_state,
+                "temps": {r.key: r.temp for r in self._readings if r.temp is not None},
+                "targets": {r.key: r.target for r in self._readings},
+                "cpu_power_w": cpu_w, "gpu_power_w": gpu_w,
+                "gpu_heat_share": round(gpu_w / (cpu_w + gpu_w), 2) if both else None}
+
     def _write_conditions(self, views: dict, rows: dict, now: float) -> None:
-        """Into each running task's RMQ_CONDITIONS_FILE (and saved with the task), every 10 s."""
+        """Into each running task's RMQ_CONDITIONS_FILE (and saved with the task), every 10 s; the file also says
+        how warm the PC is right now (heat_hint)."""
+        heat = self.heat_hint()
         for tid, v in views.items():
             c, lv, row = self._cond.get(tid), self.live.get(tid), rows.get(tid)
             if c is None or row is None:
@@ -1781,7 +1911,8 @@ class Manager:
             path = self.task_dir(tid) / "conditions.json"
             try:
                 tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(self.conditions(row, now), ensure_ascii=False), encoding="utf-8")
+                tmp.write_text(json.dumps({**self.conditions(row, now), "heat": heat}, ensure_ascii=False),
+                               encoding="utf-8")
                 os.replace(tmp, path)
             except OSError:
                 pass
@@ -2192,6 +2323,11 @@ class Manager:
         for row in self.db.tasks_hosted():  # results nobody came for
             if row["state"] in FINAL_STATES and (row["finished_at"] or now) < now - keep:
                 self._drop_hosted_files(row)
+        # project files nobody asked for in a week; the cache may take up to half the space given to the network, and
+        # it is the first to go when its drive runs short of space
+        budget = 0 if self._net_room({self.files.root.parent: 0}) else int(self.net_disk_limit_gb() * GB / 2)
+        if self.files.gc(now, budget):
+            self._net_disk = (0.0, 0.0)
 
     # ================================================================ API operations
     def identify(self, token: str | None, agent_name: str | None = None, agent_info: str = "") -> Identity | None:

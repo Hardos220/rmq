@@ -470,6 +470,14 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, path.read_bytes(), ctype, {"Content-Disposition": f'attachment; filename="{name}"'})
         return None
 
+    @route("GET", "/api/report")
+    def report(self, ident, body, q):  # the owner's report for the author, private details scrubbed (rmq/report.py)
+        self._admin(ident)
+        from .report import build
+        name, data = build(self.manager)
+        self._send(200, data, "application/zip", {"Content-Disposition": f'attachment; filename="{name}"'})
+        return None
+
     @route("GET", "/api/events")
     def events(self, ident, body, q):
         return {"events": self.manager.db.events(after_id=self._int(q, "after", 0),

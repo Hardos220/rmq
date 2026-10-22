@@ -47,7 +47,7 @@ from dataclasses import dataclass, field, replace
 RESOURCES = ("cpu", "ram", "vram")
 EPS = 1e-6
 RESUMABLE = {"paused", "game", "gpu_user", "ram", "vram", "resume", "shutdown", "heat", "disk",
-             "net_closed"}  # plus "fair:<id>" and "prio:<id>"
+             "net_closed", "power"}  # plus "fair:<id>" and "prio:<id>"
 
 
 # ---------------------------------------------------------------- smoothing
@@ -248,6 +248,7 @@ class PlanInput:
     mode: str = "auto"              # auto | game | paused
     game_active: bool = False
     thermal_freeze: bool = False    # a component is overheated: everything is frozen until it cools down
+    power_hold: bool = False        # the PC runs on its UPS: tasks save their checkpoints or freeze till power is back
     disk_hold: set[int] = field(default_factory=set)  # tasks that could write to a nearly full drive
     hung: set[int] = field(default_factory=set)       # running tasks without any sign of work for too long
     net_hold: set[int] = field(default_factory=set)   # members' tasks while the owner keeps this PC to himself
@@ -450,16 +451,21 @@ def plan(inp: PlanInput) -> Plan:
             suspended[t.id] = replace(t, used_ram=0.0)
         return need
 
-    # 2. pause mode and overheating: everything stands still
-    if inp.mode == "paused" or inp.thermal_freeze:
-        why = "paused" if inp.mode == "paused" else "heat"
+    # 2. pause mode, overheating and a power cut: everything stands still. On the UPS a task that can go on from a
+    # checkpoint saves it and leaves (nothing is lost if the UPS runs out); the rest are frozen, which also spares
+    # the UPS's battery
+    if inp.mode == "paused" or inp.thermal_freeze or inp.power_hold:
+        why = "paused" if inp.mode == "paused" else "heat" if inp.thermal_freeze else "power"
         for t in list(running.values()):
-            move(t, "suspend", why)
+            if why == "power" and t.preempt == "requeue":
+                evict(t, why, urgent=False)
+            else:
+                move(t, "suspend", why)
         if inp.ram_deficit > EPS:
             trim_frozen(inp.ram_deficit + 0.25)
         waiting = sorted(list(queued.values()) + list(suspended.values()), key=lambda t: -score[t.id])
         for i, t in enumerate(waiting, 1):
-            P.waiting[t.id] = WaitInfo(i, why if t.state == "queued" or t.suspend_reason in ("paused", "heat")
+            P.waiting[t.id] = WaitInfo(i, why if t.state == "queued" or t.suspend_reason in ("paused", "heat", "power")
                                        else (t.suspend_reason or why))
         return P
 
@@ -524,8 +530,10 @@ def plan(inp: PlanInput) -> Plan:
         for t in sorted(holders, key=lambda t: (t.preempt != "requeue", t.state == "running", score[t.id])):
             if left <= 0:
                 break
-            if t.preempt == "requeue" or (t.state == "suspended" and pol.free_vram_for_user and t.used_vram > 0.05):
-                move(t, "requeue", "vram")  # only a stopped process gives VRAM back
+            # only a stopped process gives VRAM back; with free_vram_for_user off the owner rather keeps the tasks
+            # (frozen) than gets the VRAM back, so even a task with checkpoints is not stopped for it
+            if pol.free_vram_for_user and (t.preempt == "requeue" or (t.state == "suspended" and t.used_vram > 0.05)):
+                move(t, "requeue", "vram")
                 left -= t.used_vram
                 P.shed = True
             elif t.state == "running":  # first step: the GPU stops being loaded, VRAM may stay allocated

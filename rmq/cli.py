@@ -153,7 +153,10 @@ class Client:
         req = urllib.request.Request(self.url + path, data=data, method=method, headers=self.headers)
         try:
             with LOCAL.open(req, timeout=timeout) as r:
-                payload = r.read().decode("utf-8")
+                data = r.read()
+                if raw == "bytes":
+                    return data
+                payload = data.decode("utf-8")
                 return payload if raw else json.loads(payload)
         except urllib.error.HTTPError as e:
             try:
@@ -494,7 +497,8 @@ def cmd_nodes(args) -> int:
             state += (f", те же команды идут там в {r:.1f} раза дольше, чем здесь" if r >= 1.1 else
                       f", те же команды идут там в {1 / r:.1f} раза быстрее" if r <= 0.9 else ", по скорости как этот ПК")
         flags = ", ".join(x for x, on in (("игра", busy.get("game")), ("пауза", busy.get("paused")),
-                                          ("перегрев", busy.get("heat") == "hot"), ("мало места", busy.get("disk_low")))
+                                          ("перегрев", busy.get("heat") == "hot"), ("мало места", busy.get("disk_low")),
+                                          ("работает от ИБП", busy.get("power")))
                           if on)
         print(f"{head}: {state}{f' ({flags})' if flags else ''}; {hw.get('threads', '?')} потоков, "
               f"{hw.get('ram_gb', '?')} ГБ ОЗУ, GPU {hw.get('gpu') or 'нет'} {hw.get('vram_gb') or 0} ГБ; "
@@ -957,9 +961,12 @@ def cmd_top(args) -> int:
         print("датчики: " + ", ".join(temps) + (f"; процессор: {cpu}" if cpu else "") + (f"; видеокарта: {gpu}" if gpu else ""))
     pw = st.get("power") or {}
     if pw.get("mode") or pw.get("plan"):
-        print(f"питание: {'от батареи' if pw.get('on_battery') else 'от сети'}"
+        print(f"питание: {('от ИБП' if pw.get('ups') else 'от батареи') if pw.get('on_battery') else 'от сети'}"
               + (f", режим Windows «{pw['mode']}»" if pw.get("mode") else "")
               + (f", схема «{pw['plan']}»" if pw.get("plan") else ""))
+    if pw.get("ups_hold"):
+        print("ПИТАНИЕ: пропало, ПК работает от ИБП — задачи с чекпоинтами сохранили их и остановились, остальные "
+              "заморожены, новые не стартуют, пока не вернётся сеть")
     if th.get("enabled") and th.get("state") == "hot":
         print(f"ТЕМПЕРАТУРА: перегрев — {th['trigger']}; все задачи заморожены до остывания")
     elif th.get("enabled") and th.get("factor", 1) < 0.995:
@@ -1040,6 +1047,20 @@ def cmd_dashboard(args) -> int:
     import webbrowser
     webbrowser.open(dashboard_url(args.url))
     print(args.url)
+    return 0
+
+
+def cmd_report(args) -> int:
+    """The owner's report for the author: the manager's state, log, journal and latest tasks, private details
+    removed (rmq/report.py)."""
+    from rmq import __version__
+    data = Client(args.url, admin=True).call("GET", "/api/report", timeout=120, raw="bytes")
+    out = Path(args.out or ".") / f"rmq-report-{__version__}-{time.strftime('%Y%m%d-%H%M')}.zip"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(data)
+    print(out.resolve())
+    err("отчёт для автора сохранён. Просмотрите его (README.txt внутри — что там есть и чего нет) и приложите к issue "
+        "на https://github.com/Hardos220/rmq/issues")
     return 0
 
 
@@ -1228,6 +1249,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("stop")
     sp.add_argument("--tasks", choices=["freeze", "keep", "cancel"], default="freeze")
     sp.set_defaults(fn=cmd_stop)
+    sp = sub.add_parser("report")
+    sp.add_argument("--out", metavar="ПАПКА", help="куда сохранить архив (по умолчанию текущая папка)")
+    sp.set_defaults(fn=cmd_report)
     sp = sub.add_parser("serve")
     sp.add_argument("--open", action="store_true")
     sp.set_defaults(fn=cmd_serve)
@@ -1236,7 +1260,8 @@ def build_parser() -> argparse.ArgumentParser:
                                        "home-create", "home-invite", "home-leave", "home-main", "home-ext"])
     sp.add_argument("value", nargs="?")
     sp.set_defaults(fn=cmd_net)
-    hidden = {"launch", "dashboard", "install-shortcut", "install-agents", "uninstall-agents", "stop", "serve", "net"}
+    hidden = {"launch", "dashboard", "install-shortcut", "install-agents", "uninstall-agents", "stop", "report", "serve",
+              "net"}
     sub._choices_actions = [a for a in sub._choices_actions if a.dest not in hidden]
     return p
 

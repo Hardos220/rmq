@@ -38,7 +38,8 @@ DEFAULTS: dict = {
         "busy_confirm_s": 3,
         "idle_confirm_s": 60,
         "hide_gpu_for_cpu_tasks": True,  # CUDA_VISIBLE_DEVICES="" when a task asked for no VRAM
-        "free_vram_for_user": True,      # frozen GPU tasks still holding VRAM the user needs are restarted later
+        "free_vram_for_user": True,      # GPU tasks holding VRAM the user needs are stopped and restarted later
+                                         # (off: they are only frozen, even those with checkpoints)
     },
     "game_mode": {
         "auto_detect": True,
@@ -104,7 +105,9 @@ DEFAULTS: dict = {
         "max_hosted_tasks": 8,        # members' tasks here at once (queued, running or frozen)
         "max_bundle_mb": 1024,        # the largest project a member may send
         "max_results_mb": 2048,       # the most a task may send back
-        "max_disk_gb": 20.0,          # all members' files on this PC together (code, results, environments)
+        # all members' files on this PC together (code, results, environments, cached project files): this share of
+        # all its own drives' size, but at least 10 GB (Manager.net_disk_limit_gb)
+        "max_disk_pct": 10.0,
         "protect_host": True,         # members' tasks may read this PC's files but never change them
         "keep_results_h": 72,         # results nobody collected are deleted after this time
     },
@@ -116,6 +119,8 @@ DEFAULTS: dict = {
     "power": {
         "keep_awake_while_running": True,   # no idle sleep while tasks run (the display may still turn off)
         "keep_awake_on_battery": False,     # on battery the PC may sleep so the computation does not drain it
+        # a power cut on a PC with a UPS: tasks with checkpoints save them and leave, the rest freeze till power is back
+        "ups_hold": True,
         "tariff_rub_kwh": 8.90,             # the price of electricity, for the statistics' energy in rubles
     },
     "scheduler": {
@@ -186,11 +191,17 @@ PRESETS: dict[str, tuple[str, str, dict]] = {
               {"reserve": {"cpu_pct_of_free": 40.0, "cpu_min_cores": 2.0, "ram_pct_of_free": 15.0, "ram_min_gb": 3.0},
                "thermal": {"cpu_target_c": 75.0, "board_target_c": 70.0, "gpu_target_c": 78.0, "ssd_target_c": 60.0},
                "gpu": {"user_busy_pct": 15.0}}),
-    "max": ("Максимум расчётов",
-            "Задачам — почти всё свободное. Ваши программы всё равно первые (задачи на самом низком приоритете), "
-            "температура — по обычным правилам.",
-            {"reserve": {"cpu_pct_of_free": 2.0, "ram_pct_of_free": 3.0},
-             "gpu": {"user_busy_pct": 40.0}}),
+    "productive": ("Продуктивность",
+                   "Задачам — больше: запас для вас 3% свободного процессора и памяти (но не меньше 1 потока и 1 ГБ), "
+                   "цели температуры выше (процессор 90°, плата 80°, видеокарта 86°, SSD 70°). GPU-задачи встают на "
+                   "паузу, только пока ваша загрузка видеокарты выше 40%: игра сама по себе их не останавливает, а "
+                   "ради видеопамяти их только замораживают, не перезапуская. Ваши программы всё равно первые "
+                   "(задачи на самом низком приоритете), перегрев по-прежнему замораживает всё.",
+                   {"reserve": {"cpu_pct_of_free": 3.0, "ram_pct_of_free": 3.0},
+                    "gpu": {"user_busy_pct": 40.0, "free_vram_for_user": False},
+                    "game_mode": {"pause_gpu_tasks": False},
+                    "thermal": {"cpu_target_c": 90.0, "board_target_c": 80.0, "gpu_target_c": 86.0,
+                                "ssd_target_c": 70.0}}),
 }
 PRESET_KEYS = sorted({(sec, key) for _t, _d, over in PRESETS.values() for sec, vals in over.items() for key in vals})
 
@@ -213,13 +224,14 @@ def active_preset(data: dict) -> str | None:
 
 # settings.json keeps only what the owner changed, so new defaults reach existing installs.
 # Older files stored every value; these defaults changed since and are dropped if left untouched.
-VERSION = 3
+VERSION = 4
 MIGRATIONS = {1: [("game_mode", "extra_ram_reserve_gb", 0.0)]}
+# version 4: the space for members' files is a share of the PC's drives (network.max_disk_pct), not fixed gigabytes
 # version 3: the "warm" step (half the CPU) became a smooth regulator with a target temperature;
 # an owner's own "warm" limit becomes the target, an untouched old default gives way to the new one
 RENAMED = {2: [("thermal", "cpu_warm_c", "cpu_target_c", 85.0), ("thermal", "board_warm_c", "board_target_c", 72.0),
                ("thermal", "gpu_warm_c", "gpu_target_c", 80.0), ("thermal", "ssd_warm_c", "ssd_target_c", 65.0)]}
-REMOVED = {2: [("thermal", "warm_cpu_factor")]}
+REMOVED = {2: [("thermal", "warm_cpu_factor")], 3: [("network", "max_disk_gb")]}
 
 
 class SettingsError(ValueError):
