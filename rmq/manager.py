@@ -18,6 +18,7 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -239,6 +240,7 @@ class Manager:
         self._stop = threading.Event()
         self.wake = threading.Event()
         self._thread: threading.Thread | None = None
+        self._tick_since: float | None = None  # monotonic start of the scheduler step under way (None between)
         self.keep_awake = winapi.KeepAwake("Менеджер ресурсов: идут расчёты агентов (экран может гаснуть)")
         self.cpu_zones = thermal.CpuZones()
         self.nv = thermal.NvidiaGpu()
@@ -255,6 +257,7 @@ class Manager:
         self.regulator = thermal.HeatRegulator()
         self._heat_state = "normal"           # normal | warm (the regulator holds tasks back) | hot (frozen)
         self._readings: list = []             # the latest temperatures (for the tasks' conditions files)
+        self._nv_reported = False             # the GPU's driver failure is in the journal already
         self.power_hold = False               # the PC runs on its UPS: the tasks stand still (_ups_tick)
         self._is_ups, self._caps_at = False, -1e18
         self._ups_since: float | None = None
@@ -355,6 +358,7 @@ class Manager:
             self._adopt()
         self._thread = threading.Thread(target=self._loop, name="rmq-scheduler", daemon=True)
         self._thread.start()
+        threading.Thread(target=self._watch, name="rmq-watchdog", daemon=True).start()
         self.net.start()
 
     def stop(self) -> None:
@@ -423,14 +427,45 @@ class Manager:
     # ================================================================ loop
     def _loop(self) -> None:
         while not self._stop.is_set():
-            t0 = time.monotonic()
+            t0 = self._tick_since = time.monotonic()
             try:
                 self.tick()
             except Exception:  # keep scheduling no matter what
                 log.exception("tick failed")
+            finally:
+                self._tick_since = None
+            took = time.monotonic() - t0
+            if took >= self.STUCK_S:
+                log.warning("the scheduler is going again after one step of %.0f s", took)
             period = self.settings.section("scheduler")["tick_s"]
             self.wake.wait(max(0.05, period - (time.monotonic() - t0)))
             self.wake.clear()
+
+    STUCK_S = 60.0  # a scheduler step this long is stuck: a normal one takes milliseconds
+    WATCH_EVERY_S = 10.0  # how often the watchdog looks
+    SHUTDOWN_LOCK_S = 15.0  # how long a shutdown waits for the scheduler's lock before leaving the tasks be
+
+    def stuck_s(self) -> float:
+        """How long the scheduler has been stuck in one step; 0 while it works. Read without any lock: the health
+        check answers this even when the stuck step holds the manager's lock."""
+        since = self._tick_since
+        took = time.monotonic() - since if since is not None else 0.0
+        return round(took) if took >= self.STUCK_S else 0.0
+
+    def _watch(self) -> None:
+        """The watchdog: a step stuck for STUCK_S is written to the log once, with where it stands (a call into a
+        driver that never returns, for one), so the cause can be found; agents learn it from rmq, the owner from the
+        dashboard (stuck_s in /api/health). It touches neither the lock nor the database, which the step may hold."""
+        reported = None
+        while not self._stop.wait(self.WATCH_EVERY_S):
+            since = self._tick_since
+            if since is None or since == reported or time.monotonic() - since < self.STUCK_S:
+                continue
+            reported = since
+            frame = sys._current_frames().get(self._thread.ident) if self._thread else None
+            where = "".join(traceback.format_stack(frame)) if frame is not None else "(стек недоступен)"
+            log.error("the scheduler has been stuck in one step for %.0f s; tasks are not managed until it goes on. "
+                      "Where it stands:\n%s", time.monotonic() - since, where.rstrip())
 
     def _window(self, name: str, size: float, mean: bool = False):
         kind = planner.WindowMean if mean else planner.WindowMax
@@ -758,7 +793,8 @@ class Manager:
                             "cool_confirm_s": tc["cool_confirm_s"], "factor": factor,
                             "min_cpu_factor": tc["min_cpu_factor"],
                             "limiting": {"label": lim.label, "temp": lim.temp, "target": lim.target} if lim else None,
-                            "cpu_source": self.lhm.status, "readings": [vars(r) for r in readings],
+                            "cpu_source": self.lhm.status, "gpu_broken": self.nv.broken,
+                            "readings": [vars(r) for r in readings],
                             "cpu_power": self.lhm.extra.get("power"), "clock_p": self.lhm.extra.get("clock_p"),
                             "clock_e": self.lhm.extra.get("clock_e"), "gpu_power": self.nv.extra.get("power"),
                             "gpu_clock": self.nv.extra.get("clock"),
@@ -817,7 +853,14 @@ class Manager:
             c_temp = self.lhm.read()
             self._cpu_read = (now, c_temp)
         self._refresh_ranges(now)
-        return thermal.readings_from(tc, cpu, (g_temp, g_thr, self.nv.present), (s_temp, s_warn), c_temp)
+        if self.nv.broken and not self._nv_reported:  # once: the GPU's sensor is off until the next start
+            self._nv_reported = True
+            msg = (f"Датчик видеокарты отключён до перезапуска менеджера: {self.nv.broken}. Менеджер работает дальше, "
+                   "видеокарта защищает себя от перегрева сама")
+            self.db.event("heat", msg)
+            log.error(msg)
+        return thermal.readings_from(tc, cpu, (g_temp, g_thr, self.nv.present, self.nv.broken), (s_temp, s_warn),
+                                     c_temp)
 
     RANGE_COLUMNS = (("power", ("cpu_power",)), ("clock", ("clock_p", "clock_e")), ("gpu_power", ("gpu_power",)),
                      ("gpu_clock", ("gpu_clock",)))
@@ -2642,7 +2685,11 @@ class Manager:
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=10)
         n = 0
-        with self.lock:
+        if not self.lock.acquire(timeout=self.SHUTDOWN_LOCK_S):  # the scheduler is stuck holding it (see _watch)
+            log.error("stopping while the scheduler is stuck: the tasks are left as they are (they run on and are "
+                      "picked up at the next start)")
+            return {"ok": True, "tasks": "keep", "affected": 0, "stuck": True}
+        try:
             now = time.time()
             for row in self.db.tasks_active():
                 rt = self.runtimes.get(row["id"])
@@ -2665,6 +2712,8 @@ class Manager:
             self.db.event("shutdown", {"freeze": f"Менеджер выключен, задач заморожено: {n}",
                                        "keep": "Менеджер выключен, задачи продолжают работать",
                                        "cancel": f"Менеджер выключен, задач отменено: {n}"}[tasks])
+        finally:
+            self.lock.release()
         return {"ok": True, "tasks": tasks, "affected": n}
 
     def request_restart(self) -> None:

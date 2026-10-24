@@ -22,9 +22,11 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import queue
 import re
 import statistics
 import struct
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -54,10 +56,12 @@ def readings_from(cfg: dict, board: tuple, gpu: tuple, ssd: tuple, cpu: float | 
     if board[0] is not None or board[1]:
         out.append(Reading("board", "Плата (ACPI)", board[0], cfg["board_target_c"], cfg["board_hot_c"],
                            cfg["board_normal_c"], board[1]))
-    if gpu[2]:  # an NVIDIA GPU exists
+    if gpu[2]:  # an NVIDIA GPU exists; gpu[3], if given: why its driver is not asked any more
+        broken = len(gpu) > 3 and gpu[3]
         # a target never above the GPU's own hot limit (its slowdown temperature may be lower than the setting)
         out.append(Reading("gpu", "Видеокарта", gpu[0], min(cfg["gpu_target_c"], cfg["gpu_hot_c"] - 3), cfg["gpu_hot_c"],
-                           cfg["gpu_normal_c"], gpu[1], "" if gpu[0] is not None else "спит"))
+                           cfg["gpu_normal_c"], gpu[1], "" if gpu[0] is not None else
+                           "датчик отключён: сбой драйвера" if broken else "спит"))
     if ssd[0] is not None:
         hot = min(cfg["ssd_hot_c"], ssd[1] - 3) if ssd[1] else cfg["ssd_hot_c"]
         out.append(Reading("ssd", "SSD", ssd[0], min(cfg["ssd_target_c"], hot - 5), hot, cfg["ssd_normal_c"]))
@@ -430,30 +434,94 @@ class LhmCpu:
         return parse_lhm(tree)
 
 
+class DriverThread:
+    """One daemon thread that makes every call into a driver's library, while the caller waits only so long.
+
+    Native code can crash or hang inside a call, and Python cannot interrupt it. Once NVML threw an access violation
+    inside nvmlDeviceGetTemperature, and the nvmlShutdown that followed spun a core at 100% for half an hour while the
+    scheduler waited on it, holding the manager's lock. Here such a call only ever stalls this thread: the caller gets
+    TimeoutError (or the call's own exception) and stops using the library."""
+
+    def __init__(self, name: str):
+        self._q: queue.Queue = queue.Queue()
+        threading.Thread(target=self._run, name=name, daemon=True).start()
+
+    def _run(self) -> None:
+        while True:
+            fn, box, done = self._q.get()
+            try:
+                box.append((True, fn()))
+            except BaseException as e:  # handed to the caller
+                box.append((False, e))
+            done.set()
+
+    def call(self, fn, timeout: float):
+        box: list = []
+        done = threading.Event()
+        self._q.put((fn, box, done))
+        if not done.wait(timeout):
+            raise TimeoutError(f"no answer in {timeout:.0f} s")
+        ok, value = box[0]
+        if ok:
+            return value
+        raise value
+
+
 class NvidiaGpu:
-    """NVML from the NVIDIA driver; opened only for the time the GPU is being watched."""
+    """NVML from the NVIDIA driver; opened only for the time the GPU is being watched.
+
+    Every call goes through a DriverThread: when the driver crashes or hangs inside a call, the GPU's sensor is off
+    (`broken` says why) until the manager restarts, and the broken library is never called again, not even to close
+    it. The manager itself goes on."""
 
     THERMAL_REASONS = 0x20 | 0x40  # SW / HW thermal slowdown
+    TIMEOUT_S = 5.0
 
-    def __init__(self):
-        try:
-            self._nv = ctypes.WinDLL("nvml.dll")
-        except OSError:
-            self._nv = None
-        self.present = self._nv is not None and self._open()
+    def __init__(self, timeout_s: float = TIMEOUT_S):
+        self.timeout_s = timeout_s
         self.max_operating: int | None = None
         self.power_limit: float | None = None   # W, the board power the driver enforces
         self.max_clock: float | None = None     # GHz, the graphics clock's ceiling
         self.extra: dict = {}                   # {"power": W, "clock": GHz} while it is watched
-        if self.present:
-            v = ctypes.c_uint(0)
-            if self._nv.nvmlDeviceGetTemperatureThreshold(self._h, 3, ctypes.byref(v)) == 0:  # GPU_MAX
-                self.max_operating = v.value
-            if self._nv.nvmlDeviceGetEnforcedPowerLimit(self._h, ctypes.byref(v)) == 0 and v.value:
-                self.power_limit = round(v.value / 1000, 1)
-            if self._nv.nvmlDeviceGetMaxClockInfo(self._h, 0, ctypes.byref(v)) == 0 and v.value:  # graphics
-                self.max_clock = round(v.value / 1000, 2)
-            self._close()
+        self.broken = ""                        # why the driver's library is not used any more
+        self.open = False
+        self.present = False
+        try:
+            self._nv = ctypes.WinDLL("nvml.dll")
+        except OSError:
+            self._nv = None
+        if self._nv is not None:
+            self._thread = DriverThread("rmq-nvml")
+            self.present = bool(self._call(self._probe, False)) or bool(self.broken)
+
+    def _call(self, fn, default=None):
+        if self.broken:
+            return default
+        try:
+            return self._thread.call(fn, self.timeout_s)
+        except TimeoutError:
+            self._broke(f"драйвер NVIDIA не ответил за {self.timeout_s:.0f} с")
+        except OSError as e:  # an access violation inside the driver: its library is not to be trusted any more
+            self._broke(f"сбой в драйвере NVIDIA ({e})")
+        return default
+
+    def _broke(self, why: str) -> None:
+        self.broken = why
+        self.open = False  # never shut a broken library down: that call may hang too
+        self.extra = {}
+
+    def _probe(self) -> bool:
+        if not self._open():
+            return False
+        v = ctypes.c_uint(0)
+        if self._nv.nvmlDeviceGetTemperatureThreshold(self._h, 3, ctypes.byref(v)) == 0:  # GPU_MAX
+            self.max_operating = v.value
+        if self._nv.nvmlDeviceGetEnforcedPowerLimit(self._h, ctypes.byref(v)) == 0 and v.value:
+            self.power_limit = round(v.value / 1000, 1)
+        if self._nv.nvmlDeviceGetMaxClockInfo(self._h, 0, ctypes.byref(v)) == 0 and v.value:  # graphics
+            self.max_clock = round(v.value / 1000, 2)
+        self._close()
+        return True
 
     def _open(self) -> bool:
         if self._nv.nvmlInit_v2() != 0:
@@ -468,36 +536,45 @@ class NvidiaGpu:
         return True
 
     def _close(self) -> None:
-        if getattr(self, "open", False):
+        if self.open:
             self._nv.nvmlShutdown()
             self.open = False
+
+    def _read(self):
+        """(temperature, thermal throttling, {"power", "clock"}) or None; runs on the driver's thread."""
+        if not self.open and not self._open():
+            return None
+        t = ctypes.c_uint(0)
+        if self._nv.nvmlDeviceGetTemperature(self._h, 0, ctypes.byref(t)) != 0:
+            return None
+        r = ctypes.c_ulonglong(0)
+        throttling = self._reasons_fn(self._h, ctypes.byref(r)) == 0 and bool(r.value & self.THERMAL_REASONS)
+        extra, v = {}, ctypes.c_uint(0)
+        if self._nv.nvmlDeviceGetPowerUsage(self._h, ctypes.byref(v)) == 0:
+            extra["power"] = round(v.value / 1000, 1)
+        if self._nv.nvmlDeviceGetClockInfo(self._h, 0, ctypes.byref(v)) == 0 and v.value:
+            extra["clock"] = round(v.value / 1000, 2)
+        return float(t.value), throttling, extra
 
     def read(self, watch: bool) -> tuple[float | None, bool]:
         """Temperature and thermal throttling while `watch` (and its power and clock in `extra`); otherwise the
         library is released."""
         self.extra = {}
-        if not self.present:
+        if not self.present or self.broken:
             return None, False
         if not watch:
-            self._close()
+            if self.open:
+                self._call(self._close)
             return None, False
-        if not getattr(self, "open", False) and not self._open():
+        got = self._call(self._read)
+        if got is None:
             return None, False
-        t = ctypes.c_uint(0)
-        if self._nv.nvmlDeviceGetTemperature(self._h, 0, ctypes.byref(t)) != 0:
-            return None, False
-        r = ctypes.c_ulonglong(0)
-        throttling = self._reasons_fn(self._h, ctypes.byref(r)) == 0 and bool(r.value & self.THERMAL_REASONS)
-        v = ctypes.c_uint(0)
-        if self._nv.nvmlDeviceGetPowerUsage(self._h, ctypes.byref(v)) == 0:
-            self.extra["power"] = round(v.value / 1000, 1)
-        if self._nv.nvmlDeviceGetClockInfo(self._h, 0, ctypes.byref(v)) == 0 and v.value:
-            self.extra["clock"] = round(v.value / 1000, 2)
-        return float(t.value), throttling
+        temp, throttling, self.extra = got
+        return temp, throttling
 
     def close(self) -> None:
-        if self._nv is not None:
-            self._close()
+        if self._nv is not None and self.open:
+            self._call(self._close)
 
 
 class Drives:

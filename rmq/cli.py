@@ -22,7 +22,7 @@ from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent.parent
 FINAL = {"done", "failed", "cancelled", "timeout", "lost"}
-EXIT_ERROR, EXIT_DOWN, EXIT_TIMEOUT, EXIT_INTERRUPTED = 2, 3, 124, 130
+EXIT_ERROR, EXIT_DOWN, EXIT_STUCK, EXIT_TIMEOUT, EXIT_INTERRUPTED = 2, 3, 4, 124, 130
 EPILOG = """\
 примеры:
   rmq run --cpu 4 --ram 8 --time 2h -- python train.py --epochs 10
@@ -165,6 +165,9 @@ class Client:
                 msg = str(e)
             raise CliError(msg) from None
         except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+            stuck = stuck_for(self.url)
+            if stuck:
+                raise CliError(stuck_text(stuck), EXIT_STUCK) from None
             reason = getattr(e, "reason", e)
             raise CliError(f"менеджер ресурсов не отвечает на {self.url} ({reason}). "
                            f"Запусти его командой: rmq start", EXIT_DOWN) from None
@@ -176,6 +179,22 @@ def alive(url: str) -> bool:
             return json.loads(r.read().decode("utf-8")).get("ok", False)
     except Exception:
         return False
+
+
+def stuck_for(url: str) -> float:
+    """How long the manager's scheduler has been stuck, by its health answer (0: it works, or nothing answers)."""
+    try:
+        with LOCAL.open(url + "/api/health", timeout=3) as r:
+            return float(json.loads(r.read().decode("utf-8")).get("stuck_s") or 0)
+    except Exception:
+        return 0.0
+
+
+def stuck_text(seconds: float) -> str:
+    return (f"менеджер ресурсов завис: его планировщик не отвечает уже {max(1, round(seconds / 60))} мин (дело не в "
+            "твоей задаче). Сообщи владельцу ПК: менеджер нужно перезапустить (stop.cmd в его папке или кнопка "
+            "«Выключить» в дашборде, затем ярлык «Менеджер ресурсов»). Сам его не перезапускай. Уже работающие задачи "
+            "продолжают считать, но, пока он завис, новые не стартуют и ничего не уступают владельцу")
 
 
 def spawn_server(url: str, wait_s: float = 25) -> None:
@@ -1009,6 +1028,10 @@ def cmd_guide(args) -> int:
 
 def cmd_start(args) -> int:
     if alive(args.url):
+        stuck = stuck_for(args.url)
+        if stuck:
+            err(stuck_text(stuck))
+            return EXIT_STUCK
         err(f"менеджер уже работает: {args.url}")
         return 0
     spawn_server(args.url)

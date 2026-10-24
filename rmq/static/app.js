@@ -59,12 +59,14 @@
   let METRICS = null;
   let TAB = 'overview';
   let offline = false;
+  let stuckS = 0;  // seconds the manager's scheduler has been stuck in one step (from /api/health), 0 while it works
 
-  async function api(method, path, body) {
+  async function api(method, path, body, signal) {
     const res = await fetch(path, {
       method,
       headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     });
     let data = null;
     try { data = await res.json(); } catch { /* empty */ }
@@ -1418,6 +1420,7 @@
     if (th.regulate && share < 100) body += ` Задачам пока ${share}% процессора: остальное возвращается постепенно.`;
     const noCpu = cpuSourceNote(th);
     if (noCpu) body += ` ${noCpu}`;
+    if (th.gpu_broken) body += ` Датчик видеокарты отключён до перезапуска менеджера: ${th.gpu_broken}. Видеокарта защищает себя от перегрева сама; перезапустите менеджер, чтобы снова видеть её температуру.`;
     if (!th.enabled) {
       head = 'Защита от перегрева выключена';
       body = `Включается в «Правилах и настройках». Сейчас: ${temps || 'нет данных'}.`;
@@ -1628,6 +1631,11 @@
     const out = [];
     const banner = (cls, icon, ...kids) => h('div', { class: `banner ${cls}`, role: 'status' }, h('span', { class: 'icon' }, icon), h('div', null, ...kids));
     if (offline) out.push(banner('warn', '!', 'Нет связи с менеджером. Он запущен? Запуск: start.cmd в папке проекта.'));
+    if (stuckS) {
+      out.push(banner('warn', '!', `Менеджер завис: его планировщик не отвечает уже ${dur(stuckS)}. Пока он завис, задачи агентов `
+        + 'не управляются: новые не стартуют, работающие не уступят вам память и видеокарту. Перезапустите менеджер: кнопка '
+        + '«Выключить» вверху (задачи продолжат работать), затем ярлык «Менеджер ресурсов». Где он застрял — в data\\manager.log.'));
+    }
     if (s && s.mode === 'paused') {
       out.push(banner('warn', '❚❚', 'Все задачи агентов заморожены, новые не запускаются. ',
         h('button', { class: 'btn', type: 'button', onclick: () => setMode('auto') }, 'Вернуть авто')));
@@ -4228,18 +4236,37 @@
     if (document.hidden && !now) { pollTimer = setTimeout(poll, 3000); return; }
     inflight = true;
     try {
-      STATE = await api('GET', '/api/state');
+      if (stuckS) {  // stuck: ask only the health check (it never waits) until the scheduler goes on
+        stuckS = (await (await fetch('/api/health')).json()).stuck_s || 0;
+        if (stuckS) throw new Error('stuck');
+      }
+      STATE = await stateOrStuck();
       await loadMetrics(false);
       offline = false;
       render();
     } catch (e) {
       if (e.message === 'unauthorized') { inflight = false; return; }
-      offline = true;
+      offline = !stuckS;
       renderBanners(STATE);
     }
     inflight = false;
     if (again) { again = false; poll(true); return; }
-    pollTimer = setTimeout(poll, 1000);
+    pollTimer = setTimeout(poll, stuckS ? 5000 : 1000);
+  }
+
+  // the state, or, if it does not come in 20 s, whether the manager's scheduler is stuck (its health check says)
+  async function stateOrStuck() {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 20000);
+    try {
+      return await api('GET', '/api/state', undefined, ctl.signal);
+    } catch (e) {
+      if (e.name !== 'AbortError') throw e;
+      try { stuckS = (await (await fetch('/api/health')).json()).stuck_s || 0; } catch { stuckS = 0; }
+      throw new Error(stuckS ? 'stuck' : 'timeout');
+    } finally {
+      clearTimeout(timer);
+    }
   }
   document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(true); });
 

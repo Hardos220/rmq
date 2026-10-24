@@ -172,8 +172,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ endpoints
     @route("GET", "/api/health")
-    def health(self, ident, body, q):
-        return {"ok": True, "version": __version__}
+    def health(self, ident, body, q):  # never waits for the manager's lock: it says if the scheduler is stuck, too
+        return {"ok": True, "version": __version__, "stuck_s": self.manager.stuck_s()}
 
     @route("GET", "/api/whoami")
     def whoami(self, ident, body, q):
@@ -492,6 +492,9 @@ class Handler(BaseHTTPRequestHandler):
         result["note"] = {"freeze": "менеджер выключен; задачи заморожены и продолжат после запуска",
                           "keep": "менеджер выключен; задачи продолжают работать и будут подхвачены при запуске",
                           "cancel": "менеджер выключен; задачи отменены"}[result["tasks"]]
+        if result.get("stuck"):
+            result["note"] = ("менеджер завис и выключен; задачи оставлены как есть (работающие продолжают считать) и "
+                              "будут подхвачены при запуске")
         return result
 
 
